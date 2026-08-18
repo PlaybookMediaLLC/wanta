@@ -60,11 +60,10 @@ export type LocalAccessDecision =
 export interface LocalAccessPolicyContext {
   activeGenerationId?: string
   /**
-   * The request comes from an external (BYOA) agent session. Permission policy
-   * for those sessions is owned by the agent's own CLI: it decides when to
-   * ask, and Wanta relays every ask to the user instead of answering through
-   * host-side policy. Must be derived from the session id's kind, never from
-   * whether a scratch root could be resolved.
+   * The request comes from an external (BYOA) agent session. This only affects
+   * transport-specific duplicate approvals (for example Wanta MCP dispatch).
+   * It must never change Wanta's user-visible local permission policy: the
+   * same normalized operation receives the same decision for every agent.
    */
   isExternalSession?: boolean
   linkRuntime?: ActiveLinkRuntime
@@ -111,67 +110,21 @@ function hasMatchingGenericSessionGrant(
   return Boolean(grants?.some((grant) => requestMatchesSessionGrant(request, grant)))
 }
 
-export function evaluateLocalAccessRequest(
+function evaluateBaselineLocalAccessRequest(
   request: ChatPermissionRequest,
-  context: LocalAccessPolicyContext,
+  context: Omit<LocalAccessPolicyContext, "isExternalSession">,
 ): LocalAccessDecision {
   const kind = permissionRequestKind(request)
   const highRisk = isHighRiskPermissionRequest(request)
-  // Wanta host MCP tools are the external-agent transport for the same
-  // capability kernel that OpenCode invokes directly. Their identity,
-  // credentials, validation, and audit boundary remain host-owned; do not add
-  // a second agent-runtime approval card just because ACP is the transport.
-  if (
-    context.isExternalSession &&
-    isWantaHostToolPermissionRequest(request) &&
-    !permissionRequestHasSensitiveResource(request) &&
-    !highRisk
-  ) {
-    return { type: "allow", reason: "wanta_host_tool", kind, highRisk }
-  }
+  const command = kind === "command" ? permissionCommand(request) : undefined
   // The guarded OOCLI fallback is a Wanta-owned Link transport just like the
   // host MCP path. Apply the same narrow command classifier to every adapter
   // so switching from OpenCode to Claude/Codex does not add a redundant shell
   // approval. Unknown shell composition, sensitive resources, and high-risk
-  // commands continue into the external agent's native permission flow.
-  if (
-    context.isExternalSession &&
-    context.linkRuntime &&
-    isOoCliPermissionRequest(request) &&
-    !permissionRequestHasSensitiveResource(request) &&
-    !highRisk
-  ) {
-    return { type: "allow", reason: "oo_cli", kind, highRisk }
-  }
-  if (context.isExternalSession) {
-    // linkcode-style pass-through: the external agent's own CLI policy decides
-    // WHEN to ask (its native permission modes: acceptEdits, auto classifier,
-    // sandbox levels, ...), and Wanta relays every ask to the user instead of
-    // answering through host-side policy. The only automatic answers are the
-    // user's own explicit "allow for this session" grants, and even those
-    // cannot cross credential boundaries or approve high-risk commands.
-    if (permissionRequestHasSensitiveResource(request) || highRisk) {
-      return { type: "prompt", kind, highRisk }
-    }
-    if (
-      hasMatchingNarrowSessionGrant(
-        request,
-        context.sessionGrants,
-        context.trustedProjectRoot,
-        context.activeGenerationId,
-      ) ||
-      hasMatchingGenericSessionGrant(request, context.sessionGrants)
-    ) {
-      return { type: "allow", reason: "session_grant", kind, highRisk }
-    }
-    return { type: "prompt", kind, highRisk }
-  }
+  // commands continue through the shared Wanta permission flow.
   const openConnectorPolicy =
-    context.linkRuntime === "openconnector" && kind === "command"
-      ? openConnectorCommandPolicy(permissionCommand(request) ?? request.resources.join(" "))
-      : null
+    kind === "command" ? openConnectorCommandPolicy(command ?? request.resources.join(" ")) : null
   if (openConnectorPolicy === "deny") return { type: "deny", kind, highRisk }
-  if (openConnectorPolicy === "allow") return { type: "allow", reason: "oo_cli", kind, highRisk }
   if (context.permissionMode === "full_access") {
     return { type: "allow", reason: "full_access", kind, highRisk }
   }
@@ -180,7 +133,6 @@ export function evaluateLocalAccessRequest(
   if (permissionRequestHasSensitiveResource(request)) {
     return { type: "prompt", kind, highRisk }
   }
-  const command = kind === "command" ? permissionCommand(request) : undefined
   if (
     highRisk &&
     command &&
@@ -194,6 +146,12 @@ export function evaluateLocalAccessRequest(
   if (highRisk) {
     return { type: "prompt", kind, highRisk }
   }
+  if (isOoCliPermissionRequest(request)) return { type: "allow", reason: "oo_cli", kind, highRisk }
+  // OOMOL's bundled `oo` CLI is a first-party working channel. A parser miss
+  // must not make an otherwise ordinary command stricter than the baseline
+  // local-command policy merely because the command contains `oo`. Compound
+  // commands continue below, where credential, sensitive-resource, high-risk,
+  // dependency, and project boundaries have already been applied.
   if (
     (context.taskProcessRoot &&
       (isTaskScopedPythonDependencyInstallRequest(request, context.taskProcessRoot) ||
@@ -220,9 +178,6 @@ export function evaluateLocalAccessRequest(
   if (permissionRequestNeedsDefaultPrompt(request)) {
     return { type: "prompt", kind, highRisk }
   }
-  if (context.linkRuntime && isOoCliPermissionRequest(request)) {
-    return { type: "allow", reason: "oo_cli", kind, highRisk }
-  }
   if (context.trustedProjectRoot && projectPermissionRequestInsideRoot(request, context.trustedProjectRoot)) {
     return { type: "allow", reason: "trusted_project", kind, highRisk }
   }
@@ -236,6 +191,29 @@ export function evaluateLocalAccessRequest(
     return { type: "allow", reason: "default_local", kind, highRisk }
   }
   return { type: "prompt", kind, highRisk }
+}
+
+export function evaluateLocalAccessRequest(
+  request: ChatPermissionRequest,
+  context: LocalAccessPolicyContext,
+): LocalAccessDecision {
+  const kind = permissionRequestKind(request)
+  const highRisk = isHighRiskPermissionRequest(request)
+  // This is deliberately the only adapter-specific policy branch, and it can
+  // only make an external-agent decision more permissive. All other requests
+  // go through the baseline that powered the built-in OpenCode experience;
+  // BYOA must never add a prompt or denial for the same normalized operation.
+  // Wanta host MCP tools are transport for the same capability kernel that
+  // OpenCode invokes directly, so a second native-runtime prompt is redundant.
+  if (
+    context.isExternalSession &&
+    isWantaHostToolPermissionRequest(request) &&
+    !permissionRequestHasSensitiveResource(request) &&
+    !highRisk
+  ) {
+    return { type: "allow", reason: "wanta_host_tool", kind, highRisk }
+  }
+  return evaluateBaselineLocalAccessRequest(request, context)
 }
 
 export function localAccessGrantForRequest(

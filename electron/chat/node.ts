@@ -1,3 +1,4 @@
+import type { ChatAgentBackend } from "../agent/contract/chat-backend.ts"
 import type { AgentConnectionStatus } from "../agent/contract/event.ts"
 import type { ExternalAgentKind } from "../agent/contract/profile.ts"
 import type { ChatEmit } from "../agent/event-translator.ts"
@@ -72,7 +73,7 @@ import { copyFile, readFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { ActivityMetrics } from "../activity-metrics.ts"
-import { externalAgentKindForSessionId } from "../agent/external/session-id.ts"
+import { externalAgentKindForSessionId, isExternalSessionId } from "../agent/external/session-id.ts"
 import { createOpencodeMessageId } from "../agent/opencode-id.ts"
 import { logDiagnostic } from "../diagnostics-log.ts"
 import { captureGitTurnBaseline } from "../git/turn-diff.ts"
@@ -163,6 +164,27 @@ async function removeUnsubmittedTurnDirectories(
   ).catch((error: unknown) => {
     console.warn("[wanta] failed to clean unsubmitted turn directories", error)
   })
+}
+
+async function createManagedTurnDirectoryPair(
+  createArtifactDir: () => Promise<string>,
+  createProcessDir: () => Promise<string>,
+  remember: { artifactDir: (value: string) => void; processDir: (value: string) => void },
+): Promise<void> {
+  const [artifactResult, processResult] = await Promise.allSettled([createArtifactDir(), createProcessDir()])
+  if (artifactResult.status === "fulfilled" && artifactResult.value) remember.artifactDir(artifactResult.value)
+  if (processResult.status === "fulfilled" && processResult.value) remember.processDir(processResult.value)
+  const errors = [artifactResult, processResult]
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason)
+  if (errors.length === 1) throw errors[0]
+  if (errors.length > 1) throw new AggregateError(errors, "Failed to create turn directories")
+  if (artifactResult.status !== "fulfilled" || !artifactResult.value) {
+    throw new Error("Artifact directory creation returned an empty path")
+  }
+  if (processResult.status !== "fulfilled" || !processResult.value) {
+    throw new Error("Process directory creation returned an empty path")
+  }
 }
 
 /** 仅放行 http/https 的外开 URL，避免渲染层诱导主进程打开 file:// 或自定义协议。 */
@@ -274,6 +296,11 @@ interface ChatServiceDeps {
   onOomolAuthRequired?: () => Promise<void> | void
   /** 权限模式由 ChatService 统一提交，避免 renderer 分别写运行态与会话元数据。 */
   onPermissionModeChanged?: (sessionId: string, permissionMode: AgentPermissionMode) => Promise<void> | void
+  /** Persist agent-native model/effort choices with the owning Wanta session. */
+  onExternalSessionSelectionChanged?: (
+    sessionId: string,
+    patch: { modelId?: string | null; effortId?: string | null },
+  ) => Promise<void> | void
   /** 正常完成且产物已收尾后通知主进程 attention 域；停止和错误路径不触发。 */
   onSessionCompleted?: (input: { teamId: string; runId: string; sessionId: string }) => Promise<void> | void
 }
@@ -293,6 +320,18 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   /** External (BYOA) adapters, app-lifetime, keyed by agent kind. */
   private externalAgents: ReadonlyMap<ExternalAgentKind, ExternalAgentAdapter> = new Map()
   private externalAgentUnsubscribes: Array<() => void> = []
+  /** Per-session/axis tails keep native selection, persistence, and rollback ordered. */
+  private readonly externalSelectionMutationTails = new Map<string, Promise<void>>()
+  /** Latest successfully persisted mutation owner per axis. */
+  private readonly externalSelectionMutationTokens = new Map<string, number>()
+  /** Monotonic token source; reservations are distinct even when an earlier mutation fails. */
+  private readonly externalSelectionMutationSequences = new Map<string, number>()
+  /** Permanent tombstones: external session UUIDs are never reused after deletion. */
+  private readonly deletedExternalSelectionSessions = new Set<string>()
+  /** Permission changes serialize so a duplicate same-mode request can retry a failed projection. */
+  private readonly permissionModeMutationTails = new Map<string, Promise<void>>()
+  /** Ownership token for async permission persistence/projection and rollback. */
+  private readonly permissionModeMutationTokens = new Map<string, number>()
   private readonly userStops = new UserStopTracker()
   private emittedMessageErrors = new Map<string, Set<string>>()
   private readonly generations = new GenerationRegistry()
@@ -393,6 +432,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     this.trustedAccess.clear()
     this.subagentSessions.clear()
     this.permissions.clear()
+    this.permissionModeMutationTokens.clear()
     this.outputPersistence.reset()
     this.desiredWorkspaceTeamName = undefined
     this.startedMessages.clear()
@@ -446,19 +486,122 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   }
 
   public async setExternalSessionModel(req: SetExternalSessionModelRequest): Promise<void> {
-    await this.externalAdapterFor(req.sessionId).send({
-      type: "set-model",
-      sessionId: req.sessionId,
-      ...(req.modelId ? { modelId: req.modelId } : {}),
+    await this.runExternalSelectionMutation(req.sessionId, "model", async () => {
+      const adapter = this.externalAdapterFor(req.sessionId)
+      const previous = adapter.sessionSelection(req.sessionId).modelId
+      await adapter.send({
+        type: "set-model",
+        sessionId: req.sessionId,
+        ...(req.modelId ? { modelId: req.modelId } : {}),
+      })
+      try {
+        await this.deps.onExternalSessionSelectionChanged?.(req.sessionId, { modelId: req.modelId ?? null })
+      } catch (error) {
+        await adapter
+          .send({ type: "set-model", sessionId: req.sessionId, ...(previous ? { modelId: previous } : {}) })
+          .catch(() => undefined)
+        throw error
+      }
     })
   }
 
   public async setExternalSessionEffort(req: SetExternalSessionEffortRequest): Promise<void> {
-    await this.externalAdapterFor(req.sessionId).send({
-      type: "set-effort",
-      sessionId: req.sessionId,
-      ...(req.effortId ? { effortId: req.effortId } : {}),
+    await this.runExternalSelectionMutation(req.sessionId, "effort", async () => {
+      const adapter = this.externalAdapterFor(req.sessionId)
+      const previous = adapter.sessionSelection(req.sessionId).effortId
+      await adapter.send({
+        type: "set-effort",
+        sessionId: req.sessionId,
+        ...(req.effortId ? { effortId: req.effortId } : {}),
+      })
+      try {
+        await this.deps.onExternalSessionSelectionChanged?.(req.sessionId, { effortId: req.effortId ?? null })
+      } catch (error) {
+        await adapter
+          .send({ type: "set-effort", sessionId: req.sessionId, ...(previous ? { effortId: previous } : {}) })
+          .catch(() => undefined)
+        throw error
+      }
     })
+  }
+
+  private runExternalSelectionMutation(
+    sessionId: string,
+    axis: "model" | "effort",
+    mutation: () => Promise<void>,
+  ): Promise<number> {
+    if (this.deletedExternalSelectionSessions.has(sessionId)) {
+      return Promise.reject(new Error("The external agent session was deleted."))
+    }
+    const key = `${sessionId}\0${axis}`
+    const token = (this.externalSelectionMutationSequences.get(key) ?? 0) + 1
+    this.externalSelectionMutationSequences.set(key, token)
+    const previous = this.externalSelectionMutationTails.get(key) ?? Promise.resolve()
+    let next!: Promise<void>
+    next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await mutation()
+        this.externalSelectionMutationTokens.set(key, token)
+      })
+      .finally(() => {
+        if (this.externalSelectionMutationTails.get(key) === next) {
+          this.externalSelectionMutationTails.delete(key)
+        }
+      })
+    this.externalSelectionMutationTails.set(key, next)
+    return next.then(() => token)
+  }
+
+  private runExternalSelectionRollback(
+    sessionId: string,
+    axis: "model" | "effort",
+    ownerToken: number,
+    mutation: () => Promise<void>,
+  ): Promise<void> {
+    // A rejected prompt may finish after forgetSession observed an idle queue.
+    // Its rollback no longer owns any durable state and must stay a no-op.
+    if (this.deletedExternalSelectionSessions.has(sessionId)) return Promise.resolve()
+    const key = `${sessionId}\0${axis}`
+    const rollbackToken = (this.externalSelectionMutationSequences.get(key) ?? 0) + 1
+    this.externalSelectionMutationSequences.set(key, rollbackToken)
+    const previous = this.externalSelectionMutationTails.get(key) ?? Promise.resolve()
+    let next!: Promise<void>
+    next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        // Check after earlier queued updates settle: a successful newer value
+        // owns the axis, while a failed newer mutation must not suppress the
+        // rollback of the still-persisted prompt value.
+        if (this.externalSelectionMutationTokens.get(key) !== ownerToken) return
+        await mutation()
+        this.externalSelectionMutationTokens.set(key, rollbackToken)
+      })
+      .finally(() => {
+        if (this.externalSelectionMutationTails.get(key) === next) {
+          this.externalSelectionMutationTails.delete(key)
+        }
+      })
+    this.externalSelectionMutationTails.set(key, next)
+    return next
+  }
+
+  private async settleExternalSelectionMutations(sessionId: string): Promise<void> {
+    for (const axis of ["model", "effort"] as const) {
+      const key = `${sessionId}\0${axis}`
+      // A mutation can enqueue another mutation while the current tail is
+      // settling. Re-read the tail until the axis is genuinely idle, then the
+      // deletion cleanup can remove its bookkeeping without a late callback
+      // recreating tokens for the deleted session.
+      for (;;) {
+        const tail = this.externalSelectionMutationTails.get(key)
+        if (!tail) break
+        await tail.catch(() => undefined)
+      }
+      this.externalSelectionMutationTails.delete(key)
+      this.externalSelectionMutationTokens.delete(key)
+      this.externalSelectionMutationSequences.delete(key)
+    }
   }
 
   public async getExternalSessionSelection(sessionId: string): Promise<{ modelId?: string; effortId?: string }> {
@@ -479,34 +622,25 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   }
 
   /** Resolve the backend that owns a session id (kernel or an external adapter). */
-  private chatBackendFor(sessionId: string): OpencodeAgentAdapter | ExternalAgentAdapter | null {
+  private chatBackendFor(sessionId: string): ChatAgentBackend | null {
     const kind = externalAgentKindForSessionId(sessionId)
-    if (kind) {
-      return this.externalAgents.get(kind) ?? null
+    if (isExternalSessionId(sessionId)) {
+      return kind ? (this.externalAgents.get(kind) ?? null) : null
     }
     return this.agent
   }
 
   /**
-   * Best-effort projection of a permission mode onto the session's adapter.
-   * Backends without the capability (the kernel) are a silent no-op; failures
-   * never block the caller because enforcement stays agent-side anyway.
+   * Project the host-visible permission mode onto the native agent before a
+   * turn starts. Native enforcement is the security boundary, so a failed
+   * projection must fail closed instead of running under a stale mode.
    */
   private async projectPermissionMode(sessionId: string, mode: AgentPermissionMode): Promise<void> {
     const backend = this.chatBackendFor(sessionId)
-    if (!backend || !("applyPermissionMode" in backend) || !backend.applyPermissionMode) {
+    if (!backend?.applyPermissionMode) {
       return
     }
-    try {
-      await backend.applyPermissionMode(sessionId, mode)
-    } catch (error) {
-      logDiagnostic(
-        "chat-service",
-        "failed to project permission mode onto external agent",
-        { error, kind: externalAgentKindForSessionId(sessionId), sessionId },
-        "warn",
-      )
-    }
+    await backend.applyPermissionMode(sessionId, mode)
   }
 
   public setAgentStatus(status: AgentRuntimeStatus): void {
@@ -535,7 +669,9 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
 
   /** 会话永久删除后释放运行态索引，并删除授权/停止 overlay。 */
   public async forgetSession(sessionId: string): Promise<void> {
+    this.deletedExternalSelectionSessions.add(sessionId)
     this.generations.get(sessionId)?.controller.abort()
+    const selectionMutationsSettled = this.settleExternalSelectionMutations(sessionId)
     this.turnOutputs.delete(sessionId)
     this.turnOutputs.clearPending(sessionId)
     this.clearSessionGeneration(sessionId)
@@ -547,6 +683,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     this.clearInternalMessages(sessionId)
     this.compactingSessions.delete(sessionId)
     this.permissions.deleteSession(sessionId)
+    this.permissionModeMutationTokens.delete(sessionId)
     this.trustedAccess.deleteSession(sessionId)
     const messageIds = this.managedUserMessageIdsBySession.get(sessionId)
     for (const messageId of messageIds ?? []) {
@@ -554,6 +691,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       this.internalAttachmentPathsByMessage.delete(messageId)
     }
     this.managedUserMessageIdsBySession.delete(sessionId)
+    await selectionMutationsSettled
     await this.outputPersistence.removeSession(sessionId)
   }
 
@@ -1231,6 +1369,16 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     return generation
   }
 
+  private beginChatTurn(req: SendMessageRequest, userMessageId: string): SessionGeneration {
+    const generation = this.beginSessionGeneration(req.sessionId, userMessageId)
+    this.createActiveRun(req, generation)
+    this.userStops.delete(req.sessionId)
+    this.connectionFailedSessions.delete(req.sessionId)
+    this.clearMessageErrorSignatures(req.sessionId)
+    this.emitSessionActivity(req.sessionId)
+    return generation
+  }
+
   /** session.idle 不带 message/generation id；用本轮用户消息核对历史，避免旧 idle 结束刚重试的新轮次。 */
   private async completeSessionGeneration(
     emit: (event: string, data: unknown) => Promise<void>,
@@ -1611,9 +1759,15 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   }
 
   public async sendMessage(req: SendMessageRequest): Promise<void> {
+    if (!req.text.trim()) {
+      throw new Error("Message text is empty.")
+    }
     const externalKind = externalAgentKindForSessionId(req.sessionId)
     if (externalKind) {
       return this.sendExternalMessage(req, externalKind)
+    }
+    if (isExternalSessionId(req.sessionId)) {
+      throw new Error("Invalid or unsupported external agent session.")
     }
     if (!this.agent) {
       throw new Error("Agent not configured (sign in first)")
@@ -1652,13 +1806,8 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
           ),
         )
       }
-      generation = this.beginSessionGeneration(req.sessionId, userMessageId)
-      this.createActiveRun(req, generation)
+      generation = this.beginChatTurn(req, userMessageId)
       const activeGeneration = generation
-      this.userStops.delete(req.sessionId)
-      this.connectionFailedSessions.delete(req.sessionId)
-      this.clearMessageErrorSignatures(req.sessionId)
-      this.emitSessionActivity(req.sessionId)
       const knowledgeBaseIds = (req.contextMentions ?? []).flatMap((mention) =>
         mention.kind === "knowledge" && mention.id.trim() ? [mention.id.trim()] : [],
       )
@@ -1681,17 +1830,14 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         ...(trustedProjectRoot ? { trustedProjectRoot } : {}),
       })
       const artifactProjectRoot = execution.artifactProjectRoot
-      const [artifactDirectoryResult, processDirectoryResult] = await Promise.allSettled([
-        this.agent.createArtifactDir(req.sessionId, artifactProjectRoot),
-        this.agent.createProcessDir(req.sessionId),
-      ])
-      if (artifactDirectoryResult.status === "fulfilled") artifactDir = artifactDirectoryResult.value
-      if (processDirectoryResult.status === "fulfilled") processDir = processDirectoryResult.value
-      const directoryErrors = [artifactDirectoryResult, processDirectoryResult]
-        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-        .map((result) => result.reason)
-      if (directoryErrors.length === 1) throw directoryErrors[0]
-      if (directoryErrors.length > 1) throw new AggregateError(directoryErrors, "Failed to create turn directories")
+      await createManagedTurnDirectoryPair(
+        () => this.agent!.createArtifactDir(req.sessionId, artifactProjectRoot),
+        () => this.agent!.createProcessDir(req.sessionId),
+        {
+          artifactDir: (value) => (artifactDir = value),
+          processDir: (value) => (processDir = value),
+        },
+      )
       if (!artifactDir || !processDir) throw new Error("Turn directory creation returned an empty path")
       if (!this.isCurrentGeneration(req.sessionId, activeGeneration.id) || activeGeneration.controller.signal.aborted) {
         this.clearSessionGeneration(req.sessionId, activeGeneration.id)
@@ -1835,10 +1981,6 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     if (req.attachments?.length && !adapter.profile.inputs.attachments) {
       throw new Error("Attachments are not supported for this agent yet.")
     }
-    // Main is the IPC boundary; a blank prompt must never spawn an agent turn.
-    if (!req.text.trim()) {
-      throw new Error("Message text is empty.")
-    }
     // Same trust boundary as the kernel path: attachment paths cross the IPC
     // boundary, so only picker-authorized or previously trusted paths may be
     // recorded and handed to the agent. Asserted BEFORE the single-generation
@@ -1854,14 +1996,14 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       req.permissionModeVersion,
     )
     const userMessageId = createOpencodeMessageId()
-    const generation = this.beginSessionGeneration(req.sessionId, userMessageId)
+    const generation = this.beginChatTurn(req, userMessageId)
+    const previousSelection: { modelId: string | undefined; effortId: string | undefined } = {
+      modelId: undefined,
+      effortId: undefined,
+    }
+    const promptSelectionOwners: Partial<Record<"model" | "effort", number>> = {}
     let artifactDir: string | undefined
     let processDir: string | undefined
-    this.createActiveRun(req, generation)
-    this.userStops.delete(req.sessionId)
-    this.connectionFailedSessions.delete(req.sessionId)
-    this.clearMessageErrorSignatures(req.sessionId)
-    this.emitSessionActivity(req.sessionId)
     try {
       const teamName = teamNameFromRequest(req)
       const trustedProjectRoot = await this.resolveTrustedProjectRoot(req.projectContext)
@@ -1879,18 +2021,19 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         ...(trustedProjectRoot ? { trustedProjectRoot } : {}),
       })
       const artifactProjectRoot = execution.artifactProjectRoot
-      const [artifactDirectoryResult, processDirectoryResult] = await Promise.allSettled([
-        directories.createArtifactDir(req.sessionId, artifactProjectRoot),
-        directories.createProcessDir(req.sessionId),
-      ])
-      if (artifactDirectoryResult.status === "fulfilled") artifactDir = artifactDirectoryResult.value
-      if (processDirectoryResult.status === "fulfilled") processDir = processDirectoryResult.value
-      const directoryErrors = [artifactDirectoryResult, processDirectoryResult]
-        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-        .map((result) => result.reason)
-      if (directoryErrors.length === 1) throw directoryErrors[0]
-      if (directoryErrors.length > 1) throw new AggregateError(directoryErrors, "Failed to create turn directories")
+      await createManagedTurnDirectoryPair(
+        () => directories.createArtifactDir(req.sessionId, artifactProjectRoot),
+        () => directories.createProcessDir(req.sessionId),
+        {
+          artifactDir: (value) => (artifactDir = value),
+          processDir: (value) => (processDir = value),
+        },
+      )
       if (!artifactDir || !processDir) throw new Error("Turn directory creation returned an empty path")
+      const additionalDirectories = [
+        directories.artifactSessionDir(req.sessionId, artifactProjectRoot),
+        directories.processSessionDir(req.sessionId),
+      ]
       if (!this.isCurrentGeneration(req.sessionId, generation.id) || generation.controller.signal.aborted) {
         this.clearSessionGeneration(req.sessionId, generation.id)
         await removeUnsubmittedTurnDirectories(artifactDir, processDir)
@@ -1925,6 +2068,18 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         this.discardTrustedAttachmentPaths(req.attachments)
       }
       await this.projectPermissionMode(req.sessionId, this.sessionPermissionMode(req.sessionId))
+      if (req.agentModelId) {
+        promptSelectionOwners.model = await this.runExternalSelectionMutation(req.sessionId, "model", async () => {
+          previousSelection.modelId = adapter.sessionSelection(req.sessionId).modelId
+          await this.deps.onExternalSessionSelectionChanged?.(req.sessionId, { modelId: req.agentModelId })
+        })
+      }
+      if (req.agentEffortId) {
+        promptSelectionOwners.effort = await this.runExternalSelectionMutation(req.sessionId, "effort", async () => {
+          previousSelection.effortId = adapter.sessionSelection(req.sessionId).effortId
+          await this.deps.onExternalSessionSelectionChanged?.(req.sessionId, { effortId: req.agentEffortId })
+        })
+      }
       this.activeRuns.update(req.sessionId, { phase: "submitted" })
       this.scheduleGenerationSubmitWatchdog(req.sessionId, generation.id)
       void adapter
@@ -1935,6 +2090,8 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
             text: req.text,
             messageId: userMessageId,
             ...(req.attachments?.length ? { attachments: req.attachments } : {}),
+            ...(artifactProjectRoot ? { workingDirectory: artifactProjectRoot } : {}),
+            additionalDirectories,
             ...(artifactProjectRoot ? { outputProjectRoot: artifactProjectRoot } : {}),
             artifactDir,
             processDir,
@@ -1961,7 +2118,8 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
             this.scheduleGenerationStartWatchdog(req.sessionId, generation.id)
           }
         })
-        .catch((error: unknown) => {
+        .catch(async (error: unknown) => {
+          await this.rollbackPromptSelectionPersistence(req.sessionId, promptSelectionOwners, previousSelection)
           this.turnOutputs.removePending(req.sessionId, artifactDir, processDir)
           this.turnOutputs.delete(req.sessionId, generation.id)
           void removeUnsubmittedTurnDirectories(artifactDir, processDir)
@@ -1986,12 +2144,40 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
           )
         })
     } catch (error) {
+      await this.rollbackPromptSelectionPersistence(req.sessionId, promptSelectionOwners, previousSelection)
       this.turnOutputs.removePending(req.sessionId, artifactDir, processDir)
       this.turnOutputs.delete(req.sessionId, generation.id)
       await removeUnsubmittedTurnDirectories(artifactDir, processDir)
       this.clearSessionGeneration(req.sessionId, generation.id)
       throw error
     }
+  }
+
+  private async rollbackPromptSelectionPersistence(
+    sessionId: string,
+    owners: Partial<Record<"model" | "effort", number>>,
+    previous: { modelId: string | undefined; effortId: string | undefined },
+  ): Promise<void> {
+    const rollbacks: Promise<void>[] = []
+    if (owners.model !== undefined) {
+      rollbacks.push(
+        this.runExternalSelectionRollback(sessionId, "model", owners.model, async () => {
+          await this.deps.onExternalSessionSelectionChanged?.(sessionId, { modelId: previous.modelId ?? null })
+        }),
+      )
+      delete owners.model
+    }
+    if (owners.effort !== undefined) {
+      rollbacks.push(
+        this.runExternalSelectionRollback(sessionId, "effort", owners.effort, async () => {
+          await this.deps.onExternalSessionSelectionChanged?.(sessionId, { effortId: previous.effortId ?? null })
+        }),
+      )
+      delete owners.effort
+    }
+    await Promise.all(rollbacks).catch((error: unknown) => {
+      logDiagnostic("chat-service", "failed to roll back rejected prompt selection", { error, sessionId }, "error")
+    })
   }
 
   private async rollbackUnsubmittedUserAttachments(
@@ -2493,6 +2679,21 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   }
 
   public async setPermissionMode(req: SetChatPermissionModeRequest): Promise<void> {
+    const previous = this.permissionModeMutationTails.get(req.sessionId) ?? Promise.resolve()
+    let next!: Promise<void>
+    next = previous
+      .catch(() => undefined)
+      .then(() => this.applyPermissionModeMutation(req))
+      .finally(() => {
+        if (this.permissionModeMutationTails.get(req.sessionId) === next) {
+          this.permissionModeMutationTails.delete(req.sessionId)
+        }
+      })
+    this.permissionModeMutationTails.set(req.sessionId, next)
+    return next
+  }
+
+  private async applyPermissionModeMutation(req: SetChatPermissionModeRequest): Promise<void> {
     const previousMode = this.sessionPermissionMode(req.sessionId)
     if (!this.setSessionPermissionModeValue(req.sessionId, req.permissionMode, req.version)) {
       return
@@ -2500,22 +2701,47 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     if (previousMode === req.permissionMode) {
       return
     }
+    const mutationToken = (this.permissionModeMutationTokens.get(req.sessionId) ?? 0) + 1
+    this.permissionModeMutationTokens.set(req.sessionId, mutationToken)
+    const ownsMutation = (): boolean =>
+      this.permissionModeMutationTokens.get(req.sessionId) === mutationToken &&
+      this.sessionPermissionMode(req.sessionId) === req.permissionMode &&
+      (req.version === undefined || this.permissions.modeVersion(req.sessionId) === req.version)
     try {
       await this.deps.onPermissionModeChanged?.(req.sessionId, req.permissionMode)
     } catch (error) {
       // 仅回滚仍由本次请求持有的运行态；不能覆盖等待期间抵达的更新版本。
-      if (this.sessionPermissionMode(req.sessionId) === req.permissionMode) {
+      if (ownsMutation()) {
         this.setSessionPermissionModeValue(req.sessionId, previousMode)
       }
       throw error
     }
     // 持久化等待期间可能已有更新版本接管该会话，旧请求不得继续改子会话或自动批准权限。
-    if (this.sessionPermissionMode(req.sessionId) !== req.permissionMode) {
+    if (!ownsMutation()) {
       return
     }
     // Sessions with an adapter-side mode get it projected immediately
-    // (mid-run switches must not wait for the next prompt); best effort.
-    await this.projectPermissionMode(req.sessionId, req.permissionMode)
+    // (mid-run switches must not wait for the next prompt). If native
+    // enforcement rejects it, restore host memory and persisted metadata so
+    // the same user choice remains retryable.
+    try {
+      await this.projectPermissionMode(req.sessionId, req.permissionMode)
+    } catch (error) {
+      if (ownsMutation()) {
+        this.setSessionPermissionModeValue(req.sessionId, previousMode)
+        await Promise.resolve(this.deps.onPermissionModeChanged?.(req.sessionId, previousMode)).catch(
+          (rollbackError: unknown) => {
+            logDiagnostic(
+              "chat-service",
+              "failed to persist permission mode rollback",
+              { error: rollbackError, sessionId: req.sessionId },
+              "error",
+            )
+          },
+        )
+      }
+      throw error
+    }
     const affectedSessionIds = [req.sessionId]
     for (const childSessionId of this.subagentSessions.trustedChildSessionIds(req.sessionId)) {
       if (this.setSessionPermissionModeValue(childSessionId, req.permissionMode, req.version)) {

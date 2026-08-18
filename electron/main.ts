@@ -103,7 +103,11 @@ import { DingTalkCliManager } from "./link-runtime/dingtalk-cli.ts"
 import { LarkCliManager } from "./link-runtime/lark-cli.ts"
 import { LinkRuntimeManager, LinkRuntimeServiceImpl } from "./link-runtime/node.ts"
 import { WecomCliManager } from "./link-runtime/wecom-cli.ts"
-import { isAudioOnlyMediaRequest, isTrustedRendererUrl } from "./media-permission-policy.ts"
+import {
+  isAllowedMainWindowSubframeNavigation,
+  isAudioOnlyMediaRequest,
+  isTrustedRendererUrl,
+} from "./media-permission-policy.ts"
 import { ModelCredentialStore } from "./models/credential-store.ts"
 import { ModelsServiceImpl } from "./models/node.ts"
 import { ModelsStore } from "./models/store.ts"
@@ -450,6 +454,8 @@ const chatService = new ChatServiceImpl(null, {
   userAttachmentStore,
   onPermissionModeChanged: (sessionId, permissionMode) =>
     sessionService.setPermissionMode({ id: sessionId, permissionMode }),
+  onExternalSessionSelectionChanged: (sessionId, patch) =>
+    sessionService.setAgentSelection({ id: sessionId, ...patch }),
   onOomolAuthRequired: () => authManager.expireSession().then(() => undefined),
   onSetAgentTeam: handleAgentTeamChanged,
   onSessionCompleted: (input) => attentionService.completeSession(input),
@@ -940,6 +946,14 @@ async function applyAuthAccountNow(account: AuthRuntimeAccount | null): Promise<
   const runtimeVersionAtStart = agentRuntimeVersion
   const runtimeModels = await modelsStore.runtimeModels()
   const runtime = resolveAgentRuntime(account, runtimeModels.selected, runtimeModels.customModels)
+  // On a cross-account switch, drop the previous account's team BEFORE it is
+  // baked into linkRuntime (and thus the new sidecar's oo identity/team-scope);
+  // otherwise a personal-workspace account inherits the old team and defeats the
+  // oo-guard fail-closed check. The renderer re-asserts the team after login.
+  // The later reset at the account-switch branch below stays for attention state.
+  if (appliedAccount && appliedAccount.id !== account?.id) {
+    activeAgentTeamName = undefined
+  }
   const linkRuntime =
     (await linkRuntimeManager.selectedRuntime()) === "oomol"
       ? account
@@ -1352,6 +1366,11 @@ function createMainWindow(): void {
     if (!isTrustedRendererUrl(url, viteDevServerUrl, rendererBaseUrl)) {
       event.preventDefault()
       openExternalUrl(url)
+    }
+  })
+  mainWindow.webContents.on("will-frame-navigate", (event) => {
+    if (!event.isMainFrame && !isAllowedMainWindowSubframeNavigation(event.url)) {
+      event.preventDefault()
     }
   })
   mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {

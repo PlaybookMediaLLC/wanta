@@ -13,6 +13,12 @@ OpenCode kernel, Claude Code, ACP agents — sits behind one interface,
 - `start()` / `stop()` — lifecycle
 - `profile` — static capability declaration (`AGENT_PROFILES` in `contract/profile.ts`)
 
+`ChatAgentBackend` in `contract/chat-backend.ts` is the composed host-facing
+surface used by the chat service after session routing. It adds history and
+pending-interaction reads without putting OpenCode-only deep features into the
+protocol adapter contract. External native adapters normally extend
+`ExternalAgentAdapter`, which supplies the transcript-backed implementation.
+
 There are deliberately **no per-feature methods** (`prompt()`, `setModel()`, ...).
 A new kind of interaction is a new variant on `AgentInput` or `AgentEvent`.
 
@@ -73,14 +79,22 @@ External agents build on `electron/agent/external/`:
   is declared per agent in `AgentProfile.permissionModes` and projected onto
   the agent's own approval policy (Claude SDK permission modes, including the
   `auto` classifier mode; ACP session modes via the registry's
-  `permissionModeMap`). Enforcement is always agent-side.
-- **Native permission ownership is agent-side, host capability permission is
-  host-side**: the external agent's CLI decides WHEN native file, shell, and
-  network work needs approval, and Wanta relays those asks to the user. The one
-  deliberate exception is dispatch to a generated `wanta_*` MCP server:
-  Wanta auto-approves that redundant ACP transport prompt because the call
-  enters the same host-owned capability kernel used directly by OpenCode,
-  where identity, credentials, validation, and auditing are already enforced.
+  `permissionModeMap`). Enforcement is always agent-side. Applying a declared
+  mode is fail-closed: a missing or rejected native mode blocks the turn rather
+  than silently continuing under a stale, potentially broader mode.
+- **Native enforcement is agent-side; user-visible approval semantics are
+  host-owned**: an external CLI keeps its sandbox and decides when it needs an
+  interactive native permission response. Every such request is normalized and
+  evaluated by the same Wanta local-access policy used for the built-in kernel.
+  Ordinary operations are answered automatically; protected or consequential
+  boundaries reach the user. Switching agents must not change the decision for
+  the same normalized operation, permission mode, and host context. A
+  non-sensitive, non-high-risk dispatch to a generated `wanta_*` MCP server is
+  also auto-approved at the transport layer: Wanta auto-approves that redundant
+  ACP transport prompt because the call enters the same host-owned capability
+  kernel used directly by OpenCode, where identity, credentials, validation,
+  and auditing are already enforced. Sensitive or high-risk host-tool requests
+  still continue through the shared prompt-or-deny policy.
   Claude's native `Skill` discovery tool is also auto-approved because it only
   loads local instructions; any file, shell, or network operation instructed
   by that Skill remains subject to Claude's normal permission flow. Claude MCP
@@ -90,16 +104,21 @@ External agents build on `electron/agent/external/`:
   validator.
   The guarded `oo` CLI compatibility path is classified by the same shared
   command policy for OpenCode, Claude, and ACP agents. A single `oo` command
-  may include only the shared bounded output suffixes (`head`/`tail` or stderr
-  descriptor duplication); arbitrary pipes, sequences, file redirection,
-  credential/configuration overrides, and authentication commands remain in
-  the native approval flow. Loaded Skills also receive a host execution
+  receives a fast-path allow when it includes only the shared bounded output
+  suffixes (`head`/`tail` or stderr descriptor duplication). Other ordinary
+  pipelines, sequences, and file redirections fall through to the same
+  baseline local-command policy that applied before BYOA; a parser miss must
+  never make `oo` stricter merely because it is present. Sensitive paths,
+  high-risk operations, credential/configuration overrides, and authentication
+  commands remain protected. Loaded Skills also receive a host execution
   policy: Wanta MCP capabilities take precedence over CLI examples, so the raw
   CLI remains a fallback rather than an agent-specific primary transport.
   Explicit session grants still never cross sensitive-resource or high-risk
-  boundaries. The kernel's other blanket defaults (`default_local` /
-  `default_command`, trusted-project allows, host-side `full_access`) continue
-  to apply only to built-in kernel sessions.
+  boundaries. The shared defaults (`default_local` / `default_command`,
+  trusted-project allows, and host-side `full_access`) apply to every adapter.
+  External sessions also register Wanta's stable artifact/process roots with
+  their native runtime so ordinary managed-output writes do not create a
+  redundant sandbox escalation.
 - **Transcript persistence**: every emitted event is folded into
   `ExternalTranscriptRecorder` and mirrored to one JSON file per session under
   `<scratchRoot>/<kind>/transcripts/` (atomic replace, debounced writes,
@@ -115,7 +134,8 @@ External agents build on `electron/agent/external/`:
   `ExternalAgentRuntimeStatus.catalog` and the UI renders them verbatim; a
   `warmCatalog()` pass (throwaway ACP session closed right away, or an idle
   Claude query) fills the catalog before the first user session so draft-time
-  pickers show the real lists.
+  pickers show the real lists. Per-session choices are also stored in Wanta's
+  session metadata so they survive renderer reloads and full app restarts.
 - **Attachments**: delivered as file references the agent resolves with its
   own tools and permission model — never inlined into the payload. The ACP
   adapter appends one `resource_link` block per attachment (baseline prompt
@@ -167,7 +187,9 @@ External agents build on `electron/agent/external/`:
 Record<AgentKind, AgentProfile>` on `AGENT_PROFILES` breaks the build until
    the new profile row exists. Declare only capabilities the adapter genuinely
    implements.
-2. Implement the adapter extending `BaseAgentAdapter`:
+2. Implement the native adapter by extending `ExternalAgentAdapter` (or by
+   implementing `ChatAgentBackend` directly when another host component owns
+   transcript and pending-interaction reads):
    - required hooks: `handleStart`, `handleStop`, `handlePrompt`, `handleCancel`
    - override optional hooks only for declared capabilities
    - translate native events in a stateless translator module (pattern:

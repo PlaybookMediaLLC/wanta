@@ -32,11 +32,15 @@ import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { Readable, Writable } from "node:stream"
 import { pathToFileURL } from "node:url"
+import { detectCliExecutable } from "../../agents/catalog.ts"
+import { resolveUserCommandPath } from "../../command-path.ts"
 import { errorMessage, logDiagnostic } from "../../diagnostics-log.ts"
 import { AGENT_PROFILES } from "../contract/profile.ts"
 import { ExternalAgentAdapter } from "../external/adapter-base.ts"
+import { externalExecutableNeedsShell } from "../external/executable.ts"
 import { externalAgentPromptText } from "../external/prompt.ts"
 import { externalSessionUuid } from "../external/session-id.ts"
+import { appendStderrTail, subprocessFailureSummary } from "../external/subprocess-diagnostics.ts"
 import { createAcpSessionTranslator } from "./translator.ts"
 
 // Generic ACP agent adapter (BYOA phase 2).
@@ -66,6 +70,8 @@ export interface AcpTransport {
   stream: Stream
   dispose: () => void
   onExit?: (cb: (info: { code: number | null }) => void) => void
+  /** Best-effort subprocess failure detail captured without mixing stderr into ACP stdout. */
+  failureDetail?: () => string | undefined
 }
 
 export interface AcpAdapterOptions {
@@ -91,6 +97,38 @@ interface AcpConnectionHandle {
   dispose: () => void
   /** Set once the connection is torn down so loss handling runs exactly once. */
   lost: boolean
+}
+
+/** Resolve bridge-specific native executables without adding per-agent branches. */
+export async function acpSubprocessEnvironment(
+  registration: AcpAgentRegistration,
+  pathEnv: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<NodeJS.ProcessEnv> {
+  const subprocessEnv: NodeJS.ProcessEnv = {
+    ...env,
+    PATH: pathEnv,
+    WANTA_NODE_RUNTIME: process.execPath,
+  }
+  const runtime = registration.runtimeExecutable
+  if (!runtime) {
+    return subprocessEnv
+  }
+
+  const configuredPath = env[runtime.envVar]?.trim()
+  if (configuredPath) {
+    subprocessEnv[runtime.envVar] = configuredPath
+    return subprocessEnv
+  }
+
+  const detected = await detectCliExecutable(runtime.cliCommands, { env, pathEnv })
+  if (!detected) {
+    throw new Error(
+      `${registration.displayName} CLI was not found on this machine. Install it or set ${runtime.envVar} to its executable path.`,
+    )
+  }
+  subprocessEnv[runtime.envVar] = detected.executablePath
+  return subprocessEnv
 }
 
 /** In-flight prompt marker; settled exactly once by resolve/reject/loss. */
@@ -447,17 +485,25 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     if (options?.signal?.aborted) {
       return
     }
-    // Draft-time choices ride the first prompt; createAcpSession applies them.
-    if (input.agentModelId !== undefined || input.agentEffortId !== undefined) {
-      const desired = this.desiredSelections.get(input.sessionId) ?? {}
+    const previousSelection = { ...this.desiredSelections.get(input.sessionId) }
+    const appliedSelections: Partial<Record<keyof AcpConfigSelects, string>> = {}
+    try {
       if (input.agentModelId !== undefined) {
-        desired.model = input.agentModelId
+        await this.applyConfigSelection(input.sessionId, "model", input.agentModelId)
+        appliedSelections.model = input.agentModelId
       }
       if (input.agentEffortId !== undefined) {
-        desired.effort = input.agentEffortId
+        await this.applyConfigSelection(input.sessionId, "effort", input.agentEffortId)
+        appliedSelections.effort = input.agentEffortId
       }
-      this.desiredSelections.set(input.sessionId, desired)
+      await this.dispatchPrompt(input, options)
+    } catch (error) {
+      await this.restorePromptSelections(input.sessionId, previousSelection, appliedSelections)
+      throw error
     }
+  }
+
+  private async dispatchPrompt(input: PromptAgentInput, options?: AgentSendOptions): Promise<void> {
     const restoreContext =
       !this.sessionsByWantaId.has(input.sessionId) && this.hasPersistedHistory(input.sessionId)
         ? this.restoredConversationContext(input.sessionId)
@@ -507,6 +553,30 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     })
     this.trackTurn(session, turn, promptPromise, options?.signal)
     // Resolve on dispatch (submission ack); completion arrives as messageCompleted.
+  }
+
+  private async restorePromptSelections(
+    sessionId: string,
+    previous: { model?: string; effort?: string },
+    applied: Partial<Record<keyof AcpConfigSelects, string>>,
+  ): Promise<void> {
+    const appliedAxes = (Object.keys(applied) as Array<keyof AcpConfigSelects>).reverse()
+    for (const axis of appliedAxes) {
+      // A picker or newer prompt may have changed this axis while the failed
+      // prompt was still setting up. Only the prompt's own value may be
+      // restored; otherwise this rollback would clobber the newer selection.
+      if (this.desiredSelections.get(sessionId)?.[axis] !== applied[axis]) continue
+      try {
+        await this.applyConfigSelection(sessionId, axis, previous[axis])
+      } catch (error) {
+        logDiagnostic(
+          "acp-adapter",
+          "failed to restore prompt-borne selection",
+          { adapter: this.kind, axis, error: errorMessage(error), sessionId },
+          "error",
+        )
+      }
+    }
   }
 
   protected async handleCancel(input: CancelAgentInput, options?: AgentSendOptions): Promise<void> {
@@ -578,8 +648,18 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     if (!session || !handle || handle.lost) {
       return
     }
-    const target = value ?? session.configSelects[axis]?.initialValue
-    if (target === undefined || session.configSelects[axis]?.currentValue === target) {
+    const select = session.configSelects[axis]
+    const target = value ?? select?.initialValue
+    if (target === undefined || select?.currentValue === target) {
+      return
+    }
+    // A reset (value === undefined) targets the creation-time default. A later
+    // cross-axis clamp (e.g. a model switch narrowing the effort space) may have
+    // dropped that value from the options; the agent already sits on a valid
+    // clamped default, so re-sending the vanished value would only draw a
+    // -32602 and leave the user unable to pick "Default". The stash is already
+    // cleared above, so skipping the wire call adopts the agent's default.
+    if (value === undefined && select !== undefined && !select.options.some((option) => option.id === target)) {
       return
     }
     try {
@@ -640,11 +720,7 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     }
   }
 
-  /**
-   * Best-effort projection of Wanta's permission mode onto the agent's session
-   * modes via the registry's mode map; entries the live session does not
-   * advertise are skipped.
-   */
+  /** Project Wanta's permission mode onto the native ACP session, fail closed. */
   public override async applyPermissionMode(sessionId: string, mode: AgentPermissionMode): Promise<void> {
     const modeMap = this.options.registration.permissionModeMap
     if (!modeMap) {
@@ -653,6 +729,7 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     // The chat layer projects the mode BEFORE the first prompt creates the
     // session; stash it so createAcpSession can apply it, or the whole first
     // turn would run under the agent's own default mode.
+    const previous = this.desiredPermissionModes.get(sessionId)
     this.desiredPermissionModes.set(sessionId, mode)
     const session = this.sessionsByWantaId.get(sessionId)
     if (!session) {
@@ -661,11 +738,13 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     const mapped = modeMap[mode]
     const targetModeId = mapped ?? (mode === "default" ? session.initialModeId : undefined)
     if (!targetModeId || !session.availableModeIds.includes(targetModeId)) {
-      return
+      this.restoreDesiredPermissionMode(sessionId, previous, mode)
+      throw new Error(`${this.kind}: permission mode "${mode}" is not available in this session`)
     }
     const handle = this.connectionHandle
     if (!handle || handle.lost) {
-      return
+      this.restoreDesiredPermissionMode(sessionId, previous, mode)
+      throw new Error(`${this.kind}: cannot apply permission mode while the ACP connection is unavailable`)
     }
     try {
       await handle.connection.agent.request("session/set_mode", {
@@ -673,13 +752,25 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
         modeId: targetModeId,
       })
     } catch (error) {
+      this.restoreDesiredPermissionMode(sessionId, previous, mode)
       logDiagnostic(
         "acp-adapter",
         "session/set_mode failed",
         { adapter: this.kind, modeId: targetModeId, error: errorMessage(error) },
         "warn",
       )
+      throw error
     }
+  }
+
+  private restoreDesiredPermissionMode(
+    sessionId: string,
+    previous: AgentPermissionMode | undefined,
+    attempted: AgentPermissionMode,
+  ): void {
+    if (this.desiredPermissionModes.get(sessionId) !== attempted) return
+    if (previous === undefined) this.desiredPermissionModes.delete(sessionId)
+    else this.desiredPermissionModes.set(sessionId, previous)
   }
 
   private signInRequiredMessage(): string {
@@ -799,8 +890,12 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
       })
     } catch (error) {
+      const failureDetail = transport.failureDetail?.()
       this.teardownHandle(handle)
-      throw new Error(`${displayName} failed to initialize the ACP connection: ${errorMessage(error)}`)
+      throw new Error(
+        `${displayName} failed to initialize the ACP connection: ${errorMessage(error)}` +
+          (failureDetail ? `. ACP subprocess: ${failureDetail}` : ""),
+      )
     }
     if (initialize.protocolVersion !== PROTOCOL_VERSION) {
       this.teardownHandle(handle)
@@ -833,17 +928,25 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
       const detail = status.binary.status === "error" ? ` (${status.binary.message})` : ""
       throw new Error(`${registration.displayName} CLI was not found on this machine${detail}.`)
     }
+    // Finder/desktop launches do not inherit the user's shell PATH. Reuse the
+    // recovered PATH so the bridge can find both Node and the user's agent CLI.
+    const pathEnv = await resolveUserCommandPath()
+    const subprocessEnv = await acpSubprocessEnvironment(registration, pathEnv)
     const child = spawn(status.binary.path, [...registration.acpArgs], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: subprocessEnv,
+      shell: externalExecutableNeedsShell(status.binary.path),
     })
     if (!child.stdin || !child.stdout) {
       child.kill()
       throw new Error(`${registration.displayName} subprocess did not expose stdio pipes.`)
     }
-    // ACP traffic is stdout-only; stderr must be drained so the CLI never
-    // blocks on a full pipe.
-    child.stderr?.resume()
+    // ACP traffic is stdout-only. Keep a bounded stderr tail for diagnostics
+    // while continuously draining the pipe so a noisy CLI cannot block.
+    let stderrTail = ""
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderrTail = appendStderrTail(stderrTail, chunk.toString())
+    })
     // Node web-stream declarations are structurally compatible with the DOM
     // globals the SDK types reference, but nominally distinct; cast once here.
     const stream = ndJsonStream(
@@ -852,16 +955,25 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     )
     const exitCallbacks: Array<(info: { code: number | null }) => void> = []
     let exited = false
+    let disposed = false
     const fireExit = (code: number | null): void => {
       if (exited) {
         return
       }
       exited = true
+      if (!disposed && (code !== 0 || stderrTail.trim())) {
+        logDiagnostic(
+          "acp-adapter",
+          "ACP subprocess exited",
+          { adapter: this.kind, code, stderrTail: stderrTail.trim() },
+          code === 0 ? "warn" : "error",
+        )
+      }
       for (const callback of exitCallbacks) {
         callback({ code })
       }
     }
-    child.once("exit", (code) => fireExit(code))
+    child.once("close", (code) => fireExit(code))
     child.once("error", (error) => {
       logDiagnostic("acp-adapter", "ACP subprocess error", { adapter: this.kind, error: errorMessage(error) }, "error")
       fireExit(null)
@@ -870,9 +982,11 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
       stream,
       dispose: () => {
         if (!exited) {
+          disposed = true
           child.kill()
         }
       },
+      failureDetail: () => subprocessFailureSummary(stderrTail),
       onExit: (callback) => {
         exitCallbacks.push(callback)
       },
@@ -956,9 +1070,16 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
   }
 
   private async createAcpSession(handle: AcpConnectionHandle, input: PromptAgentInput): Promise<AcpSessionState> {
-    const cwd = input.outputProjectRoot ?? (await this.ensureScratchDir(input.sessionId))
+    const cwd = input.workingDirectory ?? input.outputProjectRoot ?? (await this.ensureScratchDir(input.sessionId))
     const mcpServers = await this.hostMcpServers(input)
-    const response = await handle.connection.agent.request("session/new", { cwd, mcpServers })
+    const additionalDirectories = [...new Set(input.additionalDirectories ?? [])].filter(
+      (directory) => directory !== cwd,
+    )
+    const response = await handle.connection.agent.request("session/new", {
+      cwd,
+      ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
+      mcpServers,
+    })
     if (!this.isStarted || this.isSessionForgotten(input.sessionId)) {
       await handle.connection.agent
         .request("session/close" as never, { sessionId: response.sessionId } as never)
@@ -983,20 +1104,38 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     }
     this.sessionsByWantaId.set(input.sessionId, session)
     this.wantaIdByAcpId.set(response.sessionId, input.sessionId)
-    // Choices made before the session existed apply before the first prompt;
-    // failures are logged inside and must not fail session creation.
-    const desired = this.desiredSelections.get(input.sessionId)
-    if (desired?.model !== undefined) {
-      await this.setConfigValue(handle, session, "model", desired.model).catch(() => undefined)
+    try {
+      // A rejected catalog choice must fail before the prompt is dispatched
+      // so Wanta never persists or displays a model the agent did not accept.
+      const desired = this.desiredSelections.get(input.sessionId)
+      if (desired?.model !== undefined) {
+        await this.applyDesiredSelectionAtCreation(handle, session, desired, "model", desired.model)
+      }
+      if (desired?.effort !== undefined) {
+        await this.applyDesiredSelectionAtCreation(handle, session, desired, "effort", desired.effort)
+      }
+      const desiredMode = this.desiredPermissionModes.get(input.sessionId)
+      if (desiredMode !== undefined) await this.applyPermissionMode(input.sessionId, desiredMode)
+      // The one-shot guard above only covered the session/new round-trip. A forget
+      // (or stop) can still land during the post-registration awaits above without
+      // throwing; re-check so the catch below closes the native session instead of
+      // leaking a deleted session that handlePrompt would still dispatch a turn into.
+      if (!this.isStarted || this.isSessionForgotten(input.sessionId)) {
+        throw new Error(
+          this.isSessionForgotten(input.sessionId)
+            ? `${this.kind}: session was deleted while being created`
+            : `${this.kind}: adapter stopped while creating the session`,
+        )
+      }
+      return session
+    } catch (error) {
+      this.sessionsByWantaId.delete(input.sessionId)
+      this.wantaIdByAcpId.delete(response.sessionId)
+      await handle.connection.agent
+        .request("session/close" as never, { sessionId: response.sessionId } as never)
+        .catch(() => undefined)
+      throw error
     }
-    if (desired?.effort !== undefined) {
-      await this.setConfigValue(handle, session, "effort", desired.effort).catch(() => undefined)
-    }
-    const desiredMode = this.desiredPermissionModes.get(input.sessionId)
-    if (desiredMode !== undefined) {
-      await this.applyPermissionMode(input.sessionId, desiredMode).catch(() => undefined)
-    }
-    return session
   }
 
   private async hostMcpServers(input: PromptAgentInput): Promise<McpServer[]> {
@@ -1009,7 +1148,24 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
     }))
   }
 
-  /** Apply one axis over the select's wire channel; tolerates agents without that option. */
+  private async applyDesiredSelectionAtCreation(
+    handle: AcpConnectionHandle,
+    session: AcpSessionState,
+    desired: { model?: string; effort?: string },
+    axis: keyof AcpConfigSelects,
+    value: string,
+  ): Promise<void> {
+    try {
+      await this.setConfigValue(handle, session, axis, value)
+    } catch (error) {
+      // The session metadata rollback is owned by ChatService. Clear the live
+      // adapter stash here as well so retry cannot resurrect a rejected value.
+      if (desired[axis] === value) delete desired[axis]
+      throw error
+    }
+  }
+
+  /** Apply one axis over the select's wire channel; reject capability drift loudly. */
   private async setConfigValue(
     handle: AcpConnectionHandle,
     session: AcpSessionState,
@@ -1018,7 +1174,7 @@ export class AcpAgentAdapter extends ExternalAgentAdapter {
   ): Promise<void> {
     const select = session.configSelects[axis]
     if (!select) {
-      return
+      throw new Error(`${this.kind}: ${axis} selection is not available in this session`)
     }
     try {
       if (select.via === "set_model") {
