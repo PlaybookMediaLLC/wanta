@@ -26,3 +26,7 @@ Wanta is OOMOL's Electron desktop AI-agent chat client.
 - [docs/architecture.md](docs/architecture.md): process split, agent kernel, and IPC layout
 - [docs/conventions.md](docs/conventions.md): code conventions and security baseline
 - [docs/project-overview.md](docs/project-overview.md): product overview and system context
+
+Fork note: this is a PlaybookMediaLLC fork. Read FORK.md before you change code. <!-- fork-seam -->
+
+Fork note: this is a PlaybookMediaLLC fork. Read FORK.md before you change code. <!-- fork-seam -->
