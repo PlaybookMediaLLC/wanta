@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   clearTeamDetailsResources,
   getCachedTeamMembers,
+  getCachedTeamConnectionApps,
   getCachedTeamProviderOptions,
   getTeamMembersResource,
+  getTeamConnectionAppsResource,
   getTeamProviderOptionsResource,
   invalidateTeamDetailsResource,
   subscribeTeamMembersResource,
@@ -30,6 +32,30 @@ describe("team-details-resource", () => {
     expect(second).toEqual(first)
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(getCachedTeamMembers("account-1", "team-1")).toEqual(first)
+  })
+
+  it("keeps a newly inserted pending resource when older entries are protected", async () => {
+    const unsubscribes = Array.from({ length: 256 }, (_, index) =>
+      subscribeTeamMembersResource("account-1", `protected-${index}`, () => undefined),
+    )
+    let resolveRequest: ((response: Response) => void) | undefined
+    const fetchMock = vi.fn<typeof fetch>(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveRequest = resolve
+        }),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    const first = getTeamMembersResource("account-1", "new-team")
+    const second = getTeamMembersResource("account-1", "new-team")
+
+    expect(second).toBe(first)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    resolveRequest?.(Response.json({ members: [{ role: "member", user_id: "user-1" }] }))
+    await expect(first).resolves.toEqual([{ role: "member", user_id: "user-1" }])
+    expect(getCachedTeamMembers("account-1", "new-team")).toEqual([{ role: "member", user_id: "user-1" }])
+    unsubscribes.forEach((unsubscribe) => unsubscribe())
   })
 
   it("keeps account scopes isolated and refetches after targeted invalidation", async () => {
@@ -77,6 +103,40 @@ describe("team-details-resource", () => {
     ])
     expect(getCachedTeamProviderOptions("account-1", "team-1", "after-rename")).toEqual([
       { label: "after-rename", service: "after-rename" },
+    ])
+  })
+
+  it("shares normalized Connection App reads and keeps renamed team scopes isolated", async () => {
+    const teamHeaders: string[] = []
+    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+      const teamName = new Headers(init?.headers).get("x-oo-team-name") ?? ""
+      teamHeaders.push(teamName)
+      return Response.json({
+        data: [
+          {
+            authType: "oauth2",
+            id: `app-${teamName}`,
+            isDefault: false,
+            service: "github",
+            status: "active",
+          },
+        ],
+      })
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const first = getTeamConnectionAppsResource("account-1", "team-1", "before")
+    const duplicate = getTeamConnectionAppsResource("account-1", "team-1", "before")
+    const renamed = getTeamConnectionAppsResource("account-1", "team-1", "after")
+
+    expect(duplicate).toBe(first)
+    await Promise.all([first, duplicate, renamed])
+    expect(teamHeaders).toEqual(["before", "after"])
+    expect(getCachedTeamConnectionApps("account-1", "team-1", "before")).toMatchObject([
+      { id: "app-before", service: "github" },
+    ])
+    expect(getCachedTeamConnectionApps("account-1", "team-1", "after")).toMatchObject([
+      { id: "app-after", service: "github" },
     ])
   })
 

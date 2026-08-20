@@ -1,8 +1,16 @@
+import type { ConnectionAppSummary } from "../../electron/connections/common.ts"
 import type { TeamAppAccess, TeamMember, TeamProviderOption, TeamUserSummary } from "../../electron/teams/common.ts"
 
-import { getTeamAppAccess, listTeamMembers, listTeamProviderOptions, listUserSummaries } from "./teams-client.ts"
+import {
+  getTeamAppAccess,
+  listTeamConnectionApps,
+  listTeamMembers,
+  listTeamProviderOptions,
+  listUserSummaries,
+} from "./teams-client.ts"
 
 const teamDetailsStaleMs = 60_000
+const teamDetailsMaxEntries = 256
 
 interface ResourceEntry<T> {
   data: T | null
@@ -21,6 +29,10 @@ function providerOptionsResourceKey(accountId: string, teamId: string, teamName:
   return resourceKey(accountId, teamId, `provider-options:${teamName.trim()}`)
 }
 
+function connectionAppsResourceKey(accountId: string, teamId: string, teamName: string): string {
+  return resourceKey(accountId, teamId, `connection-apps:${teamName.trim()}`)
+}
+
 function isFresh<T>(entry: ResourceEntry<T>): entry is ResourceEntry<T> & { data: T } {
   return entry.data !== null && Date.now() - entry.loadedAt < teamDetailsStaleMs
 }
@@ -32,7 +44,18 @@ function entryFor<T>(key: string): ResourceEntry<T> {
   }
   const entry: ResourceEntry<T> = { data: null, listeners: new Set(), loadedAt: 0, promise: null }
   resourceCache.set(key, entry as ResourceEntry<unknown>)
+  pruneResourceCache(key)
   return entry
+}
+
+function pruneResourceCache(protectedKey?: string): void {
+  if (resourceCache.size <= teamDetailsMaxEntries) return
+  for (const [key, entry] of resourceCache) {
+    if (key === protectedKey) continue
+    if (entry.listeners.size > 0 || entry.promise) continue
+    resourceCache.delete(key)
+    if (resourceCache.size <= teamDetailsMaxEntries) return
+  }
 }
 
 function readCached<T>(key: string): T | null {
@@ -100,6 +123,14 @@ export function getCachedTeamAppAccess(accountId: string, teamId: string): TeamA
   return readCached(resourceKey(accountId, teamId, "app-access"))
 }
 
+export function getCachedTeamConnectionApps(
+  accountId: string,
+  teamId: string,
+  teamName: string,
+): ConnectionAppSummary[] | null {
+  return readCached(connectionAppsResourceKey(accountId, teamId, teamName))
+}
+
 export function getCachedTeamUserSummaries(
   accountId: string,
   teamId: string,
@@ -138,6 +169,19 @@ export function getTeamAppAccessResource(
   return loadResource(
     resourceKey(accountId, teamId, "app-access"),
     () => getTeamAppAccess(teamId),
+    options.forceRefresh,
+  )
+}
+
+export function getTeamConnectionAppsResource(
+  accountId: string,
+  teamId: string,
+  teamName: string,
+  options: TeamDetailsResourceOptions = {},
+): Promise<ConnectionAppSummary[]> {
+  return loadResource(
+    connectionAppsResourceKey(accountId, teamId, teamName),
+    () => listTeamConnectionApps(teamName, { forceRefresh: options.forceRefresh }),
     options.forceRefresh,
   )
 }
