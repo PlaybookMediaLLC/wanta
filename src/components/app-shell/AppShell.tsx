@@ -44,10 +44,10 @@ import {
   projectContextControlsDisabled,
   resolveNotificationTeam,
   routeAvailableForRuntime,
-  resolveTeamProviderOptionsAvailability,
   sessionRecordScopeKey,
   sessionScopeFromWorkspace,
   sessionScopeKey,
+  showArtifactsPanelToggle,
   workspaceActivationHasFailed,
   workspaceSelectionSwitchKey,
 } from "./app-shell-model.ts"
@@ -603,23 +603,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   const activeProviders = connectionSummaryMatchesWorkspace
     ? (connections.summary?.providers ?? EMPTY_CONNECTION_PROVIDERS)
     : EMPTY_CONNECTION_PROVIDERS
-  const teamProviderOptionsAvailability = resolveTeamProviderOptionsAvailability({
-    appsStatus: connections.summary?.appsStatus,
-    summaryMatchesWorkspace: connectionSummaryMatchesWorkspace,
-    workspaceActivationFailed: workspaceActivationHasFailed(workspaceActivationState),
-  })
-  const activeTeamProviderOptions = React.useMemo(
-    () =>
-      teamProviderOptionsAvailability === "ready"
-        ? activeProviders
-            .filter((provider) => provider.apps.some((app) => app.status !== "disconnected"))
-            .map((provider) => ({ label: provider.displayName, service: provider.service }))
-            .sort((left, right) => left.label.localeCompare(right.label))
-        : teamProviderOptionsAvailability === "pending"
-          ? undefined
-          : null,
-    [activeProviders, teamProviderOptionsAvailability],
-  )
   const {
     entryVisible: teamSkillEntryVisible,
     pendingInstallCount: recommendedSkillPendingInstallCount,
@@ -641,7 +624,20 @@ export function AppShell({ auth }: { auth: UseAuth }) {
       ? undefined
       : null
   const canManageWorkspaceConnections = teamWorkspace.activeWorkspace.canManage
+  const connectionAccessContext = React.useMemo(
+    () =>
+      teamWorkspace.activeWorkspace.team
+        ? {
+            accountId,
+            canManage: canManageWorkspaceConnections,
+            currentUserId: accountId,
+            team: teamWorkspace.activeWorkspace.team,
+          }
+        : undefined,
+    [accountId, canManageWorkspaceConnections, teamWorkspace.activeWorkspace.team],
+  )
   const [selectedService, setSelectedService] = React.useState<string | null>(null)
+  const [selectedConnectionAppId, setSelectedConnectionAppId] = React.useState<string | null>(null)
   const [connectionCatalogFilter, setConnectionCatalogFilter] = React.useState<ConnectionCatalogFilter>({ kind: "all" })
   const [chatConnectionDrawers, setChatConnectionDrawers] = React.useState<Record<string, ChatConnectionDrawerState>>(
     {},
@@ -657,7 +653,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     })
   const {
     artifactSelection,
-    artifactsPanelContentRef,
     artifactsPanelIsMaximized,
     artifactsPanelMaxWidthState,
     artifactsPanelOpen,
@@ -1357,11 +1352,23 @@ export function AppShell({ auth }: { auth: UseAuth }) {
         return next
       })
       setSelectedService(null)
+      setSelectedConnectionAppId(null)
       setConnectionCatalogFilter(normalizeConnectionCatalogFilter(filter))
       setRoute("connections")
       void connections.refresh({}, { silent: true })
     },
     [activeComposerDraftKey, cancelRetryForDrawer, connections.refresh],
+  )
+
+  const handleOpenTeamConnection = React.useCallback(
+    ({ appId, service }: { appId: string; service: string }): void => {
+      setSelectedService(service)
+      setSelectedConnectionAppId(appId)
+      setConnectionCatalogFilter({ kind: "all" })
+      setRoute("connections")
+      void connections.refresh({}, { silent: true })
+    },
+    [connections.refresh],
   )
 
   const handleOpenChatConnectionProvider = React.useCallback(
@@ -1415,6 +1422,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     clearRetries()
     setChatConnectionDrawers({})
     setSelectedService(null)
+    setSelectedConnectionAppId(null)
     setConnectionCatalogFilter({ kind: "all" })
     setSelectedSessionId(null)
     setIsDraftSession(false)
@@ -1860,9 +1868,8 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     () => makeAgentSelectionHandler("effortId"),
     [makeAgentSelectionHandler],
   )
-  // The adapter's desired-state stash is the authority for a session's agent
-  // model/effort; read it back once per session so a window reload cannot
-  // desync the pickers (a user choice made meanwhile always wins).
+  // Persisted session metadata survives app restarts; the adapter stash is a
+  // live-process fallback for renderer reloads and in-flight native changes.
   React.useEffect(() => {
     const inputs = AGENT_PROFILES[displayedAgentKind].inputs
     if (!activeChatSessionId || (!inputs.setModel && !inputs.setEffort)) {
@@ -1870,6 +1877,14 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     }
     const sessionId = activeChatSessionId
     if (agentSelectionsRef.current[sessionId]) {
+      return
+    }
+    const persistedSelection = {
+      ...(activeSession?.agentModelId ? { modelId: activeSession.agentModelId } : {}),
+      ...(activeSession?.agentEffortId ? { effortId: activeSession.agentEffortId } : {}),
+    }
+    if (persistedSelection.modelId || persistedSelection.effortId) {
+      setAgentSelections((prev) => (prev[sessionId] ? prev : { ...prev, [sessionId]: persistedSelection }))
       return
     }
     let cancelled = false
@@ -1887,7 +1902,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     return () => {
       cancelled = true
     }
-  }, [activeChatSessionId, chatService, displayedAgentKind])
+  }, [activeChatSessionId, activeSession?.agentEffortId, activeSession?.agentModelId, chatService, displayedAgentKind])
 
   const handleViewBilling = React.useCallback((target?: BillingDetailsTarget) => {
     setBillingInitialTarget(target ?? null)
@@ -1931,7 +1946,13 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     [activeKnowledgeBases, activeQueuedMessages.length, handleToggleKnowledgeBaseReference, knowledgeLibrary.items],
   )
   const handleOpenTeams = React.useCallback(() => setRoute("teams"), [])
-  const showArtifactsToggle = route === "chat" && hasPanelSelection && !artifactsPanelVisible
+  // Keep the same titlebar affordance available to close an already open panel.
+  const showArtifactsToggle = showArtifactsPanelToggle(
+    route,
+    hasPanelSelection,
+    artifactsPanelVisible,
+    globalThis.wanta?.platform,
+  )
   const ArtifactsToggleIcon = artifactsPanelOpen ? PanelRightClose : PanelRightOpen
   const artifactsToggleLabel = artifactsPanelOpen ? t("artifacts.collapse") : t("artifacts.expand")
   const showBrowserToggle = route === "chat" && browserState !== null
@@ -2164,6 +2185,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
             titlebarEditable={titlebarEditable}
             titlebarBreadcrumbs={titlebarBreadcrumbs}
             titlebarTitle={titlebarTitle}
+            windowControlsOnRight={!rightPanelVisible}
             workspace={teamWorkspace.activeWorkspace}
             onArtifactsToggle={handleArtifactsToggle}
             onBrowserToggle={handleBrowserToggle}
@@ -2185,9 +2207,11 @@ export function AppShell({ auth }: { auth: UseAuth }) {
                 ) : oomolLinkActive ? (
                   <div className="h-full min-h-0 p-0">
                     <ConnectionsPanel
+                      accessContext={connectionAccessContext}
                       canManageConnections={canManageWorkspaceConnections}
                       connections={connections}
                       requestedFilter={connectionCatalogFilter}
+                      selectedAppId={selectedConnectionAppId}
                       selectedService={selectedService}
                     />
                   </div>
@@ -2212,9 +2236,10 @@ export function AppShell({ auth }: { auth: UseAuth }) {
                 />
               ) : route === "teams" && oomolEnabled ? (
                 <TeamManagementRoute
+                  connectionProviders={activeProviders}
                   connectedProvidersLoading={activeProvidersLoading}
+                  onOpenConnection={handleOpenTeamConnection}
                   teamSkills={teamSkills}
-                  providerOptions={activeTeamProviderOptions}
                   providerSkillRecommendationsState={providerSkillRecommendations}
                   workspace={teamWorkspace}
                 />
@@ -2336,6 +2361,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
                     />
                   </div>
                   <AppShellConnectionDrawer
+                    accessContext={connectionAccessContext}
                     authIntent={chatConnectionAuthIntent}
                     canManageConnections={oomolLinkActive && canManageWorkspaceConnections}
                     connections={connections}
@@ -2352,7 +2378,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
 
         <AppShellRightPanel
           artifactSelection={artifactSelection}
-          artifactsPanelContentRef={artifactsPanelContentRef}
           artifactsPanelIsMaximized={artifactsPanelIsMaximized}
           artifactsPanelMaxWidthState={artifactsPanelMaxWidthState}
           artifactsPanelShellRef={artifactsPanelShellRef}

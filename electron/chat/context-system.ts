@@ -33,8 +33,9 @@ export function buildLinkRuntimeSystem(runtime: ActiveLinkRuntime, teamName: str
       }
       return [
         `Current-turn Wanta Link workspace: team ${quoted(normalizedTeamName)}.`,
-        "- When the `wanta_link` MCP tools are present, use them for Link work and do not invoke the raw `oo` CLI; inspect_action is required before call_action.",
+        "- The `wanta_link` MCP tools are the required transport for Link work; inspect_action is required before call_action. Do not invoke the raw `oo` CLI: Wanta rejects `oo connector apps`, `run`, and `proxy` shell calls while this capability is active.",
         `- Every raw \`oo connector apps\` or \`oo connector run\` call must preserve the selector \`--team ${quoted(normalizedTeamName)}\`.`,
+        "- Raw `oo connector schema` and `oo connector search` calls never accept workspace selectors such as `--team` or `--personal`.",
         "- Never omit, replace, or change that selector after an error, and never retry in a personal or default workspace.",
         "- `app_not_found` or `connection_required` from a call without this exact selector does not prove that the current Wanta team is disconnected.",
         "- Wanta-provided Link tools own workspace binding, authorization signaling, and credential redaction.",
@@ -216,9 +217,9 @@ export function buildExternalPermissionModeSystem(
     return lines.join("\n")
   }
   const lines = [
-    "Permission mode for this turn: Default Access through the external agent's native permission policy.",
+    "Permission mode for this turn: Default Access with Wanta's shared approval policy and the external agent's native enforcement.",
     "- Use local tools normally when they are useful; do not ask for conversational confirmation before the native runtime requests it.",
-    "- If the native runtime emits a permission request, Wanta will surface that exact request to the user and will not silently answer it on the agent's behalf.",
+    "- Wanta applies the same local permission policy to every agent. Ordinary shell, file, project, and managed-output operations are approved automatically; only protected or consequential boundaries should interrupt the user.",
     "- Wanta-managed business capabilities separately enforce their own confirmation, identity, and data-safety rules.",
   ]
   if (browserAvailable) {

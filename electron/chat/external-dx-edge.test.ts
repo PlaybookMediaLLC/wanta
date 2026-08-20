@@ -12,7 +12,7 @@ import type { ExternalAgentRuntimeStatus } from "../agent/external/probe.ts"
 import type { OpencodeAgentAdapter } from "../agent/opencode-adapter.ts"
 import type { ExternalSessionRecord, ExternalSessionStore } from "../session/external-store.ts"
 import type { SessionMetadata, SessionMetadataStore } from "../session/metadata-store.ts"
-import type { ChatAttachment, ChatPermissionRequest, SendMessageRequest } from "./common.ts"
+import type { AgentPermissionMode, ChatAttachment, ChatPermissionRequest, SendMessageRequest } from "./common.ts"
 import type { UserAttachmentStore } from "./user-attachments.ts"
 
 import assert from "node:assert/strict"
@@ -64,8 +64,18 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
   public readonly permissionResponses: PermissionResponseAgentInput[] = []
   public readonly setModels: SetModelAgentInput[] = []
   public readonly setEfforts: SetEffortAgentInput[] = []
+  public readonly permissionModes: Array<{ sessionId: string; mode: AgentPermissionMode }> = []
   /** When set, the next prompt throws this error instead of dispatching. */
   public failNextPrompt: Error | undefined
+  /** Optional fence used to race a rejected prompt against a newer selection. */
+  public promptFailureBarrier: Promise<void> | undefined
+  /** Optional fence used to pause a turn before prompt selections persist. */
+  public permissionModeBarrier: Promise<void> | undefined
+  public permissionModeBarrierEntries = 0
+  /** When set, the next native permission-mode projection rejects. */
+  public failNextPermissionMode: Error | undefined
+  private readonly modelSelections = new Map<string, string>()
+  private readonly effortSelections = new Map<string, string>()
   private readonly nativePendingPermissionIds = new Set<string>()
 
   public constructor(kind: ExternalAgentKind) {
@@ -84,6 +94,8 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
     if (this.failNextPrompt) {
       const error = this.failNextPrompt
       this.failNextPrompt = undefined
+      await this.promptFailureBarrier
+      this.promptFailureBarrier = undefined
       throw error
     }
     this.prompts.push(input)
@@ -125,6 +137,11 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
       return this.rejectUnsupportedInput("set-model")
     }
     this.setModels.push(input)
+    if (input.modelId) {
+      this.modelSelections.set(input.sessionId, input.modelId)
+    } else {
+      this.modelSelections.delete(input.sessionId)
+    }
   }
 
   protected override async handleSetEffort(input: SetEffortAgentInput): Promise<void> {
@@ -132,6 +149,32 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
       return this.rejectUnsupportedInput("set-effort")
     }
     this.setEfforts.push(input)
+    if (input.effortId) {
+      this.effortSelections.set(input.sessionId, input.effortId)
+    } else {
+      this.effortSelections.delete(input.sessionId)
+    }
+  }
+
+  public override sessionSelection(sessionId: string): { modelId?: string; effortId?: string } {
+    const modelId = this.modelSelections.get(sessionId)
+    const effortId = this.effortSelections.get(sessionId)
+    return {
+      ...(modelId ? { modelId } : {}),
+      ...(effortId ? { effortId } : {}),
+    }
+  }
+
+  public override async applyPermissionMode(sessionId: string, mode: AgentPermissionMode): Promise<void> {
+    this.permissionModeBarrierEntries += 1
+    await this.permissionModeBarrier
+    this.permissionModeBarrier = undefined
+    if (this.failNextPermissionMode) {
+      const error = this.failNextPermissionMode
+      this.failNextPermissionMode = undefined
+      throw error
+    }
+    this.permissionModes.push({ sessionId, mode })
   }
 
   public runtimeStatus(): Promise<ExternalAgentRuntimeStatus> {
@@ -169,8 +212,8 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
     const request: ChatPermissionRequest = {
       id: requestId,
       sessionId,
-      action: "write_file",
-      resources: [`/fake/${requestId}.txt`],
+      action: "read_file",
+      resources: [`/Users/example/.ssh/${requestId}`],
     }
     this.nativePendingPermissionIds.add(requestId)
     this.emit({ event: "permissionAsked", data: { sessionId, request } })
@@ -261,6 +304,11 @@ test("external turns receive managed output directories and finalize against the
   const prompt = adapter.prompts[0]
   assert.ok(prompt?.artifactDir)
   assert.ok(prompt.processDir)
+  assert.equal(prompt.additionalDirectories?.length, 2)
+  assert.equal(
+    prompt.additionalDirectories?.every((root) => path.isAbsolute(root)),
+    true,
+  )
 
   adapter.completeAssistantTurn(sessionId, "reply-managed", "done")
   await waitForTurnCompletion(service)
@@ -304,6 +352,7 @@ test("external plan turns keep the registered project read-only and use managed 
 
   const prompt = adapter.prompts[0]
   assert.equal(prompt?.outputProjectRoot, undefined)
+  assert.equal(prompt?.workingDirectory, undefined)
   assert.ok(prompt?.artifactDir)
   assert.equal(prompt.artifactDir.startsWith(projectRoot), false)
 
@@ -721,6 +770,27 @@ test("edge7: unknown backends degrade to empty reads and named send errors, neve
   )
 })
 
+test("edge7b: prototype-chain kind segments are not valid external kinds (in-operator spoof)", async () => {
+  // `kind in AGENT_PROFILES` would treat inherited Object.prototype keys as
+  // valid kinds; the parse must reject every one so a hostile id cannot defeat
+  // the drop-on-read guard or route anywhere.
+  for (const kind of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__", "isPrototypeOf"]) {
+    assert.equal(externalAgentKindForSessionId(`wanta-ext:${kind}:${randomUUID()}`), undefined, kind)
+  }
+
+  // And such an id behaves like an unknown backend end-to-end: empty reads, no route.
+  const { service } = createHarness(["claude-code"])
+  const spoofed = `wanta-ext:constructor:${randomUUID()}`
+  assert.deepEqual(await service.getMessages(spoofed), [])
+  assert.deepEqual(await service.getSessionSnapshot(spoofed), {
+    activeRun: null,
+    messages: [],
+    pendingPermissions: [],
+    pendingQuestions: [],
+    sessionId: spoofed,
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Edge 8: model/effort knobs against an agent that declares setEffort false
 // ---------------------------------------------------------------------------
@@ -763,6 +833,247 @@ test("edge8: prompt-borne model/effort ids are forwarded verbatim and never kill
   assert.equal((await service.getMessages(sessionId)).filter((message) => message.role === "assistant").length, 2)
 })
 
+test("external model and effort choices are persisted per session", async () => {
+  const persisted: Array<{ sessionId: string; patch: { modelId?: string | null; effortId?: string | null } }> = []
+  const { service } = createHarness(["claude-code"], {
+    onExternalSessionSelectionChanged: (sessionId, patch) => {
+      persisted.push({ sessionId, patch })
+    },
+  })
+  const sessionId = mintExternalSessionId("claude-code")
+
+  await service.setExternalSessionModel({ sessionId, modelId: "sonnet" })
+  await service.setExternalSessionEffort({ sessionId, effortId: "high" })
+  await service.setExternalSessionModel({ sessionId })
+
+  assert.deepEqual(persisted, [
+    { sessionId, patch: { modelId: "sonnet" } },
+    { sessionId, patch: { effortId: "high" } },
+    { sessionId, patch: { modelId: null } },
+  ])
+})
+
+test("a rejected prompt-borne selection is rolled back in session metadata", async () => {
+  const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
+  const { service, adapters } = createHarness(["claude-code"], {
+    onExternalSessionSelectionChanged: (_sessionId, patch) => {
+      persisted.push(patch)
+    },
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("claude-code")
+  adapter.failNextPrompt = new Error("model rejected")
+
+  await service.sendMessage(sendRequest(sessionId, "use this model", { agentModelId: "sonnet", agentEffortId: "high" }))
+  await waitForCondition(() => persisted.length === 4, "prompt selection rollback")
+
+  assert.deepEqual(persisted, [{ modelId: "sonnet" }, { effortId: "high" }, { modelId: null }, { effortId: null }])
+  await waitForCondition(() => !service.hasActiveGeneration(), "failed prompt cleanup")
+})
+
+test("a rejected prompt rollback cannot overwrite a newer model selection", async () => {
+  const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
+  const { service, adapters } = createHarness(["claude-code"], {
+    onExternalSessionSelectionChanged: (_sessionId, patch) => {
+      persisted.push(patch)
+    },
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("claude-code")
+  let releasePromptFailure!: () => void
+  adapter.promptFailureBarrier = new Promise<void>((resolve) => (releasePromptFailure = resolve))
+  adapter.failNextPrompt = new Error("prompt rejected")
+
+  await service.sendMessage(sendRequest(sessionId, "use sonnet", { agentModelId: "sonnet" }))
+  await waitForCondition(() => persisted.length === 1, "prompt selection persistence")
+  await service.setExternalSessionModel({ sessionId, modelId: "haiku" })
+  releasePromptFailure()
+  await waitForCondition(() => !service.hasActiveGeneration(), "rejected prompt cleanup")
+
+  assert.deepEqual(persisted, [{ modelId: "sonnet" }, { modelId: "haiku" }])
+  assert.deepEqual(adapter.sessionSelection(sessionId), { modelId: "haiku" })
+})
+
+test("prompt rollback captures a direct selection that completed before prompt persistence", async () => {
+  const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
+  const { service, adapters } = createHarness(["claude-code"], {
+    onExternalSessionSelectionChanged: (_sessionId, patch) => {
+      persisted.push(patch)
+    },
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("claude-code")
+  let releasePermissionMode!: () => void
+  adapter.permissionModeBarrier = new Promise<void>((resolve) => (releasePermissionMode = resolve))
+  adapter.failNextPrompt = new Error("prompt rejected")
+
+  const prompt = service.sendMessage(sendRequest(sessionId, "use sonnet", { agentModelId: "sonnet" }))
+  await waitForCondition(() => adapter.permissionModeBarrierEntries === 1, "permission-mode projection barrier")
+  await service.setExternalSessionModel({ sessionId, modelId: "haiku" })
+  releasePermissionMode()
+  await prompt
+  await waitForCondition(() => !service.hasActiveGeneration(), "rejected prompt cleanup")
+
+  assert.deepEqual(persisted, [{ modelId: "haiku" }, { modelId: "sonnet" }, { modelId: "haiku" }])
+  assert.deepEqual(adapter.sessionSelection(sessionId), { modelId: "haiku" })
+})
+
+test("forgetSession waits for pending selection persistence and removes its mutation bookkeeping", async () => {
+  let releasePersistence!: () => void
+  const persistenceBarrier = new Promise<void>((resolve) => (releasePersistence = resolve))
+  let persistenceStarted = false
+  const { service } = createHarness(["claude-code"], {
+    onExternalSessionSelectionChanged: async (_sessionId, patch) => {
+      if (patch.modelId === "sonnet") {
+        persistenceStarted = true
+        await persistenceBarrier
+      }
+    },
+  })
+  const sessionId = mintExternalSessionId("claude-code")
+  const selection = service.setExternalSessionModel({ sessionId, modelId: "sonnet" })
+  await waitForCondition(() => persistenceStarted, "pending selection persistence")
+
+  let deletionSettled = false
+  const deletion = service.forgetSession(sessionId).then(() => {
+    deletionSettled = true
+  })
+  await Promise.resolve()
+  assert.equal(deletionSettled, false)
+  releasePersistence()
+  await Promise.all([selection, deletion])
+
+  const internals = service as unknown as {
+    externalSelectionMutationTails: Map<string, Promise<void>>
+    externalSelectionMutationTokens: Map<string, number>
+    externalSelectionMutationSequences: Map<string, number>
+  }
+  for (const axis of ["model", "effort"] as const) {
+    const key = `${sessionId}\0${axis}`
+    assert.equal(internals.externalSelectionMutationTails.has(key), false)
+    assert.equal(internals.externalSelectionMutationTokens.has(key), false)
+    assert.equal(internals.externalSelectionMutationSequences.has(key), false)
+  }
+})
+
+test("a prompt failure after session deletion cannot enqueue a late selection rollback", async () => {
+  const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
+  const { service, adapters } = createHarness(["claude-code"], {
+    onExternalSessionSelectionChanged: (_sessionId, patch) => {
+      persisted.push(patch)
+    },
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("claude-code")
+  let releasePromptFailure!: () => void
+  adapter.promptFailureBarrier = new Promise<void>((resolve) => (releasePromptFailure = resolve))
+  adapter.failNextPrompt = new Error("prompt rejected after deletion")
+
+  await service.sendMessage(sendRequest(sessionId, "use sonnet", { agentModelId: "sonnet" }))
+  await waitForCondition(() => persisted.length === 1, "prompt selection persistence")
+  // Prompt selection persistence has settled, so deletion observes an idle
+  // queue. The native prompt rejection is deliberately released afterwards.
+  await service.forgetSession(sessionId)
+  releasePromptFailure()
+  await waitForCondition(() => adapter.promptFailureBarrier === undefined, "late prompt rejection")
+
+  assert.deepEqual(persisted, [{ modelId: "sonnet" }])
+  await assert.rejects(
+    service.setExternalSessionModel({ sessionId, modelId: "haiku" }),
+    /external agent session was deleted/u,
+  )
+  const internals = service as unknown as {
+    externalSelectionMutationTails: Map<string, Promise<void>>
+    externalSelectionMutationTokens: Map<string, number>
+    externalSelectionMutationSequences: Map<string, number>
+  }
+  for (const axis of ["model", "effort"] as const) {
+    const key = `${sessionId}\0${axis}`
+    assert.equal(internals.externalSelectionMutationTails.has(key), false)
+    assert.equal(internals.externalSelectionMutationTokens.has(key), false)
+    assert.equal(internals.externalSelectionMutationSequences.has(key), false)
+  }
+})
+
+test("external model and effort updates stay ordered when persistence overlaps", async () => {
+  let releaseModelPersistence!: () => void
+  let releaseEffortPersistence!: () => void
+  const modelPersistence = new Promise<void>((resolve) => (releaseModelPersistence = resolve))
+  const effortPersistence = new Promise<void>((resolve) => (releaseEffortPersistence = resolve))
+  const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
+  const { service, adapters } = createHarness(["claude-code"], {
+    onExternalSessionSelectionChanged: async (_sessionId, patch) => {
+      persisted.push(patch)
+      if (patch.modelId === "first-model") await modelPersistence
+      if (patch.effortId === "first-effort") await effortPersistence
+    },
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("claude-code")
+
+  const firstModel = service.setExternalSessionModel({ sessionId, modelId: "first-model" })
+  const secondModel = service.setExternalSessionModel({ sessionId, modelId: "second-model" })
+  await waitForCondition(() => adapter.setModels.length === 1, "first model update")
+  assert.deepEqual(adapter.sessionSelection(sessionId), { modelId: "first-model" })
+  releaseModelPersistence()
+  await Promise.all([firstModel, secondModel])
+
+  const firstEffort = service.setExternalSessionEffort({ sessionId, effortId: "first-effort" })
+  const secondEffort = service.setExternalSessionEffort({ sessionId, effortId: "second-effort" })
+  await waitForCondition(() => adapter.setEfforts.length === 1, "first effort update")
+  assert.deepEqual(adapter.sessionSelection(sessionId), {
+    modelId: "second-model",
+    effortId: "first-effort",
+  })
+  releaseEffortPersistence()
+  await Promise.all([firstEffort, secondEffort])
+
+  assert.deepEqual(
+    adapter.setModels.map(({ modelId }) => modelId),
+    ["first-model", "second-model"],
+  )
+  assert.deepEqual(
+    adapter.setEfforts.map(({ effortId }) => effortId),
+    ["first-effort", "second-effort"],
+  )
+  assert.deepEqual(persisted, [
+    { modelId: "first-model" },
+    { modelId: "second-model" },
+    { effortId: "first-effort" },
+    { effortId: "second-effort" },
+  ])
+  assert.deepEqual(adapter.sessionSelection(sessionId), {
+    modelId: "second-model",
+    effortId: "second-effort",
+  })
+})
+
+test("a rejected native permission mode rolls host metadata back and a queued retry can succeed", async () => {
+  const persistedModes: AgentPermissionMode[] = []
+  const { service, adapters } = createHarness(["codex"], {
+    onPermissionModeChanged: async (_sessionId, mode) => {
+      persistedModes.push(mode)
+    },
+  })
+  const adapter = adapters.get("codex")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("codex")
+  adapter.failNextPermissionMode = new Error("mode refused")
+
+  const rejected = service.setPermissionMode({ sessionId, permissionMode: "full_access", version: 1 })
+  const retry = service.setPermissionMode({ sessionId, permissionMode: "full_access", version: 2 })
+
+  await assert.rejects(rejected, /mode refused/)
+  await retry
+  assert.deepEqual(persistedModes, ["full_access", "default", "full_access"])
+  assert.deepEqual(adapter.permissionModes, [{ sessionId, mode: "full_access" }])
+})
+
 test("external turns receive the same Wanta team and Link identity instead of falling back to a default workspace", async () => {
   const { service, adapters } = createHarness(["codex"])
   service.setLinkRuntime("oomol")
@@ -784,7 +1095,7 @@ test("external turns receive the same Wanta team and Link identity instead of fa
   assert.match(codex.prompts[0]?.system ?? "", /Current-turn Wanta Link workspace: team "OOMOL-Internal"/)
   assert.match(codex.prompts[0]?.system ?? "", /--team "OOMOL-Internal"/)
   assert.match(codex.prompts[0]?.system ?? "", /Team-configured skills for the active workspace/)
-  assert.match(codex.prompts[0]?.system ?? "", /Default Access through the external agent's native permission policy/)
+  assert.match(codex.prompts[0]?.system ?? "", /Default Access with Wanta's shared approval policy/)
   assert.match(codex.prompts[0]?.system ?? "", /application interface language: Simplified Chinese/)
 
   codex.completeAssistantTurn(sessionId, "reply", "done")
@@ -792,38 +1103,18 @@ test("external turns receive the same Wanta team and Link identity instead of fa
 })
 
 // ---------------------------------------------------------------------------
-// Edge 5b: external permission asks always surface, even for malformed uuids
+// Edge 5b: malformed external ids fail closed before adapter routing
 // ---------------------------------------------------------------------------
 
-test("edge5b: a malformed external session uuid still surfaces the agent's permission request as a prompt", async () => {
-  // External permission policy is pass-through: the agent's CLI decided the
-  // action needs explicit approval, so the ask must reach the user as a card
-  // and never be answered automatically. The external check keys off
-  // externalAgentKindForSessionId (is this an external session at all), never
-  // off whether any session detail happens to be derivable, so a junk uuid
-  // fails closed to the same prompt.
-  const { service, events, adapters } = createHarness(["codex"])
+test("edge5b: a malformed external session uuid is never routed to an adapter", async () => {
+  const { service, adapters } = createHarness(["codex"])
   const codex = adapters.get("codex")
   assert.ok(codex)
-  // Valid kind prefix, junk uuid: routes to the codex adapter everywhere.
   const malformedSessionId = "wanta-ext:codex:legacy-imported-session"
 
-  await service.sendMessage(sendRequest(malformedSessionId, "run something"))
-  assert.equal(codex.prompts.length, 1)
-  codex.askPermission(malformedSessionId, "perm-malformed")
-  await waitForCondition(
-    () =>
-      sessionEvents(events, malformedSessionId).some(
-        (entry) => entry.event === "permissionAsked" || entry.event === "permissionReplied",
-      ),
-    "permission settlement",
+  await assert.rejects(
+    service.sendMessage(sendRequest(malformedSessionId, "run something")),
+    /Invalid or unsupported external agent session/,
   )
-
-  // Desired behavior (fails today): the request surfaces to the user...
-  assert.ok(
-    sessionEvents(events, malformedSessionId).some((entry) => entry.event === "permissionAsked"),
-    "permission request must reach the renderer as a prompt",
-  )
-  // ...and is never answered automatically on the user's behalf.
-  assert.equal(codex.permissionResponses.length, 0)
+  assert.equal(codex.prompts.length, 0)
 })

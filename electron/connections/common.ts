@@ -3,6 +3,8 @@ export type ConnectionAuthType = "oauth2" | "api_key" | "custom_credential" | "f
 export type ConnectionAppStatus = "active" | "reauth_required" | "error" | "disconnected"
 export type ConnectionProviderStatus = "available" | "connected" | "needs_attention"
 export interface ConnectionWorkspace {
+  /** Management surfaces use the full connection catalog; members use policy-visible apps only. */
+  manageable: boolean
   teamName: string
 }
 export type ConnectionProviderActionKind =
@@ -98,6 +100,16 @@ export interface ConnectionExecutionLogItem {
 export interface ConnectionExecutionLogSummary {
   items: ConnectionExecutionLogItem[]
   nextCursor?: string
+}
+
+export interface ConnectionActionCatalogItem {
+  description: string
+  id: string
+  name: string
+  operationType: "destructive" | "read" | "write"
+  providerPermissions: string[]
+  requiredScopes: string[]
+  service: string
 }
 
 export interface ConnectionExecutionLogRequest {
@@ -217,6 +229,7 @@ export type ConnectionConnectInput =
   | {
       appId?: string
       authType: "oauth2"
+      authorizationScopes?: string[]
       extra?: Record<string, unknown>
       secretExtra?: Record<string, string>
       service: string

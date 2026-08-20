@@ -8,6 +8,7 @@ import {
   isConnectorBusinessCommand,
   redactConnectorOutput,
   resolveGuardWorkspaceTeam,
+  stripIdentityIndependentWorkspaceSelectors,
 } from "./oo-guard-core.ts"
 
 const maxCapturedOutputBytes = 32 * 1024 * 1024
@@ -36,7 +37,7 @@ function killWithEscalation(child: ReturnType<typeof spawn>): void {
 }
 
 async function runGuarded(command: string, args: string[]): Promise<number> {
-  const child = spawn(command, args, { env: process.env, stdio: ["inherit", "pipe", "pipe"] })
+  const child = spawn(command, args, { env: process.env, stdio: ["inherit", "pipe", "pipe"], windowsHide: true })
   const stdout: Buffer[] = []
   const stderr: Buffer[] = []
   let stdoutSize = 0
@@ -75,7 +76,7 @@ async function runGuarded(command: string, args: string[]): Promise<number> {
 }
 
 async function runPassthrough(command: string, args: string[]): Promise<number> {
-  const child = spawn(command, args, { env: process.env, stdio: "inherit" })
+  const child = spawn(command, args, { env: process.env, stdio: "inherit", windowsHide: true })
   return await new Promise<number>((resolve, reject) => {
     child.once("error", reject)
     child.once("close", (code, signal) => resolve(code ?? (signal ? 1 : 0)))
@@ -87,7 +88,7 @@ async function main(): Promise<void> {
   if (!command) {
     throw new Error("WANTA_REAL_OO_BIN is required for the managed oo command.")
   }
-  const originalArgs = process.argv.slice(2)
+  const originalArgs = stripIdentityIndependentWorkspaceSelectors(process.argv.slice(2))
   const needsOomolBinding =
     process.env.WANTA_LINK_RUNTIME === "oomol" &&
     isConnectorBusinessCommand(originalArgs) &&

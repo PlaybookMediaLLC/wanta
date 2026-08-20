@@ -247,6 +247,14 @@ function promptInput(text = "hello agent") {
   return { type: "prompt", sessionId: WANTA_SESSION_ID, text } as const
 }
 
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((res) => {
+    resolve = res
+  })
+  return { promise, resolve }
+}
+
 function modelsShape(currentModelId: string, ids: string[]): NewSessionResponse {
   return {
     sessionId: "acp-session-x",
@@ -354,6 +362,87 @@ describe("acp selection: stash-revert on live rejection", () => {
       configId: "reasoning_effort",
       value: "high",
     })
+  })
+
+  test("resetting effort to Default after a model switch narrows the option space does not re-send the vanished value", async () => {
+    // Opens on effort "ultra" (initialValue), then a model switch clamps effort
+    // to [low,medium,high] currentValue "medium". Picking Default must NOT send
+    // the now-invalid "ultra" (which the agent would reject), leaving the user
+    // unable to select Default; it should adopt the agent's clamped default.
+    const effortWithUltra = [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        category: "model",
+        currentValue: "gpt-a",
+        options: [
+          { value: "gpt-a", name: "GPT A" },
+          { value: "gpt-b", name: "GPT B" },
+        ],
+      },
+      {
+        id: "reasoning_effort",
+        name: "Reasoning effort",
+        type: "select",
+        category: "thought_level",
+        currentValue: "ultra",
+        options: [
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+          { value: "ultra", name: "Ultra" },
+        ],
+      },
+    ]
+    const narrowedEffort = [
+      { ...effortWithUltra[0], currentValue: "gpt-b" },
+      { ...effortWithUltra[1], currentValue: "medium", options: effortWithUltra[1]!.options.slice(0, 3) },
+    ]
+    const harness = await createHarness({
+      newSession: () => ({ sessionId: "acp-session-1", configOptions: effortWithUltra }) as never,
+      setConfigOption: (params) =>
+        params.configId === "model" ? ({ configOptions: narrowedEffort } as never) : ({ configOptions: [] } as never),
+    })
+    await harness.adapter.send(promptInput())
+    await harness.waitFor((event) => event.event === "messageCompleted")
+
+    await harness.adapter.send({ type: "set-model", sessionId: WANTA_SESSION_ID, modelId: "gpt-b" })
+    // Reset effort to Default (no effortId): must not throw and must not send "ultra".
+    await harness.adapter.send({ type: "set-effort", sessionId: WANTA_SESSION_ID })
+
+    const ultraSends = harness.fake.setConfigOptionRequests.filter(
+      (request) => request.configId === "reasoning_effort" && request.value === "ultra",
+    )
+    expect(ultraSends).toHaveLength(0)
+    // The stash no longer pins an effort, so read-back reports the agent default.
+    expect(harness.adapter.sessionSelection(WANTA_SESSION_ID).effortId).toBeUndefined()
+  })
+
+  test("a delete landing during post-registration setup closes the native session and never prompts", async () => {
+    // The one-shot guard only covers session/new. A forget can still land during
+    // the post-registration setConfigValue await; without a second re-check the
+    // native session leaks on the shared subprocess and a turn could dispatch.
+    const gate = deferred<void>()
+    const harness = await createHarness({
+      newSession: () => ({ sessionId: "acp-session-late", configOptions: MODEL_EFFORT_CONFIG_OPTIONS }) as never,
+      setConfigOption: (params) =>
+        params.configId === "model" ? (gate.promise.then(() => ({ configOptions: [] })) as never) : ({} as never),
+    })
+    // Stash a desired model so createAcpSession applies it (a gated await) after
+    // it has already registered the session mappings.
+    await harness.adapter.send({ type: "set-model", sessionId: WANTA_SESSION_ID, modelId: "gpt-b" })
+
+    const sendPromise = harness.adapter.send(promptInput("delete me"))
+    await vi.waitFor(() => expect(harness.fake.setConfigOptionRequests.length).toBeGreaterThanOrEqual(1))
+    harness.adapter.forgetSession(WANTA_SESSION_ID)
+    gate.resolve()
+
+    await expect(sendPromise).rejects.toThrow(/session was deleted while being created/u)
+    expect(harness.fake.promptRequests).toHaveLength(0)
+    expect(harness.fake.closedSessionIds).toContain("acp-session-late")
+    const sessions = (harness.adapter as unknown as { sessionsByWantaId: Map<string, unknown> }).sessionsByWantaId
+    expect(sessions.has(WANTA_SESSION_ID)).toBe(false)
   })
 
   test("an accepted set_model followed by a session/new with a different current model follows the agent", async () => {
@@ -487,20 +576,108 @@ describe("acp selection: warmCatalog edges", () => {
 })
 
 describe("acp selection: prompt-borne selections", () => {
-  test("a failing prompt-borne model apply never fails the session-creating turn", async () => {
+  test("prompt-borne selections are applied to an existing session before dispatch", async () => {
+    const harness = await createHarness({
+      newSession: () => ({ sessionId: "acp-session-1", configOptions: MODEL_EFFORT_CONFIG_OPTIONS }) as never,
+    })
+    await harness.adapter.send(promptInput("first"))
+    await harness.waitFor((event) => event.event === "messageCompleted")
+
+    await harness.adapter.send({
+      ...promptInput("second"),
+      agentModelId: "gpt-b",
+      agentEffortId: "high",
+    })
+    await harness.waitFor((event) => event.event === "messageCompleted" && harness.fake.promptRequests.length === 2)
+
+    expect(harness.fake.setConfigOptionRequests.slice(-2)).toEqual([
+      { sessionId: "acp-session-1", configId: "model", value: "gpt-b" },
+      { sessionId: "acp-session-1", configId: "reasoning_effort", value: "high" },
+    ])
+  })
+
+  test("a failing prompt-borne model apply rejects before dispatch and clears the rejected stash", async () => {
     const harness = await createHarness({
       newSession: () => modelsShape("m1", ["m1", "m2"]),
       setModel: () => {
         throw new Error("switch refused")
       },
     })
-    await expect(
-      harness.adapter.send({ ...promptInput(), agentModelId: "m2", agentEffortId: "high" }),
-    ).resolves.toBeUndefined()
-    await harness.waitFor((event) => event.event === "messageCompleted")
-    expect(harness.fake.promptRequests).toHaveLength(1)
+    await expect(harness.adapter.send({ ...promptInput(), agentModelId: "m2" })).rejects.toThrow(
+      "could not open a session",
+    )
+    expect(harness.fake.promptRequests).toHaveLength(0)
     // The failed apply was attempted exactly once, on the freshly created session.
     expect(harness.fake.setModelRequests).toHaveLength(1)
+    expect(harness.adapter.sessionSelection(WANTA_SESSION_ID)).toEqual({})
+  })
+
+  test("a declared selection axis missing from the live session rejects loudly", async () => {
+    const harness = await createHarness({ newSession: () => ({ sessionId: "acp-session-1" }) })
+    await expect(harness.adapter.send({ ...promptInput(), agentModelId: "m2" })).rejects.toThrow(
+      "model selection is not available in this session",
+    )
+    expect(harness.fake.promptRequests).toHaveLength(0)
+  })
+
+  test("a later prompt-borne axis rejection restores the earlier axis", async () => {
+    const harness = await createHarness({
+      newSession: () => ({ sessionId: "acp-session-1", configOptions: MODEL_EFFORT_CONFIG_OPTIONS }) as never,
+      setConfigOption: (params) => {
+        if (params.configId === "reasoning_effort" && params.value === "high") {
+          throw new Error("effort refused")
+        }
+        return { configOptions: [] }
+      },
+    })
+    await harness.adapter.send(promptInput("first"))
+    await harness.waitFor((event) => event.event === "messageCompleted")
+
+    await expect(
+      harness.adapter.send({
+        ...promptInput("second"),
+        agentModelId: "gpt-b",
+        agentEffortId: "high",
+      }),
+    ).rejects.toThrow()
+
+    expect(harness.fake.promptRequests).toHaveLength(1)
+    expect(harness.fake.setConfigOptionRequests.slice(-3)).toEqual([
+      { sessionId: "acp-session-1", configId: "model", value: "gpt-b" },
+      { sessionId: "acp-session-1", configId: "reasoning_effort", value: "high" },
+      { sessionId: "acp-session-1", configId: "model", value: "gpt-a" },
+    ])
+    expect(harness.adapter.sessionSelection(WANTA_SESSION_ID)).toEqual({})
+  })
+
+  test("an earlier prompt failure does not restore over a newer model selection", async () => {
+    let rejectEffort: ((error: Error) => void) | undefined
+    const harness = await createHarness({
+      newSession: () => ({ sessionId: "acp-session-1", configOptions: MODEL_EFFORT_CONFIG_OPTIONS }) as never,
+      setConfigOption: (params) => {
+        if (params.configId === "reasoning_effort" && params.value === "high") {
+          return new Promise((_resolve, reject) => {
+            rejectEffort = reject
+          })
+        }
+        return { configOptions: MODEL_EFFORT_CONFIG_OPTIONS }
+      },
+    })
+    await harness.adapter.send(promptInput())
+    await harness.waitFor((event) => event.event === "messageCompleted")
+
+    const failedPrompt = harness.adapter.send({
+      ...promptInput("prompt with stale model"),
+      agentModelId: "gpt-b",
+      agentEffortId: "high",
+    })
+    await vi.waitFor(() => expect(rejectEffort).toBeDefined())
+    await harness.adapter.send({ type: "set-model", sessionId: WANTA_SESSION_ID, modelId: "gpt-a" })
+
+    rejectEffort?.(new Error("effort rejected"))
+    await expect(failedPrompt).rejects.toThrow()
+    expect(harness.adapter.sessionSelection(WANTA_SESSION_ID)).toEqual({ modelId: "gpt-a" })
+    expect(harness.fake.promptRequests).toHaveLength(1)
   })
 })
 
@@ -544,7 +721,9 @@ describe("acp selection: permission-mode projection", () => {
     await harness.adapter.send(promptInput())
     await harness.waitFor((event) => event.event === "messageCompleted")
     // codex maps full_access -> agent-full-access, which this session lacks.
-    await expect(harness.adapter.applyPermissionMode(WANTA_SESSION_ID, "full_access")).resolves.toBeUndefined()
+    await expect(harness.adapter.applyPermissionMode(WANTA_SESSION_ID, "full_access")).rejects.toThrow(
+      /permission mode "full_access" is not available/u,
+    )
     expect(harness.fake.setModeRequests).toHaveLength(0)
   })
 

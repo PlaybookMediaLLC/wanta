@@ -1,5 +1,6 @@
 import type { EditableTeamMemberRole, Team, TeamMember, TeamRole } from "../../../electron/teams/common.ts"
-import type { BusyAction, MemberView, ProviderGrantView } from "./team-management-model.ts"
+import type { BusyAction, MemberView } from "./team-management-model.ts"
+import type { TeamMemberConnectionAccessData } from "./TeamMemberConnectionAccessDialog.tsx"
 
 import { PlusIcon, RefreshCwIcon, UsersIcon } from "lucide-react"
 import * as React from "react"
@@ -11,12 +12,7 @@ import { teamAvatarStyle, teamInitials } from "@/hooks/useTeamWorkspace"
 import { useAppI18n } from "@/i18n"
 import { cn } from "@/lib/utils"
 
-export {
-  AddMemberDialog,
-  CreateTeamDialog,
-  ProviderAccessDialog,
-  TeamProfileSettingsPanel,
-} from "./TeamMemberDialogs.tsx"
+export { AddMemberDialog, CreateTeamDialog, TeamProfileSettingsPanel } from "./TeamMemberDialogs.tsx"
 
 export function TeamMemberAccessButton({
   canManage,
@@ -96,12 +92,11 @@ function MemberAvatarStackSkeleton() {
 }
 
 export function TeamDetailPanel({
-  appAccessLoading,
   actorRole,
   actorUserId,
   busyAction,
   canManage,
-  grantsByUserId,
+  connectionAccess,
   members,
   membersComplete,
   membersError,
@@ -109,25 +104,18 @@ export function TeamDetailPanel({
   membersLoading,
   onAddMember,
   onDisableMembers,
-  onEditProviderAccess,
   onEnableMembers,
-  onGrantProviderAccess,
+  onOpenMemberConnectionAccess,
   onRemoveMember,
   onRetryMembers,
-  onRevokeProviderAccess,
   onUpdateMemberRole,
   team,
-  providerAccessError,
-  providerAccessMutationError,
-  providerOptionsError,
-  providerOptionsLoading,
 }: {
-  appAccessLoading: boolean
   actorRole: TeamRole | null
   actorUserId: string | undefined
   busyAction: BusyAction | null
   canManage: boolean
-  grantsByUserId: Map<string, ProviderGrantView>
+  connectionAccess: TeamMemberConnectionAccessData
   members: MemberView[]
   membersComplete: boolean
   membersError: string | null
@@ -135,21 +123,14 @@ export function TeamDetailPanel({
   membersLoading: boolean
   onAddMember: () => void
   onDisableMembers: (userIds: string[]) => void
-  onEditProviderAccess: (grant: ProviderGrantView) => void
   onEnableMembers: (userIds: string[]) => void
-  onGrantProviderAccess: (userId: string) => void
+  onOpenMemberConnectionAccess: (member: MemberView) => void
   onRemoveMember: (member: TeamMember) => Promise<void>
   onRetryMembers: () => void
-  onRevokeProviderAccess: (grant: ProviderGrantView) => Promise<void>
   onUpdateMemberRole: (member: TeamMember, role: EditableTeamMemberRole) => Promise<void>
   team: Team | null
-  providerAccessError: string | null
-  providerAccessMutationError: string | null
-  providerOptionsError: string | null
-  providerOptionsLoading: boolean
 }) {
   const { t } = useAppI18n()
-  const showProviderAccess = canManage
 
   if (!team) {
     return (
@@ -169,7 +150,7 @@ export function TeamDetailPanel({
   return (
     <div className="grid min-w-0 gap-3">
       <Panel
-        title={showProviderAccess ? t("teams.membersAndPermissions") : t("teams.memberManagement")}
+        title={t("teams.memberManagement")}
         description={
           <span className="oo-text-caption-compact truncate text-muted-foreground">
             {compactMemberCountLabel} · {permissionModeLabel}
@@ -185,9 +166,8 @@ export function TeamDetailPanel({
         }
       >
         <>
-          {showProviderAccess && providerAccessError && !membersError ? <ProviderAccessWarning /> : null}
           {membersLoading ? (
-            <MemberRowsSkeleton canManage={canManage && showProviderAccess} />
+            <MemberRowsSkeleton canManage={canManage} />
           ) : membersError && !membersForbidden ? (
             <MemberLoadError onRetry={onRetryMembers} />
           ) : members.length === 0 ? (
@@ -196,23 +176,16 @@ export function TeamDetailPanel({
             <>
               {membersForbidden ? <MemberAccessWarning onRetry={onRetryMembers} /> : null}
               <MembersTable
-                appAccessLoading={appAccessLoading}
                 actorRole={actorRole}
                 actorUserId={actorUserId}
                 busyAction={busyAction}
                 canManage={canManage}
-                grantsByUserId={grantsByUserId}
+                connectionAccess={connectionAccess}
                 members={members}
-                showProviderAccess={showProviderAccess}
-                providerAccessMutationError={providerAccessMutationError}
-                providerOptionsError={providerOptionsError}
-                providerOptionsLoading={providerOptionsLoading}
                 onDisableMembers={onDisableMembers}
-                onEditProviderAccess={onEditProviderAccess}
                 onEnableMembers={onEnableMembers}
-                onGrantProviderAccess={onGrantProviderAccess}
+                onOpenMemberConnectionAccess={onOpenMemberConnectionAccess}
                 onRemoveMember={onRemoveMember}
-                onRevokeProviderAccess={onRevokeProviderAccess}
                 onUpdateMemberRole={onUpdateMemberRole}
               />
             </>
@@ -245,16 +218,6 @@ function MemberLoadError({ onRetry }: { onRetry: () => void }) {
         <RefreshCwIcon className="size-3.5" />
         {t("teams.retry")}
       </Button>
-    </div>
-  )
-}
-
-function ProviderAccessWarning() {
-  const { t } = useAppI18n()
-  return (
-    <div className="mx-3 mt-3 rounded-md border border-[var(--oo-warning-border)] bg-[var(--oo-warning-surface)] px-3 py-2">
-      <div className="oo-text-label text-foreground">{t("teams.providerAccessLoadFailed")}</div>
-      <div className="oo-text-caption mt-0.5 break-words">{t("teams.providerAccessLoadFailedDescription")}</div>
     </div>
   )
 }

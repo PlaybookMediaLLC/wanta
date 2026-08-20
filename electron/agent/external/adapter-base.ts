@@ -1,10 +1,12 @@
 import type { AgentPermissionMode, ChatMessage, ChatPermissionRequest, ChatQuestionRequest } from "../../chat/common.ts"
+import type { ChatAgentBackend } from "../contract/chat-backend.ts"
 import type { AgentEvent } from "../contract/event.ts"
 import type { AgentInput, AgentSendOptions } from "../contract/input.ts"
 import type { ExternalAgentRuntimeStatus } from "./probe.ts"
 
 import { logDiagnostic } from "../../diagnostics-log.ts"
 import { BaseAgentAdapter } from "../contract/adapter.ts"
+import { redactExternalAgentEvent } from "./transcript-redaction.ts"
 import { ExternalTranscriptStore } from "./transcript-store.ts"
 import { ExternalTranscriptRecorder } from "./transcript.ts"
 
@@ -22,7 +24,7 @@ export interface ExternalAgentAdapterOptions {
   transcriptDir?: string
 }
 
-export abstract class ExternalAgentAdapter extends BaseAgentAdapter {
+export abstract class ExternalAgentAdapter extends BaseAgentAdapter implements ChatAgentBackend {
   private readonly transcript = new ExternalTranscriptRecorder()
   private readonly pendingPermissionRequests = new Map<string, ChatPermissionRequest>()
   private readonly transcriptStore: ExternalTranscriptStore | undefined
@@ -43,6 +45,13 @@ export abstract class ExternalAgentAdapter extends BaseAgentAdapter {
    * scrubbed as noise, so resume decisions must use this, not the survivors.
    */
   private readonly sessionsWithDiskHistory = new Set<string>()
+  /**
+   * sessionId -> monotonically increasing count of forgets. A hydration
+   * captures it before `store.load` and rejects its own result if it changed,
+   * so a delete that lands mid-load can never restore deleted history even
+   * when a later prompt reopened the id and cleared the tombstone first.
+   */
+  private readonly forgetGenerations = new Map<string, number>()
 
   private userTurnSeq = 0
 
@@ -79,22 +88,27 @@ export abstract class ExternalAgentAdapter extends BaseAgentAdapter {
   }
 
   protected override emit(event: AgentEvent): void {
-    const sessionId = "sessionId" in event.data ? event.data.sessionId : undefined
+    const safeEvent = redactExternalAgentEvent(event)
+    const sessionId = "sessionId" in safeEvent.data ? safeEvent.data.sessionId : undefined
     if (typeof sessionId === "string" && this.forgottenSessions.has(sessionId)) {
       return
     }
-    this.transcript.record(event)
-    if (event.event === "permissionAsked") {
-      this.pendingPermissionRequests.set(event.data.request.id, event.data.request)
-    } else if (event.event === "permissionReplied") {
-      this.pendingPermissionRequests.delete(event.data.requestId)
+    this.transcript.record(safeEvent)
+    if (safeEvent.event === "permissionAsked") {
+      this.pendingPermissionRequests.set(safeEvent.data.request.id, safeEvent.data.request)
+    } else if (safeEvent.event === "permissionReplied") {
+      this.pendingPermissionRequests.delete(safeEvent.data.requestId)
     }
-    super.emit(event)
-    this.scheduleTranscriptSave(event)
+    super.emit(safeEvent)
+    this.scheduleTranscriptSave(safeEvent)
   }
 
   public override async send(input: AgentInput, options?: AgentSendOptions): Promise<void> {
-    if (input.type === "prompt" && typeof input.sessionId === "string") {
+    // An already-aborted prompt never dispatches (the concrete handlePrompt
+    // short-circuits), so it must NOT clear the tombstone: doing so would reopen
+    // the late-event gate and let a deleted session's still-draining native
+    // frames resurrect its transcript on disk.
+    if (input.type === "prompt" && typeof input.sessionId === "string" && !options?.signal?.aborted) {
       // An explicit new prompt reopens a forgotten session id; the tombstone
       // only exists to block LATE events from a still-draining native process.
       this.forgottenSessions.delete(input.sessionId)
@@ -161,6 +175,7 @@ export abstract class ExternalAgentAdapter extends BaseAgentAdapter {
   /** Release all in-memory state of a deleted session and its on-disk transcript. */
   public forgetSession(sessionId: string): void {
     this.forgottenSessions.add(sessionId)
+    this.forgetGenerations.set(sessionId, (this.forgetGenerations.get(sessionId) ?? 0) + 1)
     this.sessionsWithDiskHistory.delete(sessionId)
     this.transcript.forgetSession(sessionId)
     this.transcriptHydrations.delete(sessionId)
@@ -233,16 +248,27 @@ export abstract class ExternalAgentAdapter extends BaseAgentAdapter {
       // a queued removal and resurrect a deleted session's history. The chain
       // also swallows and logs failures, so a broken disk state degrades to an
       // empty history instead of poisoning every later getMessages/send.
+      // Snapshot the deletion generation for THIS hydration; a forget landing
+      // any time after it invalidates the load's result.
+      const generation = this.forgetGenerations.get(sessionId) ?? 0
       hydration = this.queueTranscriptOp(sessionId, async () => {
-        if (this.forgottenSessions.has(sessionId)) {
+        if (this.forgottenSessions.has(sessionId) || (this.forgetGenerations.get(sessionId) ?? 0) !== generation) {
           return
         }
         const messages = await store.load(sessionId)
+        // A forget (and its queued remove) may have landed during the load.
+        // Compare the generation, NOT just the tombstone: a later prompt can
+        // reopen the id and clear the tombstone before this load resolves, so
+        // the tombstone alone would let the stale load resurrect deleted history
+        // (and sessionsWithDiskHistory). The generation stays bumped regardless.
+        if (this.forgottenSessions.has(sessionId) || (this.forgetGenerations.get(sessionId) ?? 0) !== generation) {
+          return
+        }
         if (messages && messages.length > 0) {
           this.sessionsWithDiskHistory.add(sessionId)
         }
         const sanitized = messages && messages.length > 0 ? this.sanitizeRestoredMessages(messages) : messages
-        if (sanitized && sanitized.length > 0 && !this.forgottenSessions.has(sessionId)) {
+        if (sanitized && sanitized.length > 0) {
           this.transcript.restore(sessionId, sanitized)
         }
       })

@@ -1,3 +1,4 @@
+import type { ConnectionAppSummary } from "../../electron/connections/common.ts"
 import type {
   CreateTeamRequest,
   EditableTeamMemberRole,
@@ -15,6 +16,7 @@ import type {
   UploadTeamAvatarResponse,
 } from "../../electron/teams/common.ts"
 
+import { normalizeApp } from "../../electron/connections/summary.ts"
 import { getConnectionApps, getConnectionProviders } from "@/lib/connections-client"
 import { apiBaseUrl, teamControlBaseUrl } from "@/lib/domain"
 import { oomolFetch } from "@/lib/oomol-http"
@@ -362,7 +364,7 @@ export async function createTeam(req: CreateTeamRequest): Promise<Team> {
     throw new Error("Team name is required.")
   }
   const team = normalizeTeam(
-    await requestApiJson("/v1/orgs", {
+    await requestApiJson("/v1/teams", {
       method: "POST",
       body: JSON.stringify({ org_name: teamName, ...(req.avatar?.trim() ? { avatar: req.avatar.trim() } : {}) }),
     }),
@@ -380,7 +382,7 @@ export async function updateTeam(req: UpdateTeamRequest): Promise<Team> {
     throw new Error("Team name is required.")
   }
   const team = normalizeTeam(
-    await requestApiJson(`/v1/orgs/${encodePath(teamId)}`, {
+    await requestApiJson(`/v1/teams/${encodePath(teamId)}`, {
       method: "PUT",
       body: JSON.stringify({ org_name: teamName, avatar: req.avatar.trim() }),
     }),
@@ -395,7 +397,7 @@ export async function uploadTeamAvatar(teamId: string, file: File): Promise<Uplo
   const id = requireIdentifier(teamId, "Team id")
   const form = new FormData()
   form.set("file", file)
-  const result = await requestApiJson(`/v1/orgs/${encodePath(id)}/avatar`, {
+  const result = await requestApiJson(`/v1/teams/${encodePath(id)}/avatar`, {
     method: "POST",
     body: form,
   })
@@ -567,9 +569,25 @@ export async function listTeamProviderOptions(teamName: string): Promise<TeamPro
   if (!normalized) {
     return []
   }
-  const [apps, providers] = await Promise.all([getConnectionApps({ teamName: normalized }), getConnectionProviders()])
+  const [apps, providers] = await Promise.all([
+    getConnectionApps({ manageable: true, teamName: normalized }),
+    getConnectionProviders(),
+  ])
   return normalizeProviderOptions(
     Array.isArray(apps.data) ? apps.data : [],
     Array.isArray(providers.data) ? providers.data : [],
   )
+}
+
+export async function listTeamConnectionApps(
+  teamName: string,
+  options: { forceRefresh?: boolean } = {},
+): Promise<ConnectionAppSummary[]> {
+  const normalized = teamName.trim()
+  if (!normalized) return []
+  const result = await getConnectionApps({ manageable: true, teamName: normalized }, options)
+  return result.data
+    .map(normalizeApp)
+    .filter((app): app is ConnectionAppSummary => Boolean(app))
+    .sort((left, right) => left.service.localeCompare(right.service) || left.id.localeCompare(right.id))
 }

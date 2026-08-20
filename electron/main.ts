@@ -49,6 +49,7 @@ import {
 } from "./agent/binaries.ts"
 import { BROWSER_CAPABILITY_ID, createBrowserHostCapability } from "./agent/browser-host-capability.ts"
 import { createDirectCliHostCapability, DIRECT_CLI_CAPABILITY_ID } from "./agent/direct-cli-host-capability.ts"
+import { memoizeExternalCommandEnvironment } from "./agent/external/command-environment.ts"
 import { createExternalAgents } from "./agent/external/create.ts"
 import { externalAgentKindForSessionId } from "./agent/external/session-id.ts"
 import { HostCapabilityInvokeServer } from "./agent/host-capability-invoke-server.ts"
@@ -60,6 +61,7 @@ import { LinkCapability } from "./agent/link-capability.ts"
 import { createLinkHostCapability, LINK_CAPABILITY_ID, LINK_RUNTIME_BINDING } from "./agent/link-host-capability.ts"
 import { ManagedTurnDirectories } from "./agent/managed-turn-directories.ts"
 import { AgentManager } from "./agent/manager.ts"
+import { ensureOoGuardCommandBin } from "./agent/oo-guard-bin.ts"
 import { OpencodeAgentAdapter } from "./agent/opencode-adapter.ts"
 import { createQuestionHostCapability, QUESTION_CAPABILITY_ID } from "./agent/question-host-capability.ts"
 import { AgentRetirementPool } from "./agent/retirement.ts"
@@ -94,6 +96,7 @@ import { StoppedGenerationStore } from "./chat/stopped-generations.ts"
 import { TurnOutputStore } from "./chat/turn-outputs.ts"
 import { UserAttachmentStore } from "./chat/user-attachments.ts"
 import { registerClipboardHandler } from "./clipboard-handler.ts"
+import { mergePathValues, resolveUserCommandPath } from "./command-path.ts"
 import { parseConnectionOAuthCallback } from "./connections/domain.ts"
 import { configureDiagnosticsLog, flushDiagnosticsLog, logDiagnostic } from "./diagnostics-log.ts"
 import { GitServiceImpl } from "./git/node.ts"
@@ -103,7 +106,11 @@ import { DingTalkCliManager } from "./link-runtime/dingtalk-cli.ts"
 import { LarkCliManager } from "./link-runtime/lark-cli.ts"
 import { LinkRuntimeManager, LinkRuntimeServiceImpl } from "./link-runtime/node.ts"
 import { WecomCliManager } from "./link-runtime/wecom-cli.ts"
-import { isAudioOnlyMediaRequest, isTrustedRendererUrl } from "./media-permission-policy.ts"
+import {
+  isAllowedMainWindowSubframeNavigation,
+  isAudioOnlyMediaRequest,
+  isTrustedRendererUrl,
+} from "./media-permission-policy.ts"
 import { ModelCredentialStore } from "./models/credential-store.ts"
 import { ModelsServiceImpl } from "./models/node.ts"
 import { ModelsStore } from "./models/store.ts"
@@ -352,6 +359,23 @@ const directCliCapabilityServer = new HostCapabilityServer({
   name: "wanta_direct",
   version: "1.0.0",
 })
+const externalAgentRootDir = path.join(app.getPath("userData"), "agent-external")
+const externalAgentCommandEnvironment = memoizeExternalCommandEnvironment(async () => {
+  const [userPath, managedOoBinPath] = await Promise.all([
+    resolveUserCommandPath({ preferredDirectories: [path.dirname(ooBinPath)] }),
+    ensureOoGuardCommandBin({
+      binDir: path.join(externalAgentRootDir, "bin"),
+      nodeBin: process.execPath,
+      ooGuardCliPath,
+    }),
+  ])
+  return {
+    ...process.env,
+    PATH: mergePathValues([path.dirname(managedOoBinPath), userPath]),
+    WANTA_OO_BIN: managedOoBinPath,
+    WANTA_REAL_OO_BIN: ooBinPath,
+  }
+})
 // External (BYOA) adapters are app-lifetime and independent of the OOMOL account
 // runtime: their models and auth belong to the agent CLIs themselves. Host
 // capabilities are issued per Wanta session and keep identity in main.
@@ -359,7 +383,8 @@ const externalAgents = createExternalAgents({
   appRoot,
   isPackaged: app.isPackaged,
   resourcesPath: process.resourcesPath,
-  scratchRootDir: path.join(app.getPath("userData"), "agent-external"),
+  scratchRootDir: externalAgentRootDir,
+  commandEnvironment: externalAgentCommandEnvironment,
   hostMcpServers: async (input) => {
     const [larkRuntime, wecomRuntime, dingTalkRuntime] = await directRuntimes()
     const directSkillSources = [
@@ -416,6 +441,17 @@ const externalAgents = createExternalAgents({
     } else {
       linkCapabilityServer.disableSession(input.sessionId)
     }
+    logDiagnostic(
+      "host-capability",
+      "manifest issued",
+      {
+        linkRegistered: servers.some((server) => server.name === "wanta_link"),
+        servers: servers.map((server) => server.name),
+        sessionId: input.sessionId,
+        ...(input.messageId ? { turnId: input.messageId } : {}),
+      },
+      "trace",
+    )
     return servers
   },
 })
@@ -450,6 +486,8 @@ const chatService = new ChatServiceImpl(null, {
   userAttachmentStore,
   onPermissionModeChanged: (sessionId, permissionMode) =>
     sessionService.setPermissionMode({ id: sessionId, permissionMode }),
+  onExternalSessionSelectionChanged: (sessionId, patch) =>
+    sessionService.setAgentSelection({ id: sessionId, ...patch }),
   onOomolAuthRequired: () => authManager.expireSession().then(() => undefined),
   onSetAgentTeam: handleAgentTeamChanged,
   onSessionCompleted: (input) => attentionService.completeSession(input),
@@ -940,6 +978,14 @@ async function applyAuthAccountNow(account: AuthRuntimeAccount | null): Promise<
   const runtimeVersionAtStart = agentRuntimeVersion
   const runtimeModels = await modelsStore.runtimeModels()
   const runtime = resolveAgentRuntime(account, runtimeModels.selected, runtimeModels.customModels)
+  // On a cross-account switch, drop the previous account's team BEFORE it is
+  // baked into linkRuntime (and thus the new sidecar's oo identity/team-scope);
+  // otherwise a personal-workspace account inherits the old team and defeats the
+  // oo-guard fail-closed check. The renderer re-asserts the team after login.
+  // The later reset at the account-switch branch below stays for attention state.
+  if (appliedAccount && appliedAccount.id !== account?.id) {
+    activeAgentTeamName = undefined
+  }
   const linkRuntime =
     (await linkRuntimeManager.selectedRuntime()) === "oomol"
       ? account
@@ -1352,6 +1398,11 @@ function createMainWindow(): void {
     if (!isTrustedRendererUrl(url, viteDevServerUrl, rendererBaseUrl)) {
       event.preventDefault()
       openExternalUrl(url)
+    }
+  })
+  mainWindow.webContents.on("will-frame-navigate", (event) => {
+    if (!event.isMainFrame && !isAllowedMainWindowSubframeNavigation(event.url)) {
+      event.preventDefault()
     }
   })
   mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {

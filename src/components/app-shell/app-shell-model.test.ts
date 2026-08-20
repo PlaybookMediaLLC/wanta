@@ -13,6 +13,7 @@ import {
   isWorkspaceSwitchPending,
   newSessionComposerDraftKey,
   newSessionComposerDraftKeyForScopeKey,
+  RIGHT_PANEL_RESIZE_SASH_WIDTH_PX,
   resolveNewSessionTarget,
   resolveNotificationTeam,
   routeAvailableForRuntime,
@@ -22,6 +23,7 @@ import {
   sessionRecordScopeKey,
   sessionScopeFromWorkspace,
   sessionTitleGenerationKey,
+  showArtifactsPanelToggle,
   shouldClearWorkspaceSwitchTarget,
   shouldShowRecommendedSkillEntry,
   workspaceActivationBlocksInput,
@@ -63,6 +65,26 @@ describe("artifacts panel drag layout", () => {
       width: ARTIFACTS_PANEL_MIN_WIDTH_PX,
     })
     expect(artifactsPanelDragLayout(0, maxWidth)).toEqual({ collapsed: true, width: 0 })
+  })
+
+  test("keeps the resize sash outside the right panel content width", () => {
+    expect(artifactsPanelMaxWidth(1_000, 0, true)).toBe(1_000 - 420 - RIGHT_PANEL_RESIZE_SASH_WIDTH_PX)
+  })
+})
+
+describe("artifacts panel titlebar toggle", () => {
+  test("keeps the Windows toggle in the main titlebar while the right panel is open", () => {
+    expect(showArtifactsPanelToggle("chat", true, true, "win32")).toBe(true)
+  })
+
+  test("does not change the existing non-Windows open-panel behavior", () => {
+    expect(showArtifactsPanelToggle("chat", true, true, "darwin")).toBe(false)
+    expect(showArtifactsPanelToggle("chat", true, true, "linux")).toBe(false)
+  })
+
+  test("only renders the toggle in chats with a panel selection", () => {
+    expect(showArtifactsPanelToggle("chat", false, false, "win32")).toBe(false)
+    expect(showArtifactsPanelToggle("settings", true, false, "win32")).toBe(false)
   })
 })
 

@@ -357,49 +357,94 @@ describe("claude selection: warmCatalog edges", () => {
 })
 
 describe("claude selection: prompt-borne selections", () => {
-  it("a failing prompt-borne model apply never fails the turn", async () => {
+  it("a failing prompt-borne model apply rejects before the turn is dispatched", async () => {
     const { adapter, calls } = await createHarness()
     await adapter.send({ type: "prompt", sessionId, text: "hello" })
     await vi.waitFor(() => expect(calls[0]!.fake.promptMessages).toHaveLength(1))
 
     calls[0]!.fake.setModel.mockRejectedValueOnce(new Error("model rejected"))
-    await expect(
-      adapter.send({ type: "prompt", sessionId, text: "again", agentModelId: "bogus" }),
-    ).resolves.toBeUndefined()
-    // The turn itself still ran.
-    await vi.waitFor(() => expect(calls[0]!.fake.promptMessages).toHaveLength(2))
+    await expect(adapter.send({ type: "prompt", sessionId, text: "again", agentModelId: "sonnet" })).rejects.toThrow(
+      "model rejected",
+    )
+    expect(calls[0]!.fake.promptMessages).toHaveLength(1)
     // And the rejected choice did not stick.
     expect(adapter.sessionSelection(sessionId)).toEqual({})
   })
 
-  it("a failing prompt-borne effort apply never fails the turn", async () => {
+  it("a failing prompt-borne effort apply rejects before the turn is dispatched", async () => {
     const { adapter, calls } = await createHarness()
     await adapter.send({ type: "prompt", sessionId, text: "hello" })
     calls[0]!.fake.applyFlagSettings.mockRejectedValueOnce(new Error("effort rejected"))
-    await expect(
-      adapter.send({ type: "prompt", sessionId, text: "again", agentEffortId: "high" }),
-    ).resolves.toBeUndefined()
-    await vi.waitFor(() => expect(calls[0]!.fake.promptMessages).toHaveLength(2))
+    await expect(adapter.send({ type: "prompt", sessionId, text: "again", agentEffortId: "high" })).rejects.toThrow(
+      "effort rejected",
+    )
+    expect(calls[0]!.fake.promptMessages).toHaveLength(1)
     expect(adapter.sessionSelection(sessionId)).toEqual({})
   })
 
-  it("an unknown prompt-borne effort id is ignored and the session still starts", async () => {
+  it("a later effort rejection restores a prompt-borne live model change", async () => {
     const { adapter, calls } = await createHarness()
+    await adapter.send({ type: "prompt", sessionId, text: "hello" })
+    calls[0]!.fake.applyFlagSettings.mockRejectedValueOnce(new Error("effort rejected"))
+
     await expect(
-      adapter.send({ type: "prompt", sessionId, text: "hello", agentEffortId: "ultra" }),
-    ).resolves.toBeUndefined()
-    expect(calls).toHaveLength(1)
-    expect(calls[0]!.options.effort).toBeUndefined()
-    await vi.waitFor(() => expect(calls[0]!.fake.promptMessages).toHaveLength(1))
+      adapter.send({
+        type: "prompt",
+        sessionId,
+        text: "again",
+        agentModelId: "sonnet",
+        agentEffortId: "high",
+      }),
+    ).rejects.toThrow("effort rejected")
+
+    expect(calls[0]!.fake.setModel.mock.calls).toEqual([["sonnet"], [undefined]])
+    expect(calls[0]!.fake.promptMessages).toHaveLength(1)
+    expect(adapter.sessionSelection(sessionId)).toEqual({})
+  })
+
+  it("an earlier prompt failure does not restore over a newer model selection", async () => {
+    const { adapter, calls } = await createHarness()
+    await adapter.send({ type: "prompt", sessionId, text: "hello" })
+
+    let rejectEffort: ((error: Error) => void) | undefined
+    calls[0]!.fake.applyFlagSettings.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectEffort = reject
+        }),
+    )
+    const failedPrompt = adapter.send({
+      type: "prompt",
+      sessionId,
+      text: "prompt with stale model",
+      agentModelId: "sonnet",
+      agentEffortId: "high",
+    })
+    await vi.waitFor(() => expect(rejectEffort).toBeDefined())
+    await adapter.send({ type: "set-model", sessionId, modelId: "haiku" })
+
+    rejectEffort?.(new Error("effort rejected"))
+    await expect(failedPrompt).rejects.toThrow("effort rejected")
+    expect(adapter.sessionSelection(sessionId)).toEqual({ modelId: "haiku" })
+    expect(calls[0]!.fake.setModel.mock.calls).toEqual([["sonnet"], ["haiku"]])
+    expect(calls[0]!.fake.promptMessages).toHaveLength(1)
+  })
+
+  it("an unknown prompt-borne effort id is rejected loudly", async () => {
+    const { adapter, calls } = await createHarness()
+    await expect(adapter.send({ type: "prompt", sessionId, text: "hello", agentEffortId: "ultra" })).rejects.toThrow(
+      'claude-code: unknown effort "ultra"',
+    )
+    expect(calls).toHaveLength(0)
   })
 })
 
 describe("claude selection: permission-mode projection", () => {
-  it("a rejected setPermissionMode is swallowed (projection is best effort)", async () => {
+  it("a rejected setPermissionMode fails closed", async () => {
     const { adapter, calls } = await createHarness()
     await adapter.send({ type: "prompt", sessionId, text: "hello" })
     calls[0]!.fake.setPermissionMode.mockRejectedValueOnce(new Error("mode refused"))
-    await expect(adapter.applyPermissionMode(sessionId, "plan")).resolves.toBeUndefined()
+    await expect(adapter.applyPermissionMode(sessionId, "plan")).rejects.toThrow("mode refused")
   })
 
   it("an undeclared mode maps defensively to default instead of erroring", async () => {

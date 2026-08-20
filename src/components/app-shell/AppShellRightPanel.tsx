@@ -4,7 +4,7 @@ import type { TurnOutputSelection } from "@/routes/Chat/TurnOutputs"
 import type { ConnectionClientService } from "@oomol/connection"
 
 import * as React from "react"
-import { ARTIFACTS_PANEL_MIN_WIDTH_PX } from "./app-shell-model.ts"
+import { ARTIFACTS_PANEL_MIN_WIDTH_PX, RIGHT_PANEL_RESIZE_SASH_WIDTH_PX } from "./app-shell-model.ts"
 import { useT } from "@/i18n/i18n"
 import { cn } from "@/lib/utils"
 import { BrowserPanel } from "@/routes/Chat/BrowserPanel"
@@ -18,7 +18,6 @@ const TurnOutputsPanel = React.lazy(() =>
 
 export const AppShellRightPanel = React.memo(function AppShellRightPanel({
   artifactSelection,
-  artifactsPanelContentRef,
   artifactsPanelIsMaximized,
   artifactsPanelMaxWidthState,
   artifactsPanelShellRef,
@@ -38,7 +37,6 @@ export const AppShellRightPanel = React.memo(function AppShellRightPanel({
   visibleRightPanelWidth,
 }: {
   artifactSelection: ArtifactSelection | null
-  artifactsPanelContentRef: React.RefObject<HTMLDivElement | null>
   artifactsPanelIsMaximized: boolean
   artifactsPanelMaxWidthState: number | null
   artifactsPanelShellRef: React.RefObject<HTMLDivElement | null>
@@ -63,7 +61,7 @@ export const AppShellRightPanel = React.memo(function AppShellRightPanel({
     <div
       ref={artifactsPanelShellRef}
       className={cn(
-        "oo-artifacts-panel-shell relative min-h-0",
+        "oo-artifacts-panel-shell flex min-h-0",
         artifactsPanelIsMaximized ? "min-w-0 flex-1 shrink" : "shrink-0",
         artifactsPanelIsMaximized && "oo-artifacts-panel-maximized",
         (isArtifactsPanelResizing || browserPanelVisible) && !isArtifactsPanelDragCollapsed
@@ -71,9 +69,16 @@ export const AppShellRightPanel = React.memo(function AppShellRightPanel({
           : "transition-[width,opacity,transform] duration-200 ease-out",
         rightPanelVisible ? "translate-x-0 opacity-100" : "pointer-events-none translate-x-3 opacity-0",
       )}
-      style={{
-        width: rightPanelVisible ? (artifactsPanelIsMaximized ? undefined : `${visibleRightPanelWidth}px`) : "0px",
-      }}
+      style={
+        {
+          "--right-panel-resize-sash-width": `${RIGHT_PANEL_RESIZE_SASH_WIDTH_PX}px`,
+          width: rightPanelVisible
+            ? artifactsPanelIsMaximized
+              ? undefined
+              : `${visibleRightPanelWidth + RIGHT_PANEL_RESIZE_SASH_WIDTH_PX}px`
+            : "0px",
+        } as React.CSSProperties
+      }
     >
       {!artifactsPanelIsMaximized ? (
         <div
@@ -85,18 +90,19 @@ export const AppShellRightPanel = React.memo(function AppShellRightPanel({
           aria-valuenow={visibleRightPanelWidth}
           title={t("aria.resizeRightPanel")}
           tabIndex={rightPanelVisible ? 0 : -1}
-          className="oo-artifacts-panel-resize-handle"
+          className="oo-artifacts-panel-resize-handle shrink-0"
           onPointerDown={handleArtifactsPanelResizeStart}
           onKeyDown={handleArtifactsPanelResizeKeyDown}
         />
       ) : null}
-      <div ref={artifactsPanelContentRef} className="h-full w-full min-w-0 overflow-hidden">
+      <div className="h-full min-w-0 flex-1 overflow-hidden">
         {browserPanelVisible && browserState ? (
           <BrowserPanel
             browserService={browserService}
             maximized={artifactsPanelIsMaximized}
             sessionId={browserState.sessionId}
             state={browserState}
+            windowControlsOnRight
             onClose={onCloseBrowser}
             onToggleMaximized={() => setArtifactsPanelMaximizedState(!artifactsPanelIsMaximized)}
           />
@@ -106,6 +112,7 @@ export const AppShellRightPanel = React.memo(function AppShellRightPanel({
               <TurnOutputsPanel
                 maximized={artifactsPanelIsMaximized}
                 selection={turnOutputSelection}
+                windowControlsOnRight
                 onCollapse={() => {
                   setArtifactsPanelOpen(false)
                   setArtifactsPanelMaximizedState(false)
@@ -116,6 +123,7 @@ export const AppShellRightPanel = React.memo(function AppShellRightPanel({
               <ArtifactsPanel
                 maximized={artifactsPanelIsMaximized}
                 selection={artifactSelection}
+                windowControlsOnRight
                 onCollapse={() => {
                   setArtifactsPanelOpen(false)
                   setArtifactsPanelMaximizedState(false)

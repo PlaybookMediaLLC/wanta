@@ -59,6 +59,25 @@ export interface ChatTurnProcess {
   endedAt?: number
 }
 
+/**
+ * A process timeline segment intentionally excludes the final response lane,
+ * so its scoped messages may have no completedAt even though the whole turn
+ * is settled. Inherit the enclosing turn envelope for the last process
+ * disclosure while preserving any narrower native tool timing.
+ */
+export function inheritTurnProcessTiming(
+  scoped: ChatTurnProcess,
+  enclosing: Pick<ChatTurnProcess, "startedAt" | "endedAt">,
+): ChatTurnProcess {
+  const starts = [scoped.startedAt, enclosing.startedAt].filter((value): value is number => typeof value === "number")
+  const ends = [scoped.endedAt, enclosing.endedAt].filter((value): value is number => typeof value === "number")
+  return {
+    ...scoped,
+    ...(starts.length > 0 ? { startedAt: Math.min(...starts) } : {}),
+    ...(ends.length > 0 ? { endedAt: Math.max(...ends) } : {}),
+  }
+}
+
 export type ChatTurnProcessStatus =
   | "running"
   | "completed"
@@ -502,8 +521,12 @@ export function summarizeTurnProcess(
   }
 }
 
-export function shouldShowTurnProcess(process: Pick<ChatTurnProcess, "activity" | "tools">): boolean {
+export function shouldShowTurnProcess(
+  process: Pick<ChatTurnProcess, "activity" | "tools">,
+  hasProcessSegment = false,
+): boolean {
   return (
+    hasProcessSegment ||
     process.tools.length > 0 ||
     process.activity?.phase === "retrying" ||
     process.activity?.phase === "compacting" ||

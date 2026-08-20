@@ -13,7 +13,7 @@ test("buildLinkRuntimeSystem binds raw OOMOL calls to the exact team", () => {
 
   assert.match(prompt, /Current-turn Wanta Link workspace: team "Team \\"Quoted\\""/)
   assert.match(prompt, /`wanta_link` MCP tools/)
-  assert.match(prompt, /do not invoke the raw `oo` CLI/)
+  assert.match(prompt, /Do not invoke the raw `oo` CLI/)
   assert.match(prompt, /--team "Team \\"Quoted\\""/)
   assert.match(prompt, /never retry in a personal or default workspace/i)
   assert.match(prompt, /does not prove that the current Wanta team is disconnected/)
@@ -98,12 +98,13 @@ test("buildPermissionModeSystem describes default access", () => {
   assert.doesNotMatch(prompt, /user has enabled Full Access/)
 })
 
-test("buildExternalPermissionModeSystem preserves agent-native enforcement", () => {
+test("buildExternalPermissionModeSystem describes shared Wanta decisions over native enforcement", () => {
   const defaultPrompt = buildExternalPermissionModeSystem("default", true)
   const fullAccessPrompt = buildExternalPermissionModeSystem("full_access", true)
 
-  assert.match(defaultPrompt, /Default Access through the external agent's native permission policy/)
-  assert.match(defaultPrompt, /will not silently answer it on the agent's behalf/)
+  assert.match(defaultPrompt, /Default Access with Wanta's shared approval policy/)
+  assert.match(defaultPrompt, /same local permission policy to every agent/)
+  assert.match(defaultPrompt, /approved automatically/)
   assert.doesNotMatch(defaultPrompt, /Local permission requests are auto-approved/)
   assert.match(fullAccessPrompt, /projected onto the external agent's native permission mode when supported/)
   assert.match(fullAccessPrompt, /external agent runtime remains the enforcement authority/)

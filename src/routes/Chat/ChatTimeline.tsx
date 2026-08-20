@@ -31,6 +31,7 @@ import { shouldRenderConnectionSuggestion } from "./assistant-turn-renderer-mode
 import { TurnProcessActivity } from "./AssistantTurnRenderer.tsx"
 import {
   activityForChatTurn,
+  inheritTurnProcessTiming,
   latestAssistantMessage,
   retrySourceFromTurn,
   shouldAppendTurnProcessActivity,
@@ -51,12 +52,14 @@ import { PermissionRequiredCard } from "./PermissionRequiredCard.tsx"
 import { QuestionPromptCard } from "./QuestionPromptCard.tsx"
 import { normalizeServiceSlug } from "./tool-display.ts"
 import { hasStoppedTool } from "./tool-state.ts"
+import { terminalTurnOutcomeStatus } from "./turn-outcome-receipt-model.ts"
 import {
   turnOutputInitialRole,
   turnOutputRecordsByMessageId,
   turnOutputRecordsByTurnId,
   useTurnOutputRecords,
 } from "./turn-output-records.ts"
+import { TurnOutcomeReceipt } from "./TurnOutcomeReceipt.tsx"
 import { TurnOutputShelf } from "./TurnOutputShelf.tsx"
 import { Conversation, ConversationContent, ConversationScrollButton } from "@/components/ai-elements/conversation"
 import { Message, MessageContent } from "@/components/ai-elements/message"
@@ -172,7 +175,8 @@ const ChatTurnView = React.memo(function ChatTurnView({
   const hasVisibleOutcome =
     timelineHasVisibleOutcome(timelineSegments) || hasRenderableArtifacts || hasRenderableTurnOutputs
   const process = summarizeTurnProcess(turn, activity, activeAssistantMessageId, { hasVisibleOutcome })
-  const shouldShowProcess = shouldShowTurnProcess(process)
+  const hasProcessSegment = timelineSegments.some((segment) => segment.kind === "process")
+  const shouldShowProcess = shouldShowTurnProcess(process, hasProcessSegment)
   const shouldShowPlainActivity = shouldShowPlainTurnActivity(process)
   const turnIsActive = Boolean(activeAssistantMessageId)
   const processSeenRef = React.useRef(shouldShowProcess)
@@ -182,7 +186,6 @@ const ChatTurnView = React.memo(function ChatTurnView({
     processSeenRef.current = false
   }
   const showTurnProcess = shouldShowProcess || (turnIsActive && processSeenRef.current)
-  const hasProcessSegment = timelineSegments.some((segment) => segment.kind === "process")
   const renderSegments = shouldAppendTurnProcessActivity(showTurnProcess, hasProcessSegment)
     ? timelineSegments.concat([{ kind: "process" as const, key: `${turn.id}:process`, blocks: [] }])
     : timelineSegments
@@ -204,6 +207,7 @@ const ChatTurnView = React.memo(function ChatTurnView({
     showSuggestedAuthorization ? process.suggestedAuthorization : undefined,
     providerByService,
   )
+  const terminalOutcomeStatus = terminalTurnOutcomeStatus(process, turnIsActive)
   const retrySource = React.useMemo(() => retrySourceFromTurn(turn), [turn])
   const handleAuthorize = React.useCallback(
     (auth: AuthorizationInfo) => {
@@ -263,7 +267,7 @@ const ChatTurnView = React.memo(function ChatTurnView({
               ...turn,
               assistants: assistantMessagesFromTimelineBlocks(segment.blocks),
             }
-            const segmentProcess =
+            const scopedSegmentProcess =
               segment.blocks.length === 0
                 ? process
                 : summarizeTurnProcess(
@@ -272,10 +276,14 @@ const ChatTurnView = React.memo(function ChatTurnView({
                     isLastProcess ? activeAssistantMessageId : undefined,
                     { hasVisibleOutcome },
                   )
+            const segmentProcess =
+              isLastProcess && segment.blocks.length > 0
+                ? inheritTurnProcessTiming(scopedSegmentProcess, process)
+                : scopedSegmentProcess
             const ownsTurnActions = isLastProcess && segmentIndex === lastSegmentIndex
-            const processLive = ownsTurnActions && turnIsActive
+            const processLive = isLastProcess && turnIsActive
             return (
-              <Message key={segment.key} from="assistant">
+              <Message key={`${turn.id}:process`} from="assistant">
                 <MessageContent className="w-full">
                   <TurnProcessActivity
                     blocks={segment.blocks}
@@ -296,6 +304,7 @@ const ChatTurnView = React.memo(function ChatTurnView({
               </Message>
             )
           })}
+          {terminalOutcomeStatus ? <TurnOutcomeReceipt status={terminalOutcomeStatus} /> : null}
           {!turnIsActive && (process.authorizationIssues.length > 0 || suggestedAuthorization) ? (
             <Message from="assistant">
               <MessageContent className="w-full">

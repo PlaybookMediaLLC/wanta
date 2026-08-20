@@ -4,9 +4,10 @@ import type {
   ConnectionProviderSummary,
 } from "../../../electron/connections/common.ts"
 import type { DisconnectTarget } from "./connection-route-model.ts"
+import type { ConnectionAccessContext } from "./ConnectionAccessDialog.tsx"
 import type { UseConnections } from "@/hooks/useConnections"
 
-import { Edit, KeyRound, Save, Unplug, X } from "lucide-react"
+import { Edit, KeyRound, Save, ShieldCheck, Unplug, X } from "lucide-react"
 import * as React from "react"
 import {
   accountActionButtonClassName,
@@ -28,14 +29,19 @@ import { cn } from "@/lib/utils"
 
 export function ConnectionAccountsList({
   busy,
+  accessContext,
+  canManageConnections,
   connections,
   onConnect,
   onDisconnect,
+  onOpenAccess,
   polling,
   provider,
   reconnectBlocked,
 }: {
+  accessContext?: ConnectionAccessContext
   busy: UseConnections["busy"]
+  canManageConnections: boolean
   connections: UseConnections
   onConnect: (
     provider: ConnectionProviderSummary,
@@ -43,6 +49,7 @@ export function ConnectionAccountsList({
     appId?: string,
   ) => Promise<void>
   onDisconnect: (target: DisconnectTarget) => void
+  onOpenAccess: (app: ConnectionAppSummary) => void
   polling: string | null
   provider: ConnectionProviderSummary
   reconnectBlocked?: boolean
@@ -61,11 +68,14 @@ export function ConnectionAccountsList({
         <ConnectionAccountItem
           key={app.id}
           app={app}
+          accessContext={accessContext}
           busy={busy}
+          canManageConnections={canManageConnections}
           connections={connections}
           index={index}
           onConnect={onConnect}
           onDisconnect={onDisconnect}
+          onOpenAccess={onOpenAccess}
           polling={polling}
           provider={provider}
           reconnectBlocked={Boolean(reconnectBlocked)}
@@ -78,18 +88,23 @@ export function ConnectionAccountsList({
 
 function ConnectionAccountItem({
   app,
+  accessContext,
   busy,
+  canManageConnections,
   connections,
   index,
   onConnect,
   onDisconnect,
+  onOpenAccess,
   polling,
   provider,
   reconnectBlocked,
   servicePolling,
 }: {
   app: ConnectionAppSummary
+  accessContext?: ConnectionAccessContext
   busy: UseConnections["busy"]
+  canManageConnections: boolean
   connections: UseConnections
   index: number
   onConnect: (
@@ -98,13 +113,15 @@ function ConnectionAccountItem({
     appId?: string,
   ) => Promise<void>
   onDisconnect: (target: DisconnectTarget) => void
+  onOpenAccess: (app: ConnectionAppSummary) => void
   polling: string | null
   provider: ConnectionProviderSummary
   reconnectBlocked: boolean
   servicePolling: boolean
 }) {
   const t = useT()
-  const managedAccountActions = supportsManagedConnectionAccountActions(provider)
+  const supportsManagedAccount = supportsManagedConnectionAccountActions(provider)
+  const managedAccountActions = canManageConnections && supportsManagedAccount
   const [aliasDraft, setAliasDraft] = React.useState(app.alias ?? "")
   const [aliasEditing, setAliasEditing] = React.useState(false)
   const [aliasBusy, setAliasBusy] = React.useState(false)
@@ -154,129 +171,143 @@ function ConnectionAccountItem({
   }
 
   return (
-    <article className="grid min-w-0 gap-2.5 rounded-md border bg-card px-3 py-2.5 text-card-foreground">
-      <div className="grid min-w-0 gap-1">
-        <div className="flex min-w-0 flex-wrap items-start gap-1.5">
-          {aliasEditing && managedAccountActions ? (
-            <form
-              className="flex min-w-0 flex-1 items-center gap-1.5"
-              onSubmit={(event) => {
-                event.preventDefault()
-                void saveAlias()
-              }}
-            >
-              <Input
-                aria-label={t("connections.alias")}
-                autoFocus
-                className="h-7 min-w-32 flex-1"
-                disabled={aliasDisabled}
-                value={aliasDraft}
-                placeholder={t("connections.aliasPlaceholder")}
-                onChange={(event) => setAliasDraft(normalizeConnectionAliasInput(event.target.value))}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") {
-                    event.preventDefault()
-                    cancelAliasEditing()
-                  }
+    <>
+      <article className="grid min-w-0 gap-2.5 rounded-md border bg-card px-3 py-2.5 text-card-foreground">
+        <div className="grid min-w-0 gap-1">
+          <div className="flex min-w-0 flex-wrap items-start gap-1.5">
+            {aliasEditing && managedAccountActions ? (
+              <form
+                className="flex min-w-0 flex-1 items-center gap-1.5"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  void saveAlias()
                 }}
-              />
-              <Button
-                type="submit"
-                variant={aliasDirty ? "default" : "ghost"}
-                size="icon"
-                className="size-7"
-                aria-label={t("connections.saveAlias")}
-                title={t("connections.saveAlias")}
-                disabled={!aliasDirty || aliasDisabled}
               >
-                {aliasBusy ? <Loader size={14} /> : <Save className="size-3.5" />}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="size-7"
-                aria-label={t("common.cancel")}
-                title={t("common.cancel")}
-                disabled={aliasBusy}
-                onClick={cancelAliasEditing}
-              >
-                <X className="size-3.5" />
-              </Button>
-            </form>
-          ) : (
-            <>
-              <span className="oo-text-control max-w-full min-w-0 font-medium break-all">{accountLabel}</span>
-              {managedAccountActions ? (
+                <Input
+                  aria-label={t("connections.alias")}
+                  autoFocus
+                  className="h-7 min-w-32 flex-1"
+                  disabled={aliasDisabled}
+                  value={aliasDraft}
+                  placeholder={t("connections.aliasPlaceholder")}
+                  onChange={(event) => setAliasDraft(normalizeConnectionAliasInput(event.target.value))}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault()
+                      cancelAliasEditing()
+                    }
+                  }}
+                />
+                <Button
+                  type="submit"
+                  variant={aliasDirty ? "default" : "ghost"}
+                  size="icon"
+                  className="size-7"
+                  aria-label={t("connections.saveAlias")}
+                  title={t("connections.saveAlias")}
+                  disabled={!aliasDirty || aliasDisabled}
+                >
+                  {aliasBusy ? <Loader size={14} /> : <Save className="size-3.5" />}
+                </Button>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
                   className="size-7"
-                  aria-label={t("connections.editAlias")}
-                  title={t("connections.editAlias")}
-                  disabled={servicePolling}
-                  onClick={() => setAliasEditing(true)}
+                  aria-label={t("common.cancel")}
+                  title={t("common.cancel")}
+                  disabled={aliasBusy}
+                  onClick={cancelAliasEditing}
                 >
-                  <Edit className="size-3.5" />
+                  <X className="size-3.5" />
                 </Button>
-              ) : null}
-            </>
-          )}
-          <span className="flex shrink-0 flex-wrap items-center gap-1.5">
-            {app.isDefault ? <Badge variant="success">{t("connections.defaultConnection")}</Badge> : null}
-            {app.status === "reauth_required" || app.status === "error" ? (
-              <Badge variant="warning">{t("connections.providerNeedsAttention")}</Badge>
-            ) : null}
-          </span>
-        </div>
-        <div className="oo-text-micro oo-text-muted flex min-w-0 flex-wrap items-center gap-1.5">
-          {secondaryItems.map((item, itemIndex) => (
-            <span key={`${itemIndex}-${item}`} className="min-w-0 truncate">
-              {item}
-            </span>
-          ))}
-        </div>
-      </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5 border-t pt-2">
-        {managedAccountActions ? (
-          <AccountExecutionLogsButton appId={app.id} connections={connections} name={accountLabel} />
-        ) : null}
-        {reconnectAuthType ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className={accountActionButtonClassName}
-            disabled={reconnectDisabled}
-            onClick={() => void onConnect(provider, reconnectAuthType, app.id)}
-          >
-            {accountPolling || reconnectBlocked ? <Loader size={14} /> : <KeyRound className="size-3.5" />}
-            {accountPolling
-              ? t("connections.oauthWaiting")
-              : reconnectBlocked
-                ? t("connections.oauthInProgress")
-                : t("connections.reconnect")}
-          </Button>
-        ) : null}
-        {provider.canDisconnect ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={servicePolling || busy === "disconnect"}
-            className={cn(
-              accountActionButtonClassName,
-              "border-[var(--oo-danger-border)] text-destructive hover:bg-[var(--oo-danger-surface)] hover:text-destructive",
+              </form>
+            ) : (
+              <>
+                <span className="oo-text-control max-w-full min-w-0 font-medium break-all">{accountLabel}</span>
+                {managedAccountActions ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-7"
+                    aria-label={t("connections.editAlias")}
+                    title={t("connections.editAlias")}
+                    disabled={servicePolling}
+                    onClick={() => setAliasEditing(true)}
+                  >
+                    <Edit className="size-3.5" />
+                  </Button>
+                ) : null}
+              </>
             )}
-            onClick={() => onDisconnect({ provider, app })}
-          >
-            <Unplug className="size-3.5" />
-            {t("connections.disconnect")}
-          </Button>
-        ) : null}
-      </div>
-    </article>
+            <span className="flex shrink-0 flex-wrap items-center gap-1.5">
+              {app.isDefault ? <Badge variant="success">{t("connections.defaultConnection")}</Badge> : null}
+              {app.status === "reauth_required" || app.status === "error" ? (
+                <Badge variant="warning">{t("connections.providerNeedsAttention")}</Badge>
+              ) : null}
+            </span>
+          </div>
+          <div className="oo-text-micro oo-text-muted flex min-w-0 flex-wrap items-center gap-1.5">
+            {secondaryItems.map((item, itemIndex) => (
+              <span key={`${itemIndex}-${item}`} className="min-w-0 truncate">
+                {item}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5 border-t pt-2">
+          {supportsManagedAccount && accessContext ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className={accountActionButtonClassName}
+              onClick={() => onOpenAccess(app)}
+            >
+              <ShieldCheck className="size-3.5" />
+              {t(canManageConnections ? "connections.manageAccess" : "connections.viewAccess")}
+            </Button>
+          ) : null}
+          {managedAccountActions ? (
+            <AccountExecutionLogsButton appId={app.id} connections={connections} name={accountLabel} />
+          ) : null}
+          {reconnectAuthType ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className={accountActionButtonClassName}
+              disabled={reconnectDisabled}
+              onClick={() => void onConnect(provider, reconnectAuthType, app.id)}
+            >
+              {accountPolling || reconnectBlocked ? <Loader size={14} /> : <KeyRound className="size-3.5" />}
+              {accountPolling
+                ? t("connections.oauthWaiting")
+                : reconnectBlocked
+                  ? t("connections.oauthInProgress")
+                  : t("connections.reconnect")}
+            </Button>
+          ) : null}
+          {canManageConnections && provider.canDisconnect ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={servicePolling || busy === "disconnect"}
+              className={cn(
+                accountActionButtonClassName,
+                "border-[var(--oo-danger-border)] text-destructive hover:bg-[var(--oo-danger-surface)] hover:text-destructive",
+              )}
+              onClick={() => onDisconnect({ provider, app })}
+            >
+              <Unplug className="size-3.5" />
+              {t("connections.disconnect")}
+            </Button>
+          ) : null}
+        </div>
+      </article>
+    </>
   )
 }
 

@@ -13,6 +13,7 @@ import {
   clampArtifactsPanelWidthForLayout,
   readStoredArtifactsPanelWidth,
   readStoredBrowserPanelWidth,
+  RIGHT_PANEL_RESIZE_SASH_WIDTH_PX,
 } from "./app-shell-model.ts"
 import {
   artifactPanelSelection,
@@ -37,7 +38,6 @@ interface UseArtifactsPanelStateOptions {
 
 interface UseArtifactsPanelStateResult {
   artifactSelection: ArtifactSelection | null
-  artifactsPanelContentRef: React.RefObject<HTMLDivElement | null>
   artifactsPanelIsMaximized: boolean
   artifactsPanelMaxWidthState: number | null
   artifactsPanelOpen: boolean
@@ -95,7 +95,6 @@ export function useArtifactsPanelState({
   const artifactsPanelSidebarRestore = React.useRef<boolean | null>(null)
   const sidebarCollapsedRef = React.useRef(sidebarCollapsed)
   const artifactsPanelShellRef = React.useRef<HTMLDivElement | null>(null)
-  const artifactsPanelContentRef = React.useRef<HTMLDivElement | null>(null)
   const artifactsPanelMaxWidthValue = artifactsPanelMaxWidthState ?? Number.POSITIVE_INFINITY
   const artifactSelection = panelSelection.kind === "artifact" ? panelSelection.selection : null
   const turnOutputSelection = panelSelection.kind === "turnOutput" ? panelSelection.selection : null
@@ -119,21 +118,7 @@ export function useArtifactsPanelState({
   const applyArtifactsPanelShellWidth = React.useCallback((width: number): void => {
     const element = artifactsPanelShellRef.current
     if (element) {
-      element.style.width = `${width}px`
-    }
-  }, [])
-
-  const freezeArtifactsPanelContentWidth = React.useCallback((width: number): void => {
-    const element = artifactsPanelContentRef.current
-    if (element) {
-      element.style.width = `${width}px`
-    }
-  }, [])
-
-  const clearArtifactsPanelContentWidth = React.useCallback((): void => {
-    const element = artifactsPanelContentRef.current
-    if (element) {
-      element.style.removeProperty("width")
+      element.style.width = `${width + RIGHT_PANEL_RESIZE_SASH_WIDTH_PX}px`
     }
   }, [])
 
@@ -276,7 +261,6 @@ export function useArtifactsPanelState({
       }
       artifactsPanelPendingRawWidth.current = null
       artifactsPanelPendingWidth.current = null
-      clearArtifactsPanelContentWidth()
       artifactsPanelResizeStart.current = null
       setIsArtifactsPanelResizing(false)
       setArtifactsPanelDragCollapsedState(false)
@@ -321,7 +305,6 @@ export function useArtifactsPanelState({
       }
       artifactsPanelPendingWidth.current = null
       artifactsPanelPendingRawWidth.current = null
-      clearArtifactsPanelContentWidth()
       setArtifactsPanelDragCollapsedState(false)
       setArtifactsPanelDragWidth(null)
       window.removeEventListener("pointermove", handlePointerMove)
@@ -331,7 +314,6 @@ export function useArtifactsPanelState({
   }, [
     applyArtifactsPanelShellWidth,
     artifactsPanelMaxWidthValue,
-    clearArtifactsPanelContentWidth,
     closeBrowserPanel,
     isArtifactsPanelResizing,
     setArtifactsPanelDragCollapsedState,
@@ -351,14 +333,7 @@ export function useArtifactsPanelState({
       event.preventDefault()
       event.currentTarget.setPointerCapture(event.pointerId)
       const dragStartWidth = visibleRightPanelWidth
-      const frozenContentWidth = Math.max(
-        dragStartWidth,
-        Number.isFinite(artifactsPanelMaxWidthValue) ? artifactsPanelMaxWidthValue : dragStartWidth,
-      )
       applyArtifactsPanelShellWidth(dragStartWidth)
-      if (!browserPanelVisible) {
-        freezeArtifactsPanelContentWidth(frozenContentWidth)
-      }
       artifactsPanelResizeStart.current = {
         browser: browserPanelVisible,
         pointerX: event.clientX,
@@ -372,9 +347,7 @@ export function useArtifactsPanelState({
     },
     [
       applyArtifactsPanelShellWidth,
-      artifactsPanelMaxWidthValue,
       browserPanelVisible,
-      freezeArtifactsPanelContentWidth,
       rightPanelVisible,
       setArtifactsPanelDragCollapsedState,
       visibleRightPanelWidth,
@@ -446,7 +419,6 @@ export function useArtifactsPanelState({
 
   return {
     artifactSelection,
-    artifactsPanelContentRef,
     artifactsPanelIsMaximized,
     artifactsPanelMaxWidthState,
     artifactsPanelOpen,

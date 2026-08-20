@@ -28,6 +28,7 @@ import { AGENT_PROFILES, agentLoginHint } from "../contract/profile.ts"
 import { ExternalAgentAdapter } from "../external/adapter-base.ts"
 import { externalAgentPromptText } from "../external/prompt.ts"
 import { externalSessionUuid } from "../external/session-id.ts"
+import { appendStderrTail, subprocessFailureSummary } from "../external/subprocess-diagnostics.ts"
 import { createClaudeTurnTranslator, isLocalCommandText } from "./translator.ts"
 
 // Claude Code native adapter (BYOA phase 1).
@@ -41,7 +42,6 @@ import { createClaudeTurnTranslator, isLocalCommandText } from "./translator.ts"
 // `allowDangerouslySkipPermissions: true` at query creation.
 
 const PROBE_CACHE_TTL_MS = 30_000
-const MAX_STDERR_CHUNKS = 40
 const LOGIN_HINT = agentLoginHint("claude-code")
 
 export interface ClaudeCodeAdapterOptions {
@@ -55,6 +55,8 @@ export interface ClaudeCodeAdapterOptions {
   hostMcpServers?: HostMcpServerProvider
   /** Resolves the merged user PATH for the subprocess env (electron/command-path.ts resolveUserCommandPath by default). */
   commandPath?: () => Promise<string>
+  /** Shared Wanta-managed subprocess environment, including guarded command shims. */
+  commandEnvironment?: () => Promise<NodeJS.ProcessEnv>
   /** Test seam: the SDK query function. Defaults to the real `query` from @anthropic-ai/claude-agent-sdk. */
   queryFn?: typeof query
 }
@@ -114,7 +116,7 @@ interface ClaudeSessionState {
   inputQueue: AsyncInputQueue<SDKUserMessage>
   queryHandle: Query
   /** Bounded ring buffer of recent subprocess stderr chunks for diagnostics. */
-  stderrTail: string[]
+  stderrTail: string
   loop: Promise<void>
   /** How the native CLI session was started; drives the retry fallback. */
   startMode: "fresh" | "resume"
@@ -145,14 +147,37 @@ function salientResources(toolInput: Record<string, unknown>): string[] {
   return resources
 }
 
+// Wanta host tool names are snake_case identifiers: a lowercase letter start,
+// single `_` separators, no leading/trailing/double underscore. Validating the
+// tool segment against this grammar is what makes the server attribution exact:
+// `mcp__<server>__<tool>` is ambiguous by string alone (a foreign server named
+// `<registered>_` yields `mcp__<registered>___<tool>`, indistinguishable from
+// `<registered>` with tool `_<tool>`), and only the registered server produces
+// a grammar-valid tail, so a `_`-prefixed or `__`-bearing tail is rejected.
+const WANTA_HOST_TOOL_NAME = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/u
+
 /**
  * Claude exposes Wanta MCP calls as `mcp__<server>__<tool>`. Keep this
  * deliberately narrow so only tools from Wanta's generated host servers can
  * skip the redundant external-agent transport prompt.
  */
-function wantaHostToolName(toolName: string): string | undefined {
-  const match = /^mcp__wanta_[a-z0-9_-]+__([a-z0-9_-]+)$/u.exec(toolName)
-  return match?.[1]
+function wantaHostToolName(toolName: string, hostServerNames: ReadonlySet<string>): string | undefined {
+  // Trust the tool only when its MCP server was actually registered for THIS
+  // session by Wanta — never the `wanta_*` name shape alone. A foreign MCP
+  // server (from project/user/plugin config the CLI also loads), whether named
+  // `wanta_helper`, `wanta_skills__evil`, or `wanta_skills_`, must not inherit
+  // the host-tool auto-approve. Mirrors the ACP translator's registration check.
+  for (const name of hostServerNames) {
+    const prefix = `mcp__${name}__`
+    if (!toolName.startsWith(prefix)) {
+      continue
+    }
+    const tool = toolName.slice(prefix.length)
+    if (WANTA_HOST_TOOL_NAME.test(tool)) {
+      return tool
+    }
+  }
+  return undefined
 }
 
 function sdkPermissionMode(
@@ -230,6 +255,7 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
   private readonly probe: () => Promise<ExternalAgentRuntimeStatus>
   private readonly scratchRootDir: string
   private readonly commandPath: () => Promise<string>
+  private readonly commandEnvironment?: () => Promise<NodeJS.ProcessEnv>
   private readonly hostMcpServers?: HostMcpServerProvider
   private readonly queryFn: typeof query
 
@@ -257,8 +283,14 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
     this.probe = options.probe
     this.scratchRootDir = options.scratchRootDir
     this.commandPath = options.commandPath ?? (() => resolveUserCommandPath())
+    this.commandEnvironment = options.commandEnvironment
     this.hostMcpServers = options.hostMcpServers
     this.queryFn = options.queryFn ?? query
+  }
+
+  private async subprocessEnvironment(): Promise<NodeJS.ProcessEnv> {
+    if (this.commandEnvironment) return await this.commandEnvironment()
+    return { ...process.env, PATH: await this.commandPath() }
   }
 
   protected async handleStart(): Promise<void> {
@@ -287,24 +319,43 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
     if (options?.signal?.aborted) {
       return
     }
-    // Draft-time model/effort choices ride the first prompt; failures to apply
-    // them must never fail the turn itself.
-    if (input.agentModelId !== undefined) {
-      await this.applyModel(input.sessionId, input.agentModelId).catch((error: unknown) => {
-        logDiagnostic("claude-code-adapter", "prompt-borne model apply failed", {
-          sessionId: input.sessionId,
-          error: errorMessage(error),
-        })
-      })
+    const previousModel = this.desiredModels.get(input.sessionId)
+    const previousEffort = this.desiredEfforts.get(input.sessionId)
+    let modelApplied = false
+    let effortApplied = false
+    try {
+      // Draft-time model/effort choices ride the first prompt. They must apply
+      // before dispatch so persisted/UI state never claims a rejected choice.
+      if (input.agentModelId !== undefined) {
+        if (!this.catalog.models.some((model) => model.id === input.agentModelId)) {
+          throw new Error(`claude-code: unknown model "${input.agentModelId}"`)
+        }
+        await this.applyModel(input.sessionId, input.agentModelId)
+        modelApplied = true
+      }
+      if (input.agentEffortId !== undefined) {
+        if (!isClaudeEffortId(input.agentEffortId)) {
+          throw new Error(`claude-code: unknown effort "${input.agentEffortId}"`)
+        }
+        await this.applyEffort(input.sessionId, input.agentEffortId)
+        effortApplied = true
+      }
+      await this.dispatchPrompt(input, options)
+    } catch (error) {
+      await this.restorePromptSelections(
+        input.sessionId,
+        previousModel,
+        previousEffort,
+        input.agentModelId,
+        input.agentEffortId,
+        modelApplied,
+        effortApplied,
+      )
+      throw error
     }
-    if (input.agentEffortId !== undefined && isClaudeEffortId(input.agentEffortId)) {
-      await this.applyEffort(input.sessionId, input.agentEffortId).catch((error: unknown) => {
-        logDiagnostic("claude-code-adapter", "prompt-borne effort apply failed", {
-          sessionId: input.sessionId,
-          error: errorMessage(error),
-        })
-      })
-    }
+  }
+
+  private async dispatchPrompt(input: PromptAgentInput, options?: AgentSendOptions): Promise<void> {
     if (this.sessions.has(input.sessionId)) await this.hostMcpServers?.(input)
     const session = await this.ensureSession(input)
     if (options?.signal?.aborted) {
@@ -326,6 +377,37 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
       parent_tool_use_id: null,
       session_id: session.sessionUuid,
     })
+  }
+
+  private async restorePromptSelections(
+    sessionId: string,
+    previousModel: string | undefined,
+    previousEffort: ClaudeEffortId | undefined,
+    appliedModel: string | undefined,
+    appliedEffort: string | undefined,
+    modelApplied: boolean,
+    effortApplied: boolean,
+  ): Promise<void> {
+    if (effortApplied && this.desiredEfforts.get(sessionId) === appliedEffort) {
+      await this.applyEffort(sessionId, previousEffort).catch((error: unknown) => {
+        logDiagnostic(
+          "claude-code-adapter",
+          "failed to restore prompt-borne effort",
+          { error: errorMessage(error), sessionId },
+          "error",
+        )
+      })
+    }
+    if (modelApplied && this.desiredModels.get(sessionId) === appliedModel) {
+      await this.applyModel(sessionId, previousModel).catch((error: unknown) => {
+        logDiagnostic(
+          "claude-code-adapter",
+          "failed to restore prompt-borne model",
+          { error: errorMessage(error), sessionId },
+          "error",
+        )
+      })
+    }
   }
 
   protected async handleCancel(input: CancelAgentInput): Promise<void> {
@@ -477,6 +559,7 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
   }
 
   public override async applyPermissionMode(sessionId: string, mode: AgentPermissionMode): Promise<void> {
+    const previous = this.desiredPermissionModes.get(sessionId)
     this.desiredPermissionModes.set(sessionId, mode)
     const session = this.sessions.get(sessionId)
     if (!session) {
@@ -485,12 +568,14 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
     try {
       await session.queryHandle.setPermissionMode(sdkPermissionMode(mode))
     } catch (error) {
+      this.restoreDesired(this.desiredPermissionModes, sessionId, previous, mode)
       logDiagnostic(
         "claude-code-adapter",
         "setPermissionMode failed",
         { sessionId, mode, error: errorMessage(error) },
         "error",
       )
+      throw error
     }
   }
 
@@ -589,14 +674,14 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
     }
     const cwd = path.join(this.scratchRootDir, "warmup")
     await mkdir(cwd, { recursive: true })
-    const commandPathValue = await this.commandPath()
+    const subprocessEnvironment = await this.subprocessEnvironment()
     const inputQueue = new AsyncInputQueue<SDKUserMessage>()
     const handle = this.queryFn({
       prompt: inputQueue,
       options: {
         cwd,
         pathToClaudeCodeExecutable: status.binary.path,
-        env: { ...process.env, PATH: commandPathValue },
+        env: subprocessEnvironment,
       },
     })
     try {
@@ -672,24 +757,30 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
     // (verified against 2.1.226: resume replays nothing and keeps the same id).
     const startMode =
       this.nativeStartOverride.get(sessionId) ?? (this.hasPersistedHistory(sessionId) ? "resume" : "fresh")
-    let cwd = input.outputProjectRoot
+    let cwd = input.workingDirectory ?? input.outputProjectRoot
     if (!cwd) {
       cwd = path.join(this.scratchRootDir, sessionUuid)
       await mkdir(cwd, { recursive: true })
     }
-    const commandPathValue = await this.commandPath()
+    const subprocessEnvironment = await this.subprocessEnvironment()
     const hostMcpServers = await this.hostMcpServers?.(input)
+    const hostServerNames = new Set((hostMcpServers ?? []).map((server) => server.name))
     const inputQueue = new AsyncInputQueue<SDKUserMessage>()
     const abortController = new AbortController()
-    const stderrTail: string[] = []
+    let stderrTail = ""
     const queryHandle = this.queryFn({
       prompt: inputQueue,
       options: {
         cwd,
+        ...(input.additionalDirectories?.length
+          ? {
+              additionalDirectories: [...new Set(input.additionalDirectories)].filter((directory) => directory !== cwd),
+            }
+          : {}),
         pathToClaudeCodeExecutable: status.binary.path,
         // Options.env REPLACES the subprocess env entirely (verified against
         // sdk.d.ts 0.3.226), so the current env is spread in explicitly.
-        env: { ...process.env, PATH: commandPathValue },
+        env: subprocessEnvironment,
         ...(hostMcpServers?.length
           ? {
               mcpServers: Object.fromEntries(
@@ -708,12 +799,9 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true,
         ...(startMode === "resume" ? { resume: sessionUuid } : { sessionId: sessionUuid }),
-        canUseTool: this.createCanUseTool(sessionId),
+        canUseTool: this.createCanUseTool(sessionId, hostServerNames),
         stderr: (data: string) => {
-          stderrTail.push(data)
-          if (stderrTail.length > MAX_STDERR_CHUNKS) {
-            stderrTail.shift()
-          }
+          stderrTail = appendStderrTail(stderrTail, data)
         },
         abortController,
       },
@@ -723,7 +811,9 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
       sessionUuid,
       inputQueue,
       queryHandle,
-      stderrTail,
+      get stderrTail() {
+        return stderrTail
+      },
       loop: Promise.resolve(),
       startMode,
     }
@@ -776,12 +866,14 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
       }
     } catch (error) {
       const raw = errorMessage(error)
-      const message = isAuthenticationFailureMessage(raw) ? `${raw} ${LOGIN_HINT}` : raw
+      const stderrSummary = subprocessFailureSummary(session.stderrTail)
+      const detail = stderrSummary && !raw.includes(stderrSummary) ? `. Claude subprocess: ${stderrSummary}` : ""
+      const message = isAuthenticationFailureMessage(raw) ? `${raw} ${LOGIN_HINT}` : `${raw}${detail}`
       // A startup failure means the start mode itself was wrong (resume of a
       // vanished CLI session, or a fresh start rejected as duplicate); flip it
       // so the user's retry takes the other path instead of dead-ending.
       if (!receivedAnyMessage) {
-        const failureText = raw + session.stderrTail.join("")
+        const failureText = raw + session.stderrTail
         if (session.startMode === "resume") {
           this.nativeStartOverride.set(session.sessionId, "fresh")
         } else if (/already in use/iu.test(failureText)) {
@@ -792,7 +884,7 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
       logDiagnostic(
         "claude-code-adapter",
         "query loop failed",
-        { sessionId: session.sessionId, error: raw, stderrTail: session.stderrTail.join("") },
+        { sessionId: session.sessionId, error: raw, stderrTail: session.stderrTail },
         "error",
       )
     } finally {
@@ -827,7 +919,7 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
    * permission-response round trip. The returned promise stays parked until
    * the user replies, the prompt is aborted by the SDK, or the adapter stops.
    */
-  private createCanUseTool(sessionId: string): CanUseTool {
+  private createCanUseTool(sessionId: string, hostServerNames: ReadonlySet<string>): CanUseTool {
     return (toolName, toolInput, opts) => {
       // `Skill` only loads Claude's local Skill instructions. It is a
       // read-only discovery operation, not a shell/file mutation, and should
@@ -837,7 +929,7 @@ export class ClaudeCodeAgentAdapter extends ExternalAgentAdapter {
         return Promise.resolve({ behavior: "allow", updatedInput: toolInput })
       }
       const requestId = opts.requestId ?? opts.toolUseID
-      const wantaHostTool = wantaHostToolName(toolName)
+      const wantaHostTool = wantaHostToolName(toolName, hostServerNames)
       const request: ChatPermissionRequest = {
         id: requestId,
         sessionId,

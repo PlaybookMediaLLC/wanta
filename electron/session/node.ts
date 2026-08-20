@@ -10,6 +10,7 @@ import type {
   GenerateSessionTitleResult,
   SetSessionPermissionModeRequest,
   SetSessionKnowledgeBasesRequest,
+  SetSessionAgentSelectionRequest,
   SessionInfo,
   SessionPlacement,
   SessionProject,
@@ -26,12 +27,13 @@ import type { IConnectionService } from "@oomol/connection"
 import { ConnectionService } from "@oomol/connection"
 import { randomUUID } from "node:crypto"
 import path from "node:path"
-import { isExternalAgentKind } from "../agent/contract/profile.ts"
+import { EXTERNAL_AGENT_KINDS, isExternalAgentKind } from "../agent/contract/profile.ts"
 import {
   externalAgentKindForSessionId,
   isExternalSessionId,
   mintExternalSessionId,
 } from "../agent/external/session-id.ts"
+import { AGENT_PERMISSION_MODES } from "../chat/common.ts"
 import { logDiagnostic } from "../diagnostics-log.ts"
 import { normalizeSessionScopeValue, sessionScopesEqual, SessionService as SessionServiceName } from "./common.ts"
 import { normalizeKnowledgeBaseIds } from "./metadata-store.ts"
@@ -87,7 +89,7 @@ function normalizeBatchSessionIds(ids: string[]): string[] {
 }
 
 function normalizeSessionPermissionMode(mode: SessionPermissionMode): SessionPermissionMode {
-  return mode === "full_access" ? "full_access" : "default"
+  return AGENT_PERMISSION_MODES.includes(mode) ? mode : "default"
 }
 
 function normalizeProjectPath(projectPath: string): string {
@@ -215,7 +217,10 @@ export class SessionServiceImpl
   }
 
   private async createMutation(req: CreateSessionRequest, revision: number): Promise<SessionInfo> {
-    if (req.agentKind && isExternalAgentKind(req.agentKind)) {
+    // Only a REGISTERED external kind mints an external session id; isExternalAgentKind
+    // alone is `!== "opencode"`, so RPC-erased junk (unknown or prototype-chain kinds)
+    // must not reach mintExternalSessionId. Unknown kinds fall through to the kernel.
+    if (req.agentKind && isExternalAgentKind(req.agentKind) && EXTERNAL_AGENT_KINDS.includes(req.agentKind)) {
       return this.createExternalMutation(req, req.agentKind, revision)
     }
     const agent = this.agent
@@ -287,6 +292,7 @@ export class SessionServiceImpl
     const now = Date.now()
     const record: ExternalSessionRecord = {
       id: mintExternalSessionId(agentKind),
+      agentKind,
       title: req.title?.trim() || "New session",
       createdAt: now,
       updatedAt: now,
@@ -400,6 +406,30 @@ export class SessionServiceImpl
     return this.enqueueMutation((revision) => this.setPermissionModeMutation(req, revision))
   }
 
+  public setAgentSelection(req: SetSessionAgentSelectionRequest): Promise<void> {
+    return this.enqueueMutation((revision) => this.setAgentSelectionMutation(req, revision))
+  }
+
+  private async setAgentSelectionMutation(req: SetSessionAgentSelectionRequest, revision: number): Promise<void> {
+    await this.ensureMetadataLoaded(revision)
+    const current = this.sessionMetadata.get(req.id) ?? {}
+    const next = { ...current }
+    if ("modelId" in req) {
+      const modelId = req.modelId?.trim()
+      if (modelId) next.agentModelId = modelId
+      else delete next.agentModelId
+    }
+    if ("effortId" in req) {
+      const effortId = req.effortId?.trim()
+      if (effortId) next.agentEffortId = effortId
+      else delete next.agentEffortId
+    }
+    const nextMetadata = new Map(this.sessionMetadata)
+    this.setMetadataEntry(req.id, next, nextMetadata)
+    await this.commitMetadata(nextMetadata)
+    this.broadcastChangedBestEffort("set session agent selection")
+  }
+
   private async setPermissionModeMutation(req: SetSessionPermissionModeRequest, revision: number): Promise<void> {
     await this.ensureMetadataLoaded(revision)
     const current = this.sessionMetadata.get(req.id) ?? {}
@@ -408,10 +438,10 @@ export class SessionServiceImpl
     if (normalizeSessionPermissionMode(current.permissionMode ?? "default") === permissionMode) {
       return
     }
-    if (permissionMode === "full_access") {
-      next.permissionMode = permissionMode
-    } else {
+    if (permissionMode === "default") {
       delete next.permissionMode
+    } else {
+      next.permissionMode = permissionMode
     }
     const nextMetadata = new Map(this.sessionMetadata)
     this.setMetadataEntry(req.id, next, nextMetadata)
@@ -1049,13 +1079,21 @@ export class SessionServiceImpl
 
   /** External (BYOA) session records rendered as base SessionInfo rows for the merge. */
   private externalSessionInfos(): SessionInfo[] {
-    return [...this.externalSessions.values()].map((record) => ({
-      id: record.id,
-      title: record.title,
-      createdAt: record.createdAt,
-      updatedAt: record.updatedAt,
-      agentKind: externalAgentKindForSessionId(record.id),
-    }))
+    return [...this.externalSessions.values()].flatMap((record) => {
+      const agentKind = externalAgentKindForSessionId(record.id)
+      // Unsupported providers remain persisted for forward/backward
+      // compatibility, but are not misrepresented as OpenCode in today's UI.
+      if (!agentKind) return []
+      return [
+        {
+          id: record.id,
+          title: record.title,
+          createdAt: record.createdAt,
+          updatedAt: record.updatedAt,
+          agentKind,
+        },
+      ]
+    })
   }
 
   private async ensureProjectsLoaded(expectedRevision?: number): Promise<void> {
@@ -1161,6 +1199,8 @@ export class SessionServiceImpl
       metadata.scope ||
       metadata.projectId ||
       metadata.permissionMode ||
+      metadata.agentModelId ||
+      metadata.agentEffortId ||
       metadata.knowledgeBaseIds ||
       metadata.pinnedAt ||
       metadata.archivedAt
@@ -1198,6 +1238,8 @@ export class SessionServiceImpl
       scope,
       ...(project ? { projectId: project.id } : {}),
       ...(metadata?.permissionMode ? { permissionMode: metadata.permissionMode } : {}),
+      ...(metadata?.agentModelId ? { agentModelId: metadata.agentModelId } : {}),
+      ...(metadata?.agentEffortId ? { agentEffortId: metadata.agentEffortId } : {}),
       ...(metadata?.knowledgeBaseIds ? { knowledgeBaseIds: metadata.knowledgeBaseIds } : {}),
       ...(usedAt && usedAt > session.updatedAt ? { updatedAt: usedAt } : {}),
       ...(metadata?.pinnedAt ? { pinnedAt: metadata.pinnedAt } : {}),
@@ -1272,6 +1314,8 @@ export class SessionServiceImpl
           scope,
           ...(project ? { projectId: project.id } : {}),
           ...(metadata?.permissionMode ? { permissionMode: metadata.permissionMode } : {}),
+          ...(metadata?.agentModelId ? { agentModelId: metadata.agentModelId } : {}),
+          ...(metadata?.agentEffortId ? { agentEffortId: metadata.agentEffortId } : {}),
           ...(metadata?.knowledgeBaseIds ? { knowledgeBaseIds: metadata.knowledgeBaseIds } : {}),
           ...(usedAt && usedAt > session.updatedAt ? { updatedAt: usedAt } : {}),
           ...(metadata?.pinnedAt ? { pinnedAt: metadata.pinnedAt } : {}),

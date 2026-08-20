@@ -107,6 +107,7 @@ export const AppShellMainTitlebar = React.memo(function AppShellMainTitlebar({
   titlebarEditable,
   titlebarBreadcrumbs,
   titlebarTitle,
+  windowControlsOnRight,
   workspace,
 }: {
   activeSession: SessionInfo | null
@@ -132,10 +133,16 @@ export const AppShellMainTitlebar = React.memo(function AppShellMainTitlebar({
   titlebarEditable: boolean
   titlebarBreadcrumbs?: TitlebarBreadcrumb[]
   titlebarTitle: string
+  windowControlsOnRight: boolean
   workspace: WorkspaceSelection
 }) {
   return (
-    <header className="oo-titlebar oo-toolbar oo-main-titlebar oo-border-divider flex h-[var(--app-titlebar-height)] min-w-0 items-center overflow-hidden border-b [-webkit-app-region:drag]">
+    <header
+      className={cn(
+        "oo-titlebar oo-toolbar oo-main-titlebar oo-border-divider flex h-[var(--app-titlebar-height)] min-w-0 items-center overflow-hidden border-b [-webkit-app-region:drag]",
+        windowControlsOnRight && "oo-titlebar-window-controls",
+      )}
+    >
       <div className="oo-titlebar-collapsed-controls shrink-0 items-center gap-3">
         <div className="oo-titlebar-control-spacer shrink-0" />
         <SidebarTitlebarActions
@@ -164,15 +171,17 @@ export const AppShellMainTitlebar = React.memo(function AppShellMainTitlebar({
           />
         )}
       </div>
-      <div className="ml-auto flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
+      <div className="oo-main-titlebar-actions ml-auto flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
         <AppUpdateTitlebarEntry update={appUpdate} />
         {onViewBilling ? (
-          <BillingUsagePopover
-            cacheScope={billingCacheScope}
-            sharedConnectorCount={sharedConnectorCount}
-            workspace={workspace}
-            onViewDetails={onViewBilling}
-          />
+          <div className="oo-main-titlebar-billing-entry flex shrink-0">
+            <BillingUsagePopover
+              cacheScope={billingCacheScope}
+              sharedConnectorCount={sharedConnectorCount}
+              workspace={workspace}
+              onViewDetails={onViewBilling}
+            />
+          </div>
         ) : null}
         {showBrowserToggle ? (
           <button
@@ -181,7 +190,7 @@ export const AppShellMainTitlebar = React.memo(function AppShellMainTitlebar({
             aria-label={browserToggleLabel}
             aria-pressed={browserPanelOpen}
             className={cn(
-              "oo-toolbar-button flex size-8 items-center justify-center rounded-md hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground",
+              "oo-main-titlebar-browser-toggle oo-toolbar-button flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground",
               browserPanelOpen && "bg-accent text-foreground",
             )}
             onClick={onBrowserToggle}
@@ -196,7 +205,7 @@ export const AppShellMainTitlebar = React.memo(function AppShellMainTitlebar({
             aria-label={artifactsToggleLabel}
             aria-pressed={artifactsPanelOpen}
             className={cn(
-              "oo-toolbar-button flex size-8 items-center justify-center rounded-md hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground",
+              "oo-main-titlebar-artifacts-toggle oo-toolbar-button flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground",
               artifactsPanelOpen && "bg-accent text-foreground",
             )}
             onClick={onArtifactsToggle}
