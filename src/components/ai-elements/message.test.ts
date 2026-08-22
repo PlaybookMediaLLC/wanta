@@ -18,6 +18,7 @@ import {
 import { MessageStreamdown } from "./message-streamdown.tsx"
 import {
   compactLocalPath,
+  extractLocalImagePreviews,
   markdownCodeLanguage,
   markdownCodeRendererLanguages,
   markdownCodeText,
@@ -223,6 +224,32 @@ describe("normalizeLocalImageMarkdown", () => {
   })
 })
 
+describe("extractLocalImagePreviews", () => {
+  it("does not append a duplicate preview when an encoded Markdown image is repeated as a decoded path", () => {
+    const encodedPath = "/Users/me/Library/Application%20Support/wanta/agent/artifacts/turn/cute-cat.png"
+    const decodedPath = "/Users/me/Library/Application Support/wanta/agent/artifacts/turn/cute-cat.png"
+    const markdown = [`![generated cat](${encodedPath})`, "", "Saved to:", `\`${decodedPath}\``].join("\n")
+
+    expect(extractLocalImagePreviews(markdown)).toEqual([])
+  })
+
+  it("deduplicates equivalent Windows path separators", () => {
+    const markdown = [
+      String.raw`![generated](C:\Users\me\output%20files\image.png)`,
+      "",
+      String.raw`C:/Users/me/output files/image.png`,
+    ].join("\n")
+
+    expect(extractLocalImagePreviews(markdown)).toEqual([])
+  })
+
+  it("still appends a preview for a standalone local image path", () => {
+    expect(extractLocalImagePreviews("Saved to `/Users/me/output/image.png`")).toEqual([
+      { path: "/Users/me/output/image.png", alt: "image.png" },
+    ])
+  })
+})
+
 describe("compactLocalPath", () => {
   it("keeps short paths readable", () => {
     expect(compactLocalPath("/tmp/image.png")).toBe("/tmp/image.png")
@@ -277,6 +304,27 @@ describe("MarkdownImage", () => {
 
   it("accepts case-insensitive file URL schemes", () => {
     expect(localImagePathFromSrc("FILE:///Users/me/output%20files/image.png")).toBe("/Users/me/output files/image.png")
+  })
+
+  it("decodes renderer-safe local image markers", () => {
+    expect(
+      localImagePathFromSrc("https://wanta.local/__local-image__/C%3A%5CUsers%5Cme%5Coutput%20files%5Cimage.png"),
+    ).toBe(String.raw`C:\Users\me\output files\image.png`)
+  })
+
+  it("normalizes file URLs decoded from local image markers", () => {
+    expect(
+      localImagePathFromSrc(
+        "https://wanta.local/__local-image__/file%3A%2F%2F%2FC%3A%2FUsers%2Fme%2Foutput%2520files%2Fimage.png",
+      ),
+    ).toBe("C:/Users/me/output files/image.png")
+  })
+
+  it("removes a mistaken leading slash from Windows drive paths", () => {
+    expect(localImagePathFromSrc("/C:/Users/me/output%20files/image.png")).toBe("C:/Users/me/output files/image.png")
+    expect(
+      localImagePathFromSrc("https://wanta.local/__local-image__/%2FC%3A%2FUsers%2Fme%2Foutput%2520files%2Fimage.png"),
+    ).toBe("C:/Users/me/output files/image.png")
   })
 
   it("does not treat home-relative image paths as absolute local paths", () => {

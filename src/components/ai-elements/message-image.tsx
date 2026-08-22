@@ -15,6 +15,7 @@ import {
   EllipsisIcon,
   ExternalLinkIcon,
   FolderOpenIcon,
+  ImageOffIcon,
   MinusIcon,
   PlusIcon,
   SaveIcon,
@@ -24,6 +25,7 @@ import { ContextMenu as ContextMenuPrimitive } from "radix-ui"
 import { useEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { toast } from "sonner"
+import { localImagePreviewMarkerPrefix } from "../../../electron/chat/markdown-images.ts"
 import { useChatService } from "@/components/AppContext"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { useT } from "@/i18n/i18n"
@@ -35,13 +37,6 @@ type MarkdownImageProps = ComponentProps<"img"> & {
   node?: unknown
 }
 
-interface LocalImagePreviewCacheEntry {
-  expiresAt?: number
-  url: string
-}
-
-const localImagePreviewUrlByPath = new Map<string, LocalImagePreviewCacheEntry>()
-const localImagePreviewRefreshMarginMs = 60_000
 export const localImagePreviewRetryDelaysMs = [250, 750, 1_500, 3_000] as const
 const imageViewerMinScale = 0.1
 const imageViewerMaxScale = 4
@@ -126,8 +121,19 @@ function decodeLocalImagePath(value: string): string {
     .join("")
 }
 
+function normalizeWindowsDrivePath(value: string): string {
+  return /^\/[A-Za-z]:[\\/]/.test(value) ? value.slice(1) : value
+}
+
 export function localImagePathFromSrc(src: string | undefined): string | null {
   const value = src?.trim()
+  if (value?.startsWith(localImagePreviewMarkerPrefix)) {
+    try {
+      return localImagePathFromSrc(decodeURIComponent(value.slice(localImagePreviewMarkerPrefix.length)))
+    } catch {
+      return null
+    }
+  }
   if (!value || /^(?:https?:|data:|blob:|wanta:|wanta-local:)/i.test(value)) {
     return null
   }
@@ -135,13 +141,13 @@ export function localImagePathFromSrc(src: string | undefined): string | null {
     try {
       const url = new URL(value)
       const decoded = decodeURIComponent(url.pathname)
-      return /^\/[A-Za-z]:[\\/]/.test(decoded) ? decoded.slice(1) : decoded
+      return normalizeWindowsDrivePath(decoded)
     } catch {
       return null
     }
   }
   if (/^(?:[\\/]|[A-Za-z]:[\\/])/.test(value)) {
-    return decodeLocalImagePath(value)
+    return normalizeWindowsDrivePath(decodeLocalImagePath(value))
   }
   return null
 }
@@ -234,21 +240,28 @@ function viewerPercent(scale: number): string {
   return `${Math.round(scale * 100)}%`
 }
 
+function UnavailableImagePreview({ name }: { name: string }) {
+  const t = useT()
+  return (
+    <div
+      className="oo-markdown-image-unavailable"
+      role="status"
+      aria-label={t("chat.imagePreview.unavailable", { name })}
+    >
+      <ImageOffIcon aria-hidden="true" />
+      <span>{t("chat.imagePreview.unavailable", { name })}</span>
+    </div>
+  )
+}
+
 export function MarkdownImage({ src, alt, className, node: _, ...props }: MarkdownImageProps) {
   const t = useT()
   const chatService = useChatService()
   const localPath = typeof src === "string" ? localImagePathFromSrc(src) : null
   const originalSrc = typeof src === "string" ? src : undefined
-  const [previewUrl, setPreviewUrl] = useState<string | null>(() => {
-    if (!localPath) {
-      return null
-    }
-    const cached = localImagePreviewUrlByPath.get(localPath)
-    return cached && (!cached.expiresAt || cached.expiresAt > Date.now() + localImagePreviewRefreshMarginMs)
-      ? cached.url
-      : null
-  })
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewRetry, setPreviewRetry] = useState(0)
+  const [failedExternalSrc, setFailedExternalSrc] = useState<string | null>(null)
   const [isViewerOpen, setIsViewerOpen] = useState(false)
   const [stageSize, setStageSize] = useState<ImageViewerSize | null>(null)
   const [imageSize, setImageSize] = useState<ImageViewerSize | null>(null)
@@ -262,16 +275,14 @@ export function MarkdownImage({ src, alt, className, node: _, ...props }: Markdo
   }, [localPath])
 
   useEffect(() => {
+    setFailedExternalSrc(null)
+  }, [originalSrc])
+
+  useEffect(() => {
     if (!localPath) {
       setPreviewUrl(null)
       return
     }
-    const cached = localImagePreviewUrlByPath.get(localPath)
-    if (cached && (!cached.expiresAt || cached.expiresAt > Date.now() + localImagePreviewRefreshMarginMs)) {
-      setPreviewUrl(cached.url)
-      return
-    }
-    localImagePreviewUrlByPath.delete(localPath)
     setPreviewUrl(null)
     let cancelled = false
     let retryTimer: number | null = null
@@ -294,19 +305,15 @@ export function MarkdownImage({ src, alt, className, node: _, ...props }: Markdo
         }
         const nextUrl = attachmentPreviewSource(result)
         if (!nextUrl) {
-          localImagePreviewUrlByPath.delete(localPath)
           setPreviewUrl(null)
           scheduleRetry()
           return
         }
-        localImagePreviewUrlByPath.set(localPath, { expiresAt: result.resourceExpiresAt, url: nextUrl })
         setPreviewUrl(nextUrl)
       })
       .catch(() => {
         if (!cancelled) {
-          localImagePreviewUrlByPath.delete(localPath)
           setPreviewUrl(null)
-          scheduleRetry()
         }
       })
     return () => {
@@ -324,14 +331,24 @@ export function MarkdownImage({ src, alt, className, node: _, ...props }: Markdo
   const visibleSrc = localPath ? previewUrl : originalSrc
   const downloadName = imageFileName(localPath ?? originalSrc)
   const previewTitle = alt || downloadName
+  const externalPreviewFailed = Boolean(!localPath && originalSrc && failedExternalSrc === originalSrc)
   const handlePreviewError: MarkdownImageProps["onError"] = (event) => {
     props.onError?.(event)
-    if (!localPath || localImagePreviewRetryDelay(previewRetry) === null) {
+    if (!localPath) {
+      if (originalSrc) {
+        setFailedExternalSrc(originalSrc)
+      }
       return
     }
-    localImagePreviewUrlByPath.delete(localPath)
+    if (localImagePreviewRetryDelay(previewRetry) === null) {
+      return
+    }
     setPreviewUrl(null)
     setPreviewRetry((value) => value + 1)
+  }
+
+  if (externalPreviewFailed) {
+    return <UnavailableImagePreview name={previewTitle} />
   }
 
   if (!visibleSrc) {
@@ -368,6 +385,7 @@ export function MarkdownImage({ src, alt, className, node: _, ...props }: Markdo
               imageSize={imageSize}
               localPath={localPath}
               onClose={() => setIsViewerOpen(false)}
+              onError={handlePreviewError}
               setImageSize={setImageSize}
               setStageSize={setStageSize}
               setViewerState={setViewerState}
@@ -392,6 +410,7 @@ interface ImageViewerProps {
   imageSize: ImageViewerSize | null
   localPath?: string | null
   onClose: () => void
+  onError?: MarkdownImageProps["onError"]
   setImageSize: Dispatch<SetStateAction<ImageViewerSize | null>>
   setStageSize: Dispatch<SetStateAction<ImageViewerSize | null>>
   setViewerState: Dispatch<SetStateAction<ImageViewerState>>
@@ -399,6 +418,7 @@ interface ImageViewerProps {
   stageRef: RefObject<HTMLDivElement | null>
   stageSize: ImageViewerSize | null
   title: string
+  unavailableName?: string
   viewerState: ImageViewerState
   viewerStateRef: MutableRefObject<ImageViewerState>
 }
@@ -566,16 +586,19 @@ function ImageActionLabel({ messageKey }: { messageKey: Parameters<ReturnType<ty
 export function ImageViewerModal({
   alt,
   onClose,
+  onError,
   localPath,
   src,
   title,
 }: {
   alt: string
   onClose: () => void
+  onError?: MarkdownImageProps["onError"]
   localPath?: string | null
   src: string
   title: string
 }) {
+  const [unavailable, setUnavailable] = useState(false)
   const [stageSize, setStageSize] = useState<ImageViewerSize | null>(null)
   const [imageSize, setImageSize] = useState<ImageViewerSize | null>(null)
   const [viewerState, setViewerState] = useState<ImageViewerState>({ offset: { x: 0, y: 0 }, scale: 1 })
@@ -587,12 +610,22 @@ export function ImageViewerModal({
     viewerStateRef.current = viewerState
   }, [viewerState])
 
+  useEffect(() => {
+    setUnavailable(false)
+  }, [src])
+
+  const handleError: NonNullable<MarkdownImageProps["onError"]> = (event) => {
+    onError?.(event)
+    setUnavailable(true)
+  }
+
   return createPortal(
     <ImageViewer
       alt={alt}
       imageSize={imageSize}
       localPath={localPath}
       onClose={onClose}
+      onError={handleError}
       setImageSize={setImageSize}
       setStageSize={setStageSize}
       setViewerState={setViewerState}
@@ -600,6 +633,7 @@ export function ImageViewerModal({
       stageRef={stageRef}
       stageSize={stageSize}
       title={title}
+      unavailableName={unavailable ? title : undefined}
       viewerState={viewerState}
       viewerStateRef={viewerStateRef}
       dragRef={dragRef}
@@ -614,6 +648,7 @@ function ImageViewer({
   imageSize,
   localPath,
   onClose,
+  onError,
   setImageSize,
   setStageSize,
   setViewerState,
@@ -621,6 +656,7 @@ function ImageViewer({
   stageRef,
   stageSize,
   title,
+  unavailableName,
   viewerState,
   viewerStateRef,
 }: ImageViewerProps) {
@@ -776,7 +812,12 @@ function ImageViewer({
           onLostPointerCapture={clearDrag}
           onWheel={handleWheel}
         >
-          <div className="oo-markdown-image-viewer-center">
+          {unavailableName ? (
+            <div className="oo-markdown-image-viewer-center">
+              <UnavailableImagePreview name={unavailableName} />
+            </div>
+          ) : null}
+          <div className={cn("oo-markdown-image-viewer-center", unavailableName && "hidden")}>
             <div
               className="oo-markdown-image-viewer-offset"
               style={{ transform: `translate(${viewerState.offset.x}px, ${viewerState.offset.y}px)` }}
@@ -787,6 +828,7 @@ function ImageViewer({
                 className="oo-markdown-image-viewer-image"
                 draggable={false}
                 decoding="async"
+                onError={onError}
                 onLoad={(event) => {
                   setImageSize({
                     height: event.currentTarget.naturalHeight,
@@ -804,27 +846,29 @@ function ImageViewer({
         </div>
       </ImageContextActions>
 
-      <div className="oo-markdown-image-viewer-zoom" aria-label={viewerPercent(viewerState.scale)}>
-        <button
-          type="button"
-          className="oo-markdown-image-viewer-zoom-button"
-          aria-label={t("chat.imagePreview.zoomOut")}
-          disabled={!canZoomOut}
-          onClick={() => zoomBy(-imageViewerScaleStep)}
-        >
-          <MinusIcon className="size-4" />
-        </button>
-        <span className="oo-markdown-image-viewer-percent">{viewerPercent(viewerState.scale)}</span>
-        <button
-          type="button"
-          className="oo-markdown-image-viewer-zoom-button"
-          aria-label={t("chat.imagePreview.zoomIn")}
-          disabled={!canZoomIn}
-          onClick={() => zoomBy(imageViewerScaleStep)}
-        >
-          <PlusIcon className="size-4" />
-        </button>
-      </div>
+      {!unavailableName ? (
+        <div className="oo-markdown-image-viewer-zoom" aria-label={viewerPercent(viewerState.scale)}>
+          <button
+            type="button"
+            className="oo-markdown-image-viewer-zoom-button"
+            aria-label={t("chat.imagePreview.zoomOut")}
+            disabled={!canZoomOut}
+            onClick={() => zoomBy(-imageViewerScaleStep)}
+          >
+            <MinusIcon className="size-4" />
+          </button>
+          <span className="oo-markdown-image-viewer-percent">{viewerPercent(viewerState.scale)}</span>
+          <button
+            type="button"
+            className="oo-markdown-image-viewer-zoom-button"
+            aria-label={t("chat.imagePreview.zoomIn")}
+            disabled={!canZoomIn}
+            onClick={() => zoomBy(imageViewerScaleStep)}
+          >
+            <PlusIcon className="size-4" />
+          </button>
+        </div>
+      ) : null}
     </div>
   )
 }
