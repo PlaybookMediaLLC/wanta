@@ -7,18 +7,7 @@ import type { SidebarSessionGroups } from "./sidebar-sessions.ts"
 import type { UseTeamWorkspace } from "@/hooks/useTeamWorkspace"
 import type { UserFacingError } from "@/lib/user-facing-error"
 
-import {
-  Archive,
-  Building2,
-  Check,
-  Ellipsis,
-  FolderPlus,
-  LibraryBig,
-  ListChecks,
-  Package,
-  Plug,
-  SquarePen,
-} from "lucide-react"
+import { BookOpen, Archive, Ellipsis, FolderPlus, ListChecks, Package, Plug, SquarePen, Workflow } from "lucide-react"
 import * as React from "react"
 import { APP_COMMANDS } from "../../../electron/app-command.ts"
 import { SIDEBAR_MAX_WIDTH_PX, SIDEBAR_MIN_WIDTH_PX } from "./app-shell-model.ts"
@@ -39,6 +28,8 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -95,7 +86,6 @@ export const AppShellNavigationSidebar = React.memo(function AppShellNavigationS
   restoring,
   selectedSessionId,
   sessionsError,
-  showKnowledge,
   sidebarSegment,
   sidebarSessionGroups,
   taskSessions,
@@ -150,7 +140,6 @@ export const AppShellNavigationSidebar = React.memo(function AppShellNavigationS
   restoring: boolean
   selectedSessionId: string | null
   sessionsError: UserFacingError | null
-  showKnowledge: boolean
   sidebarSegment: SidebarSegment
   sidebarSessionGroups: SidebarSessionGroups
   taskSessions: SessionInfo[]
@@ -241,18 +230,24 @@ export const AppShellNavigationSidebar = React.memo(function AppShellNavigationS
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuLabel>{t("tasks.sortLabel")}</DropdownMenuLabel>
-            {(
-              [
-                ["updatedAt", t("tasks.sortUpdated")],
-                ["createdAt", t("tasks.sortCreated")],
-                ["title", t("tasks.sortTitle")],
-              ] satisfies Array<[SidebarTaskSortMode, string]>
-            ).map(([value, label]) => (
-              <DropdownMenuItem key={value} onSelect={() => onSetTaskSortMode(value)}>
-                <span>{label}</span>
-                {taskSortMode === value ? <Check className="ml-auto size-4" /> : null}
-              </DropdownMenuItem>
-            ))}
+            <DropdownMenuRadioGroup
+              value={taskSortMode}
+              onValueChange={(value) => {
+                if (value === "updatedAt" || value === "createdAt" || value === "title") onSetTaskSortMode(value)
+              }}
+            >
+              {(
+                [
+                  ["updatedAt", t("tasks.sortUpdated")],
+                  ["createdAt", t("tasks.sortCreated")],
+                  ["title", t("tasks.sortTitle")],
+                ] satisfies Array<[SidebarTaskSortMode, string]>
+              ).map(([value, label]) => (
+                <DropdownMenuRadioItem key={value} value={value}>
+                  {label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>
         <button
@@ -322,31 +317,31 @@ export const AppShellNavigationSidebar = React.memo(function AppShellNavigationS
             <Package className="size-4 shrink-0" />
             <span className="oo-sidebar-nav-label truncate">{t("skills.title")}</span>
           </button>
-          {showKnowledge ? (
-            <button
-              type="button"
-              onClick={() => onNavigate("knowledge")}
-              className={cn(
-                "oo-sidebar-nav-item oo-text-body flex h-[var(--sidebar-item-height)] items-center gap-2 rounded-md px-2",
-                activeRoute === "knowledge" && "bg-sidebar-accent text-sidebar-accent-foreground",
-              )}
-            >
-              <LibraryBig className="size-4 shrink-0" />
-              <span className="oo-sidebar-nav-label truncate">{t("knowledge.title")}</span>
-            </button>
-          ) : null}
           {cloudEnabled ? (
-            <button
-              type="button"
-              onClick={() => onNavigate("teams")}
-              className={cn(
-                "oo-sidebar-nav-item oo-text-body flex h-[var(--sidebar-item-height)] items-center gap-2 rounded-md px-2",
-                activeRoute === "teams" && "bg-sidebar-accent text-sidebar-accent-foreground",
-              )}
-            >
-              <Building2 className="size-4 shrink-0" />
-              <span className="oo-sidebar-nav-label truncate">{t("teams.title")}</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => onNavigate("knowledge")}
+                className={cn(
+                  "oo-sidebar-nav-item oo-text-body flex h-[var(--sidebar-item-height)] items-center gap-2 rounded-md px-2",
+                  activeRoute === "knowledge" && "bg-sidebar-accent text-sidebar-accent-foreground",
+                )}
+              >
+                <BookOpen className="size-4 shrink-0" />
+                <span className="oo-sidebar-nav-label truncate">{t("knowledge.title")}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigate("flows")}
+                className={cn(
+                  "oo-sidebar-nav-item oo-text-body flex h-[var(--sidebar-item-height)] items-center gap-2 rounded-md px-2",
+                  activeRoute === "flows" && "bg-sidebar-accent text-sidebar-accent-foreground",
+                )}
+              >
+                <Workflow className="size-4 shrink-0" />
+                <span className="oo-sidebar-nav-label truncate">{t("flows.title")}</span>
+              </button>
+            </>
           ) : null}
         </nav>
 

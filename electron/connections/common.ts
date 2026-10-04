@@ -1,5 +1,6 @@
-export type ConnectionAppsStatus = "ready" | "forbidden" | "unavailable"
-export type ConnectionAuthType = "oauth2" | "api_key" | "custom_credential" | "federated" | "no_auth" | null
+export type ConnectionAppsStatus = "loading" | "ready" | "forbidden" | "unavailable"
+export type ConnectionCredentialAuthType = "oauth2" | "api_key" | "custom_credential" | "federated" | "no_auth"
+export type ConnectionAppAuthType = ConnectionCredentialAuthType | "marketplace"
 export type ConnectionAppStatus = "active" | "reauth_required" | "error" | "disconnected"
 export type ConnectionProviderStatus = "available" | "connected" | "needs_attention"
 export interface ConnectionWorkspace {
@@ -18,16 +19,23 @@ export type ConnectionProviderActionKind =
 export interface ConnectionAppSummary {
   accountLabel?: string
   alias?: string
-  authType: ConnectionAuthType
+  authType: ConnectionAppAuthType | null
   connectionName?: string
   createdAt: number
   displayName?: string
   id: string
   isDefault: boolean
+  marketplace?: ConnectionMarketplaceSummary
   providerAccountId?: string
+  scopes?: string[]
   service: string
   status: ConnectionAppStatus
   updatedAt: number
+}
+
+export interface ConnectionMarketplaceSummary {
+  id: string
+  pricing: "free" | "metered"
 }
 
 export interface ConnectionCredentialFieldSummary {
@@ -37,7 +45,7 @@ export interface ConnectionCredentialFieldSummary {
 }
 
 export interface ConnectionCredentialSummary {
-  authType: Extract<ConnectionAuthType, "api_key" | "custom_credential">
+  authType: Extract<ConnectionCredentialAuthType, "api_key" | "custom_credential">
   fields: Record<string, ConnectionCredentialFieldSummary>
 }
 
@@ -54,18 +62,36 @@ export interface ConnectionAppDetail extends ConnectionAppSummary {
   credentialSummary?: ConnectionCredentialSummary
 }
 
-export interface ConnectionProviderSummary {
+export interface ConnectionProviderIconSprite {
+  version: string
+  pixelRatio: number
+  iconSize: number
+  bleed: number
+  width: number
+  height: number
+  lightUrl: string
+  darkUrl: string
+}
+
+export interface ConnectionProviderIcon {
+  iconSprite?: ConnectionProviderIconSprite
+  iconSpritePosition?: { x: number; y: number }
+}
+
+export interface ConnectionProviderSummary extends ConnectionProviderIcon {
   accountLabel?: string
   appId?: string
   appStatus?: ConnectionAppStatus
-  appAuthType?: ConnectionAuthType
+  appAuthType?: ConnectionAppAuthType | null
   appCount: number
   apps: ConnectionAppSummary[]
-  authTypes: Exclude<ConnectionAuthType, null>[]
+  authTypes: ConnectionCredentialAuthType[]
   actionKind: ConnectionProviderActionKind
   canDisconnect: boolean
   /** Local Direct providers opt into reconnect only when their runtime can replace an existing identity. */
   canReconnect?: boolean
+  /** Stable Connector category ids used for cross-locale catalog grouping. */
+  categoryIds?: string[]
   categoryLabels: string[]
   /** Renderer-owned copy for a local Direct provider's provider-specific primary action. */
   connectActionLabel?: string
@@ -77,6 +103,8 @@ export interface ConnectionProviderSummary {
   executionMode?: "direct" | "remote"
   iconUrl?: string
   oauthClientConfig?: ConnectionProviderOAuthClientConfigSummary | null
+  /** Localized and legacy names supplied by Connector for catalog search. */
+  searchAliases?: string[]
   service: string
   status: ConnectionProviderStatus
   runtimeVersion?: string
@@ -110,6 +138,18 @@ export interface ConnectionActionCatalogItem {
   providerPermissions: string[]
   requiredScopes: string[]
   service: string
+}
+
+export interface ConnectionLingxingErpUser {
+  displayName: string | null
+  email: string | null
+  id: string
+  isMaster: boolean | null
+  mobile: string | null
+  roles: string[]
+  sellerPermissions: string[]
+  status: "active" | "disabled" | "unknown"
+  username: string | null
 }
 
 export interface ConnectionExecutionLogRequest {
@@ -147,6 +187,7 @@ export interface ConnectionOAuthClientConfigFieldDefinition {
 }
 
 export interface ConnectionProviderOAuthClientConfigSummary {
+  authorizationOptions?: ConnectionOAuthAuthorizationOption[]
   clientConfigFields: ConnectionOAuthClientConfigFieldDefinition[]
   clientConfigPolicy: ConnectionOAuthClientConfigPolicy
   configured: boolean
@@ -154,6 +195,16 @@ export interface ConnectionProviderOAuthClientConfigSummary {
   oauthScopes: string[]
   service: string
   tokenEndpointAuthMethod: ConnectionOAuthTokenEndpointAuthMethod
+}
+
+export interface ConnectionOAuthAuthorizationOption {
+  defaultSelected: boolean
+  description: string
+  id: string
+  label: string
+  required: boolean
+  requires: string[]
+  risk: "destructive" | "sensitive" | "standard"
 }
 
 export interface ConnectionUserOAuthClientConfigSummary {
@@ -213,7 +264,7 @@ export interface ConnectionSummary {
   apps: ConnectionAppSummary[]
   /** 团队连接状态与 Provider 公共目录分开读取；失败时目录仍可只读浏览。 */
   appsStatus?: ConnectionAppsStatus
-  /** 用户实际配置或授权过的 Provider 种类数，不包含无需账号即可使用的免配置 Provider。 */
+  /** 当前拥有可选择连接的 Provider 种类数；包含 Marketplace，不包含 connectionless no-auth Provider。 */
   connectedProviderCount: number
   providerCount: number
   providers: ConnectionProviderSummary[]
@@ -229,7 +280,7 @@ export type ConnectionConnectInput =
   | {
       appId?: string
       authType: "oauth2"
-      authorizationScopes?: string[]
+      authorizationOptionIds?: string[]
       extra?: Record<string, unknown>
       secretExtra?: Record<string, string>
       service: string

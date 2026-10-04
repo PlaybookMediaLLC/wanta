@@ -1,18 +1,11 @@
 import type { AcpTransport } from "../acp/adapter.ts"
-import type { AcpAgentKind } from "../acp/registry.ts"
+import type { AcpAgentKind, AcpAgentRegistration } from "../acp/registry.ts"
 import type { ExternalAgentRuntimeStatus } from "../external/probe.ts"
 import type { AgentManager } from "../manager.ts"
 import type { AgentEvent } from "./event.ts"
 import type { AgentInput, AgentSendOptions, CancelAgentInput, PromptAgentInput } from "./input.ts"
 import type { AgentKind, AgentProfile } from "./profile.ts"
 import type { AnyMessage, RequestPermissionResponse, SessionUpdate, Stream } from "@agentclientprotocol/sdk"
-import type {
-  Options as ClaudeOptions,
-  Query as ClaudeQuery,
-  SDKMessage,
-  SDKUserMessage,
-  query as claudeQuery,
-} from "@anthropic-ai/claude-agent-sdk"
 
 import { agent as acpAgent, PROTOCOL_VERSION } from "@agentclientprotocol/sdk"
 import { mkdtemp, rm } from "node:fs/promises"
@@ -21,13 +14,12 @@ import path from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { AcpAgentAdapter } from "../acp/adapter.ts"
 import { ACP_AGENT_KINDS, ACP_AGENT_REGISTRY } from "../acp/registry.ts"
-import { ClaudeCodeAgentAdapter } from "../claude/adapter.ts"
 import { mintExternalSessionId } from "../external/session-id.ts"
 import { OpencodeAgentAdapter } from "../opencode-adapter.ts"
 import { BaseAgentAdapter } from "./adapter.ts"
 import { agentEventIssues } from "./event.ts"
 import { agentInputIssues } from "./input.ts"
-import { AGENT_PROFILES } from "./profile.ts"
+import { AGENT_PROFILES, agentLoginHint, EXTERNAL_AGENT_KINDS } from "./profile.ts"
 
 // Cross-adapter contract tests: every adapter must satisfy the same lifecycle
 // invariants (event delivery, capability honesty, teardown sweep). New adapters
@@ -180,197 +172,16 @@ function createOpencodeHarness(): Promise<AdapterContractHarness> {
   return Promise.resolve(harness)
 }
 
-// ── Claude Code fixture: fake SDK query fed by a push stream ──
-
-interface FakeClaudeQuery {
-  push: (message: SDKMessage) => void
-  promptMessages: SDKUserMessage[]
-  options: ClaudeOptions
-  interrupt: ReturnType<typeof vi.fn>
-  close: ReturnType<typeof vi.fn>
-}
-
-async function createClaudeHarness(): Promise<AdapterContractHarness> {
-  const scratchRootDir = await mkdtemp(path.join(os.tmpdir(), "wanta-contract-claude-"))
-  const queries: FakeClaudeQuery[] = []
-  const queryFn = ((params: { prompt: string | AsyncIterable<SDKUserMessage>; options?: ClaudeOptions }) => {
-    const buffered: SDKMessage[] = []
-    const waiters: Array<(result: IteratorResult<SDKMessage>) => void> = []
-    let ended = false
-    const promptMessages: SDKUserMessage[] = []
-    if (typeof params.prompt !== "string") {
-      const stream = params.prompt
-      void (async () => {
-        for await (const message of stream) {
-          promptMessages.push(message)
-        }
-      })()
-    }
-    const fake: FakeClaudeQuery = {
-      push: (message) => {
-        const waiter = waiters.shift()
-        if (waiter) {
-          waiter({ value: message, done: false })
-          return
-        }
-        buffered.push(message)
-      },
-      promptMessages,
-      options: params.options ?? {},
-      interrupt: vi.fn(() => Promise.resolve(undefined)),
-      close: vi.fn(() => {
-        ended = true
-        for (const waiter of waiters.splice(0)) {
-          waiter({ value: undefined, done: true })
-        }
-      }),
-    }
-    queries.push(fake)
-    const next = (): Promise<IteratorResult<SDKMessage>> => {
-      if (buffered.length > 0) {
-        return Promise.resolve({ value: buffered.shift() as SDKMessage, done: false })
-      }
-      if (ended) {
-        return Promise.resolve({ value: undefined, done: true })
-      }
-      return new Promise((resolve) => {
-        waiters.push(resolve)
-      })
-    }
-    return {
-      [Symbol.asyncIterator]: () => ({ next }),
-      interrupt: fake.interrupt,
-      setPermissionMode: vi.fn(() => Promise.resolve()),
-      close: fake.close,
-    } as unknown as ClaudeQuery
-  }) as unknown as typeof claudeQuery
-  const status: ExternalAgentRuntimeStatus = {
-    kind: "claude-code",
-    displayName: "Claude Code",
-    binary: { status: "detected", path: "/fake/claude", version: "2.1.226" },
-    login: { status: "logged_in" },
-    loginHint: "Run `claude` in a terminal and sign in, then retry.",
-  }
-  const adapter = new ClaudeCodeAgentAdapter({
-    probe: () => Promise.resolve(status),
-    scratchRootDir,
-    commandPath: () => Promise.resolve("/fake/bin"),
-    queryFn,
-  })
-  const sessionId = mintExternalSessionId("claude-code")
-  let permissionSeq = 0
-  let permissionSettled = 0
-  let assistantSeq = 0
-  const ensureTurn = async (): Promise<FakeClaudeQuery> => {
-    if (queries.length === 0) {
-      await adapter.send({ type: "prompt", sessionId, text: "start turn" })
-    }
-    const fake = queries[0]
-    if (!fake) {
-      throw new Error("fake query missing")
-    }
-    return fake
-  }
-  return {
-    adapter,
-    sessionId,
-    emitAssistantText: async (text) => {
-      // Real SDK wire shape (0.3.226): stream partials first, then one complete
-      // assistant message PER content block, all sharing the API message id.
-      const fake = await ensureTurn()
-      assistantSeq += 1
-      const messageId = `api-msg-${assistantSeq}`
-      const push = (message: unknown): void => {
-        fake.push(message as SDKMessage)
-      }
-      const stream = (event: unknown): unknown => ({
-        type: "stream_event",
-        event,
-        parent_tool_use_id: null,
-        uuid: `stream-uuid-${assistantSeq}`,
-        session_id: "sdk-session",
-      })
-      const complete = (content: unknown[]): unknown => ({
-        type: "assistant",
-        message: { id: messageId, content },
-        parent_tool_use_id: null,
-        uuid: `assistant-uuid-${assistantSeq}`,
-        session_id: "sdk-session",
-      })
-      push(stream({ type: "message_start", message: { id: messageId } }))
-      push(
-        stream({
-          type: "content_block_start",
-          index: 0,
-          content_block: { type: "thinking", thinking: "", signature: "" },
-        }),
-      )
-      push(
-        stream({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "considering" } }),
-      )
-      push(complete([{ type: "thinking", thinking: "considering", signature: "" }]))
-      push(stream({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }))
-      push(stream({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text } }))
-      push(complete([{ type: "text", text }]))
-    },
-    emitPermissionAsked: async () => {
-      const fake = await ensureTurn()
-      permissionSeq += 1
-      const decision = fake.options.canUseTool?.("Bash", { command: "ls" }, {
-        signal: new AbortController().signal,
-        toolUseID: `tool-use-${permissionSeq}`,
-        requestId: `claude-perm-${permissionSeq}`,
-        suggestions: [],
-      } as never)
-      void decision?.then(() => {
-        permissionSettled += 1
-      })
-    },
-    settlePermission: async (requestId) => {
-      await adapter.send({ type: "permission-response", sessionId, requestId, reply: "once" })
-    },
-    emitToolCallStarted: async () => {
-      const fake = await ensureTurn()
-      fake.push({
-        type: "assistant",
-        message: { id: "api-msg-2", content: [{ type: "tool_use", id: "claude-call-1", name: "Bash", input: {} }] },
-        parent_tool_use_id: null,
-        uuid: "assistant-uuid-2",
-        session_id: "sdk-session",
-      } as unknown as SDKMessage)
-      return { partId: "claude-call-1", callId: "claude-call-1" }
-    },
-    transcriptTexts: async () => {
-      const messages = await adapter.getMessages(sessionId)
-      return messages.flatMap((message) =>
-        message.parts.filter((part) => part.kind === "text").map((part) => part.text ?? ""),
-      )
-    },
-    effects: {
-      attachmentObserved: () =>
-        queries.some((fake) =>
-          fake.promptMessages.some((message) => JSON.stringify(message).includes("/tmp/input.txt")),
-        ),
-      modeObserved: () => false,
-      promptCount: () => queries.reduce((total, fake) => total + fake.promptMessages.length, 0),
-      cancelCount: () => queries.reduce((total, fake) => total + fake.interrupt.mock.calls.length, 0),
-      permissionSettledCount: () => permissionSettled,
-      stopped: () => queries.length > 0 && queries.every((fake) => fake.close.mock.calls.length > 0),
-    },
-    cleanup: async () => {
-      await rm(scratchRootDir, { recursive: true, force: true }).catch(() => undefined)
-    },
-  }
-}
-
 // ── ACP fixture: in-process fake agent over cross-wired streams ──
 
 async function createAcpHarness(kind: AcpAgentKind): Promise<AdapterContractHarness> {
+  const registration: AcpAgentRegistration = ACP_AGENT_REGISTRY[kind]
   const scratchRootDir = await mkdtemp(path.join(os.tmpdir(), "wanta-contract-acp-"))
   let promptCount = 0
   let cancelCount = 0
   let disposed = false
   let attachmentObserved = false
+  let modeObserved = false
   const permissionResponses: RequestPermissionResponse[] = []
   let bridge:
     | {
@@ -382,8 +193,31 @@ async function createAcpHarness(kind: AcpAgentKind): Promise<AdapterContractHarn
   const cancelResolvers: Array<() => void> = []
   const app = acpAgent({ name: "contract-fake-acp" })
     .onRequest("initialize", () => ({ protocolVersion: PROTOCOL_VERSION }))
-    .onRequest("session/new", () => ({ sessionId: "acp-session-1" }))
+    .onRequest("session/new", () => ({
+      sessionId: "acp-session-1",
+      ...(registration.workModeMap
+        ? {
+            configOptions: [
+              {
+                id: "collaboration_mode",
+                name: "Collaboration mode",
+                category: "collaboration_mode",
+                type: "select" as const,
+                currentValue: "default",
+                options: [
+                  { value: "default", name: "Default" },
+                  { value: "plan", name: "Plan" },
+                ],
+              },
+            ],
+          }
+        : {}),
+    }))
     .onRequest("session/set_mode", () => ({}))
+    .onRequest("session/set_config_option", ({ params }) => {
+      modeObserved ||= params.configId === "collaboration_mode" && params.value === "plan"
+      return { configOptions: [] }
+    })
     .onRequest("session/prompt", ({ params, client }) => {
       promptCount += 1
       attachmentObserved ||= JSON.stringify(params.prompt).includes("input.txt")
@@ -436,7 +270,7 @@ async function createAcpHarness(kind: AcpAgentKind): Promise<AdapterContractHarn
   }
   const adapter = new AcpAgentAdapter({
     kind,
-    registration: ACP_AGENT_REGISTRY[kind],
+    registration,
     probe: () =>
       Promise.resolve({
         kind,
@@ -499,7 +333,7 @@ async function createAcpHarness(kind: AcpAgentKind): Promise<AdapterContractHarn
     },
     effects: {
       attachmentObserved: () => attachmentObserved,
-      modeObserved: () => false,
+      modeObserved: () => modeObserved,
       promptCount: () => promptCount,
       cancelCount: () => cancelCount,
       permissionSettledCount: () => permissionResponses.length,
@@ -513,7 +347,6 @@ async function createAcpHarness(kind: AcpAgentKind): Promise<AdapterContractHarn
 
 const adapterFixtures: Array<{ kind: AgentKind; create: () => Promise<AdapterContractHarness> }> = [
   { kind: "opencode", create: createOpencodeHarness },
-  { kind: "claude-code", create: createClaudeHarness },
   ...ACP_AGENT_KINDS.map((kind) => ({ kind, create: () => createAcpHarness(kind) })),
 ]
 
@@ -552,6 +385,17 @@ async function observedPermissionRequestId(events: AgentEvent[]): Promise<string
   return asked.data.request.id
 }
 
+test("BYOA profiles always use the local agent's account and model catalog", () => {
+  expect(AGENT_PROFILES.opencode.modelSource).toBe("wanta")
+  expect(AGENT_PROFILES.opencode.auth.kind).toBe("wanta-account")
+  for (const kind of EXTERNAL_AGENT_KINDS) {
+    expect(AGENT_PROFILES[kind].modelSource).toBe("agent")
+    expect(AGENT_PROFILES[kind].auth.kind).toBe("agent-cli")
+  }
+  expect(AGENT_PROFILES.grok.auth).toEqual({ kind: "agent-cli", loginCommand: "grok login" })
+  expect(agentLoginHint("grok")).toContain("Run `grok login`")
+})
+
 describe.each(adapterFixtures)("agent adapter contract: $kind", ({ kind, create }) => {
   test("prompt requires a started lifecycle", async () => {
     const harness = await create()
@@ -571,6 +415,7 @@ describe.each(adapterFixtures)("agent adapter contract: $kind", ({ kind, create 
     expect(harness.adapter.profile).toBe(profile)
     expect(harness.adapter.supportsInput("prompt")).toBe(true)
     expect(harness.adapter.supportsInput("cancel")).toBe(true)
+    expect(harness.adapter.supportsInput("authenticate")).toBe(profile.inputs.authenticate)
     expect(harness.adapter.supportsInput("permission-response")).toBe(profile.inputs.permissionResponse)
     expect(harness.adapter.supportsInput("question-response")).toBe(profile.inputs.questionResponse)
     expect(harness.adapter.supportsInput("set-model")).toBe(profile.inputs.setModel)
@@ -853,6 +698,7 @@ describe("BaseAgentAdapter defaults", () => {
     const adapter = new MinimalAdapter()
     await adapter.start()
     expect(adapter.supportsInput("permission-response")).toBe(false)
+    expect(adapter.supportsInput("authenticate")).toBe(false)
     expect(adapter.supportsInput("question-response")).toBe(false)
     expect(adapter.supportsInput("set-model")).toBe(false)
     expect(adapter.supportsInput("set-effort")).toBe(false)
@@ -861,6 +707,9 @@ describe("BaseAgentAdapter defaults", () => {
     )
     await expect(adapter.send({ type: "set-effort", sessionId: "s", effortId: "e" })).rejects.toThrow(
       "opencode: set-effort is not supported",
+    )
+    await expect(adapter.send({ type: "authenticate", methodId: "native" })).rejects.toThrow(
+      "opencode: authenticate is not supported",
     )
     await expect(
       adapter.send({ type: "permission-response", sessionId: "s", requestId: "r", reply: "once" }),

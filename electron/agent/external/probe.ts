@@ -1,5 +1,11 @@
-import type { ExternalAgentKind } from "../contract/profile.ts"
-import type { ExternalAgentBinaryProbe, ExternalAgentLoginProbe, ExternalAgentRuntimeStatus } from "./status.ts"
+import type { AcpAgentRegistration } from "../acp/registry.ts"
+import type { AgentAuthMode, ExternalAgentKind } from "../contract/profile.ts"
+import type {
+  ExternalAgentBinaryProbe,
+  ExternalAgentCatalog,
+  ExternalAgentLoginProbe,
+  ExternalAgentRuntimeStatus,
+} from "./status.ts"
 
 import { execFile } from "node:child_process"
 import { readFile } from "node:fs/promises"
@@ -30,6 +36,38 @@ export interface ExternalAgentProbeOptions {
   homeDirectory?: string
   /** Extra directories searched before PATH (dev node_modules/.bin, bundled Resources/bin). */
   extraBinDirectories?: readonly string[]
+}
+
+export function shouldProbeExternalAgentLogin(auth: AgentAuthMode, binary: ExternalAgentBinaryProbe): boolean {
+  return auth.kind === "agent-cli" && binary.status === "detected"
+}
+
+export type ExternalAgentRuntimeDependencyProbe =
+  | { status: "not_required" }
+  | { status: "detected"; path: string }
+  | { status: "not_found"; message: string }
+
+/** Verify the native CLI delegated to by a packaged ACP bridge. */
+export async function probeRegisteredRuntime(
+  registration: AcpAgentRegistration,
+  pathEnv: string,
+  options: ExternalAgentProbeOptions = {},
+): Promise<ExternalAgentRuntimeDependencyProbe> {
+  const runtime = registration.runtimeExecutable
+  if (!runtime) return { status: "not_required" }
+  const env = options.env ?? process.env
+  const configuredPath = env[runtime.envVar]?.trim()
+  const commands = configuredPath ? [configuredPath] : runtime.cliCommands
+  const detected = await detectCliExecutable(commands, {
+    env,
+    homeDirectory: options.homeDirectory,
+    pathEnv,
+  })
+  if (detected) return { status: "detected", path: detected.executablePath }
+  return {
+    status: "not_found",
+    message: `${registration.displayName} ACP bridge is installed, but its native CLI is missing. Install ${runtime.cliCommands[0] ?? registration.displayName} or set ${runtime.envVar} to a valid executable path.`,
+  }
 }
 
 async function probeCommandPath(options: ExternalAgentProbeOptions): Promise<string> {
@@ -111,6 +149,53 @@ async function probeClaudeCliLogin(
   }
 }
 
+export function parseGrokModelsOutput(raw: string): {
+  catalog?: ExternalAgentCatalog
+  login: ExternalAgentLoginProbe
+} {
+  const loggedOut = /\bnot authenticated\b/iu.test(raw)
+  const defaultModelId = raw.match(/^Default model:\s*(\S+)\s*$/imu)?.[1]
+  const models = raw
+    .split(/\r?\n/u)
+    .flatMap((line) => {
+      const match = line.match(/^\s*[*-]\s+(\S+?)(?:\s+\(default\))?\s*$/u)
+      return match?.[1] ? [{ id: match[1], label: match[1] }] : []
+    })
+    .filter((model, index, all) => all.findIndex((candidate) => candidate.id === model.id) === index)
+  return {
+    login: loggedOut ? { status: "logged_out" } : models.length > 0 ? { status: "logged_in" } : { status: "unknown" },
+    ...(models.length > 0
+      ? {
+          catalog: {
+            models,
+            efforts: [],
+            ...(defaultModelId ? { defaultModelId } : {}),
+          },
+        }
+      : {}),
+  }
+}
+
+async function probeGrokModels(
+  executablePath: string,
+  pathEnv: string,
+  options: ExternalAgentProbeOptions,
+): Promise<{ catalog?: ExternalAgentCatalog; login: ExternalAgentLoginProbe }> {
+  const env = options.env ?? process.env
+  try {
+    const { stdout } = await execFileAsync(executablePath, ["models"], {
+      timeout: versionProbeTimeoutMs,
+      maxBuffer: 64 * 1024,
+      env: { ...env, PATH: pathEnv },
+    })
+    return parseGrokModelsOutput(stdout)
+  } catch (error) {
+    const stdout =
+      error && typeof error === "object" && "stdout" in error && typeof error.stdout === "string" ? error.stdout : ""
+    return parseGrokModelsOutput(stdout)
+  }
+}
+
 /**
  * Claude Code login state from the CLI's own config file. Only key presence is
  * inspected; no secret ever leaves this function (~/.claude.json holds account
@@ -151,6 +236,34 @@ async function probeLoginMarker(
   return (await pathExists(path.join(home, markerPath))) ? { status: "logged_in" } : { status: "unknown" }
 }
 
+async function probeRegisteredLogin(
+  registration: AcpAgentRegistration,
+  pathEnv: string,
+  options: ExternalAgentProbeOptions,
+): Promise<ExternalAgentLoginProbe> {
+  if (registration.loginProbe === "claude-cli") {
+    const runtime = registration.runtimeExecutable
+    const detected = runtime
+      ? await detectCliExecutable(runtime.cliCommands, {
+          env: options.env ?? process.env,
+          homeDirectory: options.homeDirectory,
+          pathEnv,
+        })
+      : undefined
+    const native = detected ? await probeClaudeCliLogin(detected.executablePath, pathEnv, options) : undefined
+    return native ?? probeClaudeLogin(options)
+  }
+  if (registration.loginProbe === "grok-models") {
+    const detected = await detectCliExecutable(registration.cliCommands, {
+      env: options.env ?? process.env,
+      homeDirectory: options.homeDirectory,
+      pathEnv,
+    })
+    return detected ? (await probeGrokModels(detected.executablePath, pathEnv, options)).login : { status: "unknown" }
+  }
+  return probeLoginMarker(registration.loginMarkerPath, options)
+}
+
 export async function probeExternalAgent(
   kind: ExternalAgentKind,
   options: ExternalAgentProbeOptions = {},
@@ -158,15 +271,31 @@ export async function probeExternalAgent(
   const profile = AGENT_PROFILES[kind]
   const loginHint = agentLoginHint(kind)
   const pathEnv = await probeCommandPath(options)
-  const registration = kind === "claude-code" ? undefined : ACP_AGENT_REGISTRY[kind]
-  const binary = registration
-    ? await probeBinary(registration.cliCommands, registration.versionArgs, options, pathEnv)
-    : await probeBinary(["claude"], ["--version"], options, pathEnv)
-  const login = registration
-    ? await probeLoginMarker(registration.loginMarkerPath, options)
-    : ((binary.status === "detected" ? await probeClaudeCliLogin(binary.path, pathEnv, options) : undefined) ??
-      (await probeClaudeLogin(options)))
-  const status: ExternalAgentRuntimeStatus = { kind, displayName: profile.displayName, binary, login, loginHint }
+  const registration: AcpAgentRegistration = ACP_AGENT_REGISTRY[kind]
+  let binary = await probeBinary(registration.cliCommands, registration.versionArgs, options, pathEnv)
+  if (binary.status === "detected") {
+    const runtime = await probeRegisteredRuntime(registration, pathEnv, options)
+    if (runtime.status === "not_found") {
+      binary = { status: "error", message: runtime.message }
+    }
+  }
+  const nativeCatalogProbe =
+    registration.catalogProbe === "grok-models" && binary.status === "detected"
+      ? await probeGrokModels(binary.path, pathEnv, options)
+      : undefined
+  const login = shouldProbeExternalAgentLogin(profile.auth, binary)
+    ? (nativeCatalogProbe?.login ?? (await probeRegisteredLogin(registration, pathEnv, options)))
+    : { status: "unknown" as const }
+  const catalog = nativeCatalogProbe?.catalog
+  const status: ExternalAgentRuntimeStatus = {
+    kind,
+    displayName: profile.displayName,
+    binary,
+    login,
+    loginHint,
+    loginCommand: registration.loginCommand,
+    ...(catalog ? { catalog } : {}),
+  }
   logDiagnosticOnChange(`byoa-probe:${kind}`, "byoa-probe", "external agent probe", {
     kind,
     binaryStatus: status.binary.status,

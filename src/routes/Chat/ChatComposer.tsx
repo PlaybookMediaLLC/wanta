@@ -7,8 +7,8 @@ import type {
   ChatQuestionRequest,
 } from "../../../electron/chat/common.ts"
 import type { ConnectionProvider } from "../../../electron/connections/common.ts"
-import type { KnowledgeBaseSummary } from "../../../electron/knowledge/common.ts"
 import type { ChatTurnState } from "./chat-turn-state.ts"
+import type { ComposerDraftBinding } from "./composer-draft-store.ts"
 import type { ComposerState } from "./composer-state.ts"
 import type { ArtifactSelection } from "./GeneratedArtifacts.tsx"
 import type { PromptInputMessage } from "@/components/ai-elements/prompt-input"
@@ -16,8 +16,10 @@ import type { ChatSendRequest, ChatSendResult } from "@/components/app-shell/app
 import type { QueuedChatMessage, QueuedMessageMovePlacement } from "@/components/app-shell/chat-queue"
 import type { UserFacingError } from "@/lib/user-facing-error"
 
-import { ArrowRight, BrainCircuit, Bug, Server, X } from "lucide-react"
+import { ArrowRight, BrainCircuit, Bug, Copy, Loader2, LogIn, RefreshCw, Server, Trash2, X } from "lucide-react"
+import { BookOpen } from "lucide-react"
 import * as React from "react"
+import { toast } from "sonner"
 import { AGENT_PROFILES, isExternalAgentKind } from "../../../electron/agent/contract/profile.ts"
 import { AddCustomModelDialog } from "./AddCustomModelDialog.tsx"
 import { agentRuntimeReadyForSubmission } from "./agent-control-options.ts"
@@ -35,7 +37,6 @@ import {
   buildArtifactPaletteItems,
   buildConnectionPaletteItems,
   buildContextPaletteItems,
-  buildKnowledgePaletteItems,
   buildSkillPaletteItems,
   slashCommandItems,
 } from "./composer-palette-items.ts"
@@ -69,15 +70,18 @@ import {
 import { useChatService } from "@/components/AppContext"
 import { useSkillInventoryResource } from "@/components/AppDataHooks"
 import { ErrorNotice } from "@/components/ErrorNotice"
+import { Button } from "@/components/ui/button"
 import { useAppSettings } from "@/hooks/useAppSettings"
+import { useExternalAgentCatalog } from "@/hooks/useExternalAgentCatalog"
 import { useExternalAgents } from "@/hooks/useExternalAgents"
 import { useT } from "@/i18n/i18n"
-import { reportRendererHandledError } from "@/lib/renderer-diagnostics"
-import { resolveUserFacingError } from "@/lib/user-facing-error"
+import { resolveUserFacingError, userFacingErrorDescription } from "@/lib/user-facing-error"
 import { cn } from "@/lib/utils"
 import { authTypeLabel } from "@/routes/Connections/shared"
 
 interface ChatComposerProps {
+  knowledgeTeamId?: string
+  knowledgeRequired?: boolean
   error: string | null
   agentEffortId?: string
   agentKind?: AgentKind
@@ -94,13 +98,9 @@ interface ChatComposerProps {
   generatedArtifacts?: ArtifactSelection | null
   hasMessages: boolean
   historyScope: string
+  draftBinding?: ComposerDraftBinding
   initialComposerState?: ComposerState
   messages: ChatMessage[]
-  knowledgeBaseIds: string[]
-  knowledgeEnabled: boolean
-  knowledgeError: string | null
-  knowledgeItems: KnowledgeBaseSummary[]
-  knowledgeLoading: boolean
   modelRequired?: boolean
   permissionMode: AgentPermissionMode
   pendingQuestions: ChatQuestionRequest[]
@@ -122,12 +122,10 @@ interface ChatComposerProps {
   onPermissionModeSelect: (mode: AgentPermissionMode) => void
   onPermissionModeFullAccess: () => void
   onOpenConnectionProvider?: (service: string, displayName: string) => void
-  onOpenKnowledgeLibrary?: () => void
   selfManagedSetup?: {
     onConfigureOpenConnector: () => void
     onDismiss: () => void
   }
-  onSelectKnowledgeBase: (id: string) => void
   onStop: () => Promise<void> | void
   onViewBilling?: () => void
 }
@@ -192,6 +190,8 @@ function paletteLabels({
 }
 
 export function ChatComposer({
+  knowledgeTeamId,
+  knowledgeRequired = false,
   agentEffortId,
   agentKind = "opencode",
   agentModelId,
@@ -208,13 +208,9 @@ export function ChatComposer({
   generatedArtifacts = null,
   hasMessages,
   historyScope,
+  draftBinding,
   initialComposerState: initialComposerStateProp,
   messages,
-  knowledgeBaseIds,
-  knowledgeEnabled,
-  knowledgeError,
-  knowledgeItems,
-  knowledgeLoading,
   modelRequired = false,
   permissionMode,
   pendingQuestions = [],
@@ -236,9 +232,7 @@ export function ChatComposer({
   onPermissionModeSelect,
   onPermissionModeFullAccess,
   onOpenConnectionProvider,
-  onOpenKnowledgeLibrary,
   selfManagedSetup,
-  onSelectKnowledgeBase,
   onStop,
   onViewBilling,
 }: ChatComposerProps) {
@@ -249,25 +243,24 @@ export function ChatComposer({
   const chatService = useChatService()
   const externalAgentsState = useExternalAgents()
   const refreshExternalAgents = externalAgentsState.refresh
-  const warmedAgentKindsRef = React.useRef(new Set<AgentKind>())
-  React.useEffect(() => {
-    // Warm the displayed external agent's catalog once per kind per mount so
-    // model and effort options are ready by the time the pickers open.
-    if (!isExternalAgentKind(agentKind) || warmedAgentKindsRef.current.has(agentKind)) {
-      return
-    }
-    warmedAgentKindsRef.current.add(agentKind)
-    void chatService
-      .invoke("warmExternalAgent", agentKind)
-      .then(() => refreshExternalAgents())
-      .catch((cause: unknown) => {
-        reportRendererHandledError("agent", `warm external agent failed: ${agentKind}`, cause)
-      })
-  }, [agentKind, chatService, refreshExternalAgents])
-  const [composer, dispatchComposer] = React.useReducer(
+  const nativeCatalog = useExternalAgentCatalog(agentKind, agentModelId, refreshExternalAgents)
+  const refreshAgentConfiguration = React.useCallback(async () => {
+    await nativeCatalog.refresh()
+  }, [nativeCatalog.refresh])
+  const [localComposer, localDispatch] = React.useReducer(
     composerReducer,
     initialComposerStateProp ?? initialComposerState(),
   )
+  React.useSyncExternalStore(
+    draftBinding?.subscribe ?? (() => () => {}),
+    () => `${draftBinding?.isReady()}:${draftBinding?.saveError()}`,
+  )
+  const savedComposer = React.useSyncExternalStore(
+    draftBinding?.subscribe ?? (() => () => {}),
+    draftBinding?.getSnapshot ?? (() => null),
+  )
+  const composer = savedComposer ?? localComposer
+  const dispatchComposer = draftBinding?.dispatch ?? localDispatch
   const [inputError, setInputError] = React.useState<UserFacingError | null>(null)
   const clearInputError = React.useCallback(() => setInputError(null), [])
   const showTrustedInputError = React.useCallback(
@@ -316,9 +309,22 @@ export function ChatComposer({
     () => externalAgentsState.agents.find((agent) => agent.kind === agentKind),
     [agentKind, externalAgentsState.agents],
   )
+  const displayedAgentProfile = AGENT_PROFILES[agentKind]
+  const effectivePermissionModes = isExternalAgentKind(agentKind)
+    ? (displayedExternalAgent?.permissionModes ?? ["default"])
+    : displayedAgentProfile.permissionModes
+  const [authenticatingAgent, setAuthenticatingAgent] = React.useState<AgentKind | null>(null)
+  const [agentAuthError, setAgentAuthError] = React.useState<string | null>(null)
+  const [loginCommandCopied, setLoginCommandCopied] = React.useState(false)
+  React.useEffect(() => {
+    setAgentAuthError(null)
+    setLoginCommandCopied(false)
+    if (displayedExternalAgent?.login.status === "logged_in") setAuthenticatingAgent(null)
+  }, [agentKind, displayedExternalAgent?.login.status])
   const agentRuntimeReady = agentRuntimeReadyForSubmission(agentKind, displayedExternalAgent)
-  const submitBlocked = submitDisabled || !agentRuntimeReady || initialSendPending
+  const submitBlocked = submitDisabled || !agentRuntimeReady || initialSendPending || Boolean(composer.pendingImports)
   const composerDisabled =
+    Boolean(draftBinding && !draftBinding.isReady()) ||
     submitDisabled ||
     !agentRuntimeReady ||
     (voiceEnabled && voiceInput.busy) ||
@@ -326,6 +332,14 @@ export function ChatComposer({
     answeringQuestion ||
     composerQuestionBlocked
   const composerControlsDisabled = composerModeControlsDisabled({ composerDisabled, modelRequired })
+  // Runtime readiness blocks submission, never the escape hatch used to log in
+  // or select another agent.
+  const agentConfigurationDisabled =
+    submitDisabled ||
+    (voiceEnabled && voiceInput.busy) ||
+    initialSendPending ||
+    answeringQuestion ||
+    composerQuestionBlocked
   const modelCatalog = React.useMemo(
     () => modelCatalogForRuntime(modelCatalogState.catalog, cloudModelsEnabled),
     [cloudModelsEnabled, modelCatalogState.catalog],
@@ -334,6 +348,7 @@ export function ChatComposer({
   const customModelConfigured = Boolean(modelCatalogState.catalog?.customModels.length)
   const composerAttachments = useComposerAttachments({
     attachments,
+    beginImport: draftBinding?.beginImport,
     clearInputError,
     disabled: composerDisabled || composerAttachmentsDisabled,
     dispatch: dispatchComposer,
@@ -393,32 +408,9 @@ export function ChatComposer({
     [providers, t],
   )
   const artifactItems = React.useMemo(() => buildArtifactPaletteItems(generatedArtifacts, t), [generatedArtifacts, t])
-  const knowledgePaletteItems = React.useMemo(
-    () =>
-      knowledgeEnabled
-        ? buildKnowledgePaletteItems(
-            knowledgeItems,
-            knowledgeBaseIds,
-            {
-              emptyDescription: t("chat.knowledgePaletteEmptyDescription"),
-              emptyTitle: t("chat.knowledgePaletteEmptyTitle"),
-              failedDescription: t("chat.knowledgePaletteFailedDescription"),
-              failedTitle: t("chat.knowledgePaletteFailedTitle"),
-              libraryDescription: t("chat.knowledgePaletteLibraryDescription"),
-              libraryTitle: t("chat.knowledgePaletteLibraryTitle"),
-              loadingDescription: t("chat.knowledgePaletteLoadingDescription"),
-              loadingTitle: t("chat.knowledgePaletteLoadingTitle"),
-              selected: t("chat.knowledgePaletteSelected"),
-            },
-            { error: Boolean(knowledgeError), loading: knowledgeLoading },
-          )
-        : [],
-    [knowledgeBaseIds, knowledgeEnabled, knowledgeError, knowledgeItems, knowledgeLoading, t],
-  )
   const contextItems = React.useMemo(
-    () =>
-      buildContextPaletteItems({ artifactItems, connectionItems, knowledgeItems: knowledgePaletteItems, platform, t }),
-    [artifactItems, connectionItems, knowledgePaletteItems, platform, t],
+    () => buildContextPaletteItems({ artifactItems, connectionItems, platform, t }),
+    [artifactItems, connectionItems, platform, t],
   )
   const providerByService = React.useMemo(
     () => new Map(providers.map((provider) => [normalizeServiceSlug(provider.service), provider])),
@@ -433,8 +425,8 @@ export function ChatComposer({
   }, [focusRequest])
 
   React.useEffect(() => {
-    onComposerStateChange?.(composer)
-  }, [composer, onComposerStateChange])
+    if (!draftBinding) onComposerStateChange?.(composer)
+  }, [composer, draftBinding, onComposerStateChange])
 
   React.useLayoutEffect(() => {
     const textarea = textareaRef.current
@@ -502,14 +494,12 @@ export function ChatComposer({
     },
     onAddContextMention: addContextMention,
     onOpenConnectionProvider,
-    onOpenKnowledgeLibrary,
     onSelectAttachments: (kind) => {
       if (composerDisabled || composerAttachmentsDisabled) {
         return
       }
       void composerAttachments.selectAttachments(kind)
     },
-    onSelectKnowledgeBase,
     onViewBilling,
     skillItems,
     slashItems,
@@ -610,9 +600,9 @@ export function ChatComposer({
         return
       }
       clearedAfterSubmit = true
-      composerAttachments.revokeCurrentPreviews()
+      if (!draftBinding) composerAttachments.revokeCurrentPreviews()
       resetHistoryNavigation()
-      dispatchComposer({ type: "reset-after-submit" })
+      if (!draftBinding) dispatchComposer({ type: "reset-after-submit" })
       clearInputError()
     }
     let result: ChatSendResult
@@ -692,13 +682,86 @@ export function ChatComposer({
   ) : null
   // Probed sign-in hint for the displayed agent; only an explicit logged_out
   // state shows guidance (finding by kind naturally skips the built-in agent).
-  const displayedAgentProfile = AGENT_PROFILES[agentKind]
-  const agentLoginNotice =
-    displayedExternalAgent?.login.status === "logged_out" ? (
-      <p className="oo-text-caption px-1 text-muted-foreground">
-        {t("chat.agentLoginRequired", { hint: displayedExternalAgent.loginHint })}
-      </p>
-    ) : null
+  const agentLoginRequired =
+    displayedAgentProfile.auth.kind === "agent-cli" && displayedExternalAgent?.login.status === "logged_out"
+  const nativeAuthMethod = displayedExternalAgent?.authMethods?.find((method) => method.type === "agent")
+  const authenticating = authenticatingAgent === agentKind
+  const authenticateAgent = async (): Promise<void> => {
+    if (!isExternalAgentKind(agentKind) || !nativeAuthMethod || authenticating) return
+    setAuthenticatingAgent(agentKind)
+    setAgentAuthError(null)
+    try {
+      await chatService.invoke("authenticateExternalAgent", { kind: agentKind, methodId: nativeAuthMethod.id })
+      await refreshExternalAgents()
+    } catch (cause) {
+      setAgentAuthError(
+        userFacingErrorDescription(resolveUserFacingError(cause, { area: "auth", preserveMessage: true }), t),
+      )
+    } finally {
+      setAuthenticatingAgent(null)
+    }
+  }
+  const copyLoginCommand = (): void => {
+    const command = displayedExternalAgent?.loginCommand
+    if (!command) return
+    void globalThis.navigator.clipboard
+      .writeText(command)
+      .then(() => setLoginCommandCopied(true))
+      .catch((cause: unknown) => {
+        setAgentAuthError(
+          userFacingErrorDescription(resolveUserFacingError(cause, { area: "auth", preserveMessage: true }), t),
+        )
+      })
+  }
+  const agentLoginNotice = agentLoginRequired ? (
+    <div className="oo-border-divider rounded-xl border bg-muted/35 px-3 py-3">
+      <div className="flex items-start gap-2.5">
+        <LogIn className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <p className="oo-text-label">{t("chat.agentLoginTitle", { agent: displayedExternalAgent.displayName })}</p>
+          <p className="oo-text-caption mt-0.5 text-muted-foreground">
+            {t("chat.agentLoginDescription", { agent: displayedExternalAgent.displayName })}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {nativeAuthMethod ? (
+              <Button type="button" size="sm" disabled={authenticating} onClick={() => void authenticateAgent()}>
+                {authenticating ? <Loader2 className="size-3.5 animate-spin" /> : <LogIn className="size-3.5" />}
+                {authenticating
+                  ? t("chat.agentAuthenticating", { agent: displayedExternalAgent.displayName })
+                  : t("chat.agentLoginAction", { agent: displayedExternalAgent.displayName })}
+              </Button>
+            ) : null}
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={authenticating}
+              onClick={() => void refreshExternalAgents()}
+            >
+              <RefreshCw className="size-3.5" />
+              {t("chat.agentRefreshStatus")}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => onSelectAgentKind?.("opencode")}>
+              {t("chat.agentUseBuiltIn")}
+            </Button>
+          </div>
+          {displayedExternalAgent.loginCommand ? (
+            <div className="oo-text-caption mt-2 flex min-w-0 flex-wrap items-center gap-1.5 text-muted-foreground">
+              <span>{t("chat.agentLoginTerminalFallback")}</span>
+              <code className="rounded bg-muted px-1.5 py-0.5 text-foreground">
+                {displayedExternalAgent.loginCommand}
+              </code>
+              <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5" onClick={copyLoginCommand}>
+                <Copy className="size-3" />
+                {loginCommandCopied ? t("chat.agentLoginCommandCopied") : t("chat.agentLoginCommandCopy")}
+              </Button>
+            </div>
+          ) : null}
+          {agentAuthError ? <p className="oo-text-caption mt-2 text-destructive">{agentAuthError}</p> : null}
+        </div>
+      </div>
+    </div>
+  ) : null
   const submitText = draft
   const canSubmit = activePendingQuestion
     ? !submitBlocked && !composerDisabled && attachments.length === 0 && submitText.trim().length > 0
@@ -711,12 +774,18 @@ export function ChatComposer({
       : t("chat.questionComposerPlaceholder")
     : placeholder
   const hasInputAddons = command !== null || attachments.length > 0 || contextMentions.length > 0
-  // The context budget comes from Wanta's own model catalog, which is only
-  // authoritative when the agent routes models through Wanta; agents that bring
-  // their own model must not render a meter fabricated from unrelated limits.
+  // Built-in models use Wanta's budget. BYOA uses only context metadata reported
+  // by that native agent; live usage_update values remain authoritative.
+  const externalContextWindow = React.useMemo(() => {
+    if (modelRoutingEnabled) return undefined
+    const catalog = displayedExternalAgent?.catalog
+    if (!catalog) return undefined
+    const selectedId = agentModelId ?? catalog.defaultModelId
+    return catalog.models.find((model) => model.id === selectedId)?.contextWindow
+  }, [agentModelId, displayedExternalAgent?.catalog, modelRoutingEnabled])
   const contextUsage = React.useMemo(
-    () => buildContextUsageInfo(messages, modelRoutingEnabled ? modelCatalog : null),
-    [messages, modelCatalog, modelRoutingEnabled],
+    () => buildContextUsageInfo(messages, modelRoutingEnabled ? modelCatalog : null, externalContextWindow),
+    [externalContextWindow, messages, modelCatalog, modelRoutingEnabled],
   )
 
   const promptInput = (
@@ -726,6 +795,29 @@ export function ChatComposer({
       onDragOver={composerAttachments.handleDragOver}
       onDrop={composerAttachments.handleDrop}
     >
+      {composer.pendingImports ? (
+        <p role="status" className="px-3 text-xs text-muted-foreground">
+          {t("chat.draftImporting")}
+        </p>
+      ) : null}
+      {composer.interruptedImport ? (
+        <p role="alert" className="px-3 text-sm text-destructive">
+          {t("chat.draftImportInterrupted")}
+        </p>
+      ) : null}
+      {composer.importError ? (
+        <p role="alert" className="px-3 text-sm text-destructive">
+          {composer.importError}
+        </p>
+      ) : null}
+      {draftBinding?.saveError() ? (
+        <p role="alert" className="px-3 text-sm text-destructive">
+          {t("chat.draftSaveFailed")}{" "}
+          <Button type="button" variant="ghost" size="sm" onClick={draftBinding.retrySave}>
+            {t("artifacts.retry")}
+          </Button>
+        </p>
+      ) : null}
       {hasInputAddons ? (
         <PromptInputAttachments>
           <div className="flex max-h-[min(42vh,20rem)] w-full flex-col gap-2 overflow-y-auto pr-1">
@@ -804,6 +896,27 @@ export function ChatComposer({
         />
       </PromptInputBody>
       <PromptInputToolbar className="oo-composer-toolbar min-w-0 flex-nowrap overflow-hidden">
+        {knowledgeTeamId ? (
+          <Button
+            type="button"
+            variant={
+              knowledgeRequired || contextMentions.some((m) => m.kind === "cloud-knowledge") ? "secondary" : "ghost"
+            }
+            size="icon"
+            disabled={knowledgeRequired || composerDisabled || command !== null}
+            aria-label={t("knowledge.useInChat")}
+            title={t("knowledge.useInChat")}
+            aria-pressed={knowledgeRequired || contextMentions.some((m) => m.kind === "cloud-knowledge")}
+            onClick={() => {
+              const selected = contextMentions.find((m) => m.kind === "cloud-knowledge")
+              if (selected) removeContextMention(selected)
+              else
+                addContextMention({ kind: "cloud-knowledge", id: knowledgeTeamId, displayName: t("knowledge.title") })
+            }}
+          >
+            <BookOpen />
+          </Button>
+        ) : null}
         <ComposerAttachmentMenu
           disabled={composerDisabled || composerAttachmentsDisabled}
           fileInputRef={composerAttachments.fileInputRef}
@@ -811,14 +924,32 @@ export function ChatComposer({
           onSelectDirectory={() => composerAttachments.selectAttachments("directory")}
           onSelectFile={() => composerAttachments.selectAttachments("file")}
         />
+        {draftBinding && hasComposerDraftContent(composer) ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            title={t("chat.draftClear")}
+            aria-label={t("chat.draftClear")}
+            onClick={() => {
+              const undo = draftBinding.clear()
+              toast(t("chat.draftCleared"), { duration: 8_000, action: { label: t("chat.draftUndo"), onClick: undo } })
+            }}
+          >
+            <Trash2 />
+          </Button>
+        ) : null}
         <ComposerTrailingControls
+          agentConfigurationDisabled={agentConfigurationDisabled}
           canSubmit={canSubmit}
           composerDisabled={composerControlsDisabled}
           contextUsage={contextUsage}
           turnState={composerTurnState}
           modelCatalog={modelCatalog}
           modelRequired={modelRequired}
-          agentCatalog={displayedExternalAgent?.catalog}
+          agentCatalog={nativeCatalog.catalog}
+          agentCatalogLoading={nativeCatalog.loading}
+          agentCatalogError={nativeCatalog.error}
           agentEffortId={agentEffortId}
           agentEffortSelectionEnabled={displayedAgentProfile.inputs.setEffort}
           agentKind={agentKind}
@@ -829,7 +960,7 @@ export function ChatComposer({
           externalAgents={externalAgentsState.agents}
           modelRoutingEnabled={modelRoutingEnabled}
           permissionMode={permissionMode}
-          permissionModes={displayedAgentProfile.permissionModes}
+          permissionModes={effectivePermissionModes}
           reasoningLevel={reasoningLevel}
           voiceEnabled={voiceEnabled}
           voiceActive={voiceEnabled && voiceInput.active}
@@ -842,7 +973,7 @@ export function ChatComposer({
           voiceTranscribing={voiceEnabled && voiceInput.transcribing}
           willQueueMessage={composerWillQueueMessage}
           onAddModel={modelCatalogState.openDialog}
-          onAgentPickerOpen={externalAgentsState.refresh}
+          onAgentPickerOpen={refreshAgentConfiguration}
           onCancelVoice={voiceInput.cancel}
           onDeleteModel={modelCatalogState.deleteModel}
           onRetryVoice={voiceInput.retry}

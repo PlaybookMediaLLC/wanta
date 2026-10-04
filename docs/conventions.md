@@ -48,7 +48,7 @@
 - Service domains registered as main-process RPC services co-locate in one directory:
   `common.ts` (contract + pure types, imported by both main and renderer) / `node.ts` (main-process
   implementation) / `store.ts` (persistence) / `*.test.ts`. This applies to the RPC-registered
-  domains (currently attention / auth / chat / git / knowledge / link-runtime / models / session /
+  domains (currently attention / auth / chat / git / link-runtime / models / session /
   settings / skills / update — see the source tree); `connections` and `teams` keep only `common.ts` contracts
   and pure functions under `electron/`, with their request logic living in the renderer at
   `src/lib/*-client.ts`.
@@ -139,7 +139,7 @@
 - **Capabilities sync across three places**: the tools configuration in `config.ts` (current state:
   no disable table, all built-in tools enabled), permission (agent-level + root-level), and the
   `system-prompt.ts` prompt. Changing any capability policy means changing all three together.
-- **Permission `"ask"` must be verified against the UI**: `permission.asked` /
+- **Built-in OpenCode permission `"ask"` must be verified against the UI**: `permission.asked` /
   `permission.v2.asked` are first handled by the ChatService main-process local access policy;
   Default Access treats bash as a normal working channel, auto-approving ordinary shell commands,
   scripts, project checks, data processing, simple output filtering, ordinary file reads/writes, and
@@ -159,12 +159,22 @@
   or system Python. Standard Node.js install/ci/add/remove/update operations with no explicit source
   override are auto-approved when npm/pnpm/yarn/bun explicitly targets the turn process directory
   or the currently selected project; lockfile-driven operations do not need a package argument.
-  Node.js and Python package runners are ordinary local execution rather than a package-specific
+  When the permission request itself carries a proven working directory (metadata `cwd`, or the
+  ACP session cwd) that matches that task or project root, a direct `npm install` / `.venv` pip
+  command does not need a redundant `cd`. Inert log redirects, descriptor duplication, and `echo ok`
+  markers do not eject an in-scope install. Node.js and Python package runners are ordinary local execution rather than a package-specific
   risk class. Package names, package size, browser tooling, and unfamiliar ordinary flags are not
-  confirmation boundaries. Recursive cleanup is also auto-approved for direct children of Wanta's
-  per-turn process directory and for exact well-known generated project roots such as `dist`,
-  `coverage`, and `node_modules`; project roots, source directories, variables, wildcards, and
-  composed destructive commands remain protected. Global installs, custom registries, user config, Git/URL/local
+  confirmation boundaries. Recursive cleanup is also auto-approved for descendants of Wanta's
+  per-turn process directory and exact well-known generated project roots such as `dist`,
+  `coverage`, and `node_modules`; unrelated temporary directories, project roots, source directories, variables, wildcards, and
+  composed destructive commands remain protected. A `.env` file inside the selected project is
+  readable automatically through recognized read-only commands; deletion, writing, and unknown
+  executable semantics still prompt and may be granted for the session. Home credentials, browser
+  login state, and private app data stay outside session grants. `git restore` of explicit narrow
+  file pathspecs and named `docker rm`/`rmi` are ordinary; syntactically broad Git restore pathspecs
+  such as `.`, `:/`, directory forms ending in `/`, pathspec magic, and globs still prompt, as do
+  `docker rm -v` / `--volumes`,
+  `git push`, `reset --hard`, `clean -f`, and `docker system prune` remain confirmation boundaries. Global installs, custom registries, user config, Git/URL/local
   package sources, and out-of-scope commands never qualify for automatic approval. Session
   grants may still cover non-sensitive requests the user has explicitly allowed; Full Access =
   session-level local YOLO — once confirmed, the main process auto-replies local permissions for the
@@ -177,8 +187,20 @@
   outcome categories—never commands, resources, or paths—and are included in `/bug-report`
   runtime metadata. Standard bounded project dependency operations are automatic, so do not
   reintroduce the obsolete project-dependency task grant or its renderer action.
-  New ask rules must be verified end to end: pending-permission queries, event push, auto-approve
+  ACP requests bypass this classifier and retain native options and grants;
+  Link business authorization remains enforced in managed tool entry points.
+  New built-in ask rules must be verified end to end: pending-permission queries, event push, auto-approve
   dedup, and reply.
+  Ordinary dependency command lists (`&&`, semicolons/newlines, and existing bounded
+  `head`/`tail` filters) are evaluated per step, so installation followed by ordinary
+  checks/scripts remains automatic. Only successful literal cwd changes establish
+  scope; unconditional separators discard cwd that differs on a failure path.
+  Piped directory changes and shell control/definition syntax do not establish scope.
+  Keep ordinary scripts permissive; do not turn this classifier into a script
+  allowlist. Common shell launchers use shared normalization, recognized
+  package-runner deployments retain the direct command's confirmation, and
+  wildcard deletion remains consequential even without recursive flags. Missing
+  shell command metadata requires clarification, not automatic approval.
 - **oo CLI fast path**: OOMOL keeps the OpenCode fast pass for commands whose first token is `oo` /
   `$WANTA_OO_BIN` / `${WANTA_OO_BIN}`. OpenConnector keeps `bash: "ask"` so the main process can
   reject credential reads and runtime configuration overrides, then automatically approves built-in
@@ -203,11 +225,8 @@
 - Embedded tool source (`tool-sources.ts`, String.raw) **must not contain backticks or `${}`**
   (they break the template string); that code runs in OpenCode's Bun and does not participate in
   this project's tsc/oxlint. The embedded custom tools are four connector tools plus seven
-  integrated-browser tools. WikiGraph
-  knowledge access is intentionally not an OpenCode custom tool: the sidecar receives a Wanta-owned
-  `wg` shim at the front of `PATH`, and the shim forwards stdin/stdout/stderr/exit code to WikiGraph
-  without interpreting business output. Tool descriptions are themselves part of the prompt: keep
-  the list/search/inspect/call responsibility boundaries and cross-references.
+  integrated-browser tools. Tool descriptions are themselves part of the prompt: keep the
+  list/search/inspect/call responsibility boundaries and cross-references.
 - The embedded tools do not rely on OpenCode implicitly installing npm packages on the user's
   machine: the tool helper and Zod schema are bundled at build time by
   `scripts/build-agent-tool-runtime.ts` (entry `scripts/agent-tool-runtime-entry.ts`) into a
@@ -288,6 +307,11 @@
 
 ## 8. Renderer / UI
 
+- Selection state uses a filled background in both themes. Dropdown radios, checkbox menu items,
+  selects, model/agent/mode/permission options, project/branch choices, and member choices do not
+  add dots or checkmark decorations. Keep their semantic state and keyboard behavior. Form
+  checkboxes indicate their checked state with a filled box, using a separate fill for mixed state.
+
 - No router library: page switching is internal state in `AppShell.tsx`; before adding a "page",
   first ask whether a router library is truly needed.
 - Streaming render stability: text parts use a stable React key (partId), `upsertPart` replaces in
@@ -313,8 +337,9 @@
   and `@source "../../node_modules/@streamdown/mermaid/dist"` — must not be deleted (Tailwind v4
   does not scan node_modules; deleting them means the classes those packages use are not generated).
 - i18n: an in-house lightweight implementation (`src/i18n/i18n.ts`), flat dot keys + `{var}`
-  placeholders, zh-CN as baseline + en mirror; new copy must be added to both locales; `useT()`
-  returns the translate function.
+  placeholders; all eight locales must cover new copy, with English as the runtime fallback.
+  `useT()` returns the translate function. Shared codes and validation live in `electron/app-locale.ts`;
+  see [internationalization.md](internationalization.md) for persistence, plurals, native copy and checks.
 - ai-elements is a chat component library — it has no sidebar/navigation/forms/list items; build
   non-chat UI with shadcn primitives, do not force ai-elements onto them.
 

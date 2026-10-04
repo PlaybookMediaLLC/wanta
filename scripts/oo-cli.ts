@@ -3,26 +3,27 @@
 // 本项目只用 oo 的二进制，不再把 @oomol-lab/oo-cli 列为 npm 依赖：
 //   - postinstall（scripts/download-oo.ts）把【当前平台】的 oo 下载到 .oo-bin/（gitignore）；
 //   - dev（electron/main.ts → resolveDevOoBin）与打包前置（scripts/prepare-binaries.ts）共用这一份；
-//   - 上游发布的平台包 tarball 内 bin/oo 是 0644（缺少可执行位，1.2.0 起、1.3.0/1.4.2/1.5.1/1.7.1 复核仍是），故提取后必须 chmod 0o755，
+//   - 上游发布的平台包 tarball 内 bin/oo 是 0644（缺少可执行位，1.2.0 起、1.3.0/1.4.2/1.5.1/1.7.12 复核仍是），故提取后必须 chmod 0o755，
 //     否则直接 spawn 会 EACCES——这正是改造前 dev 直连 node_modules 报错的根因。
 //
-// 平台映射取自 @oomol-lab/oo-cli 的 platform-targets.json（1.2.0；1.3.0/1.4.2/1.5.1/1.7.1 复核平台集未变），含 Linux glibc/musl 判别。
+// 平台映射取自 @oomol-lab/oo-cli 的 platform-targets.json（1.2.0；1.3.0/1.4.2/1.5.1/1.7.12 复核平台集未变），含 Linux glibc/musl 判别。
 
 import { createHash } from "node:crypto"
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { gunzipSync } from "node:zlib"
+import { OO_CLI_VERSION } from "../electron/agent/oo-version.ts"
 import { fetchWithRetry } from "./network-download.ts"
 
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.join(dirname, "..")
 
-// oo-cli 版本：原先经 package-lock 间接锁定，移除依赖后由此处单一锁定。升级 oo 改这里。
-export const OO_CLI_VERSION = "1.7.1"
+export { OO_CLI_VERSION }
 
 // 下载落地目录（gitignore）。dev 侧的同名路径解析见 electron/agent/binaries.ts resolveDevOoBin。
 const localOoBinDir = path.join(repoRoot, ".oo-bin")
+const ooTarballTimeoutMs = 120_000
 
 interface PlatformTarget {
   packageName: string
@@ -135,15 +136,20 @@ export function extractFileFromTar(tar: Buffer, wantedPath: string): Buffer | nu
 }
 
 /** 版本标记内容：平台包名 + 版本，二者任一变化即触发重新下载。 */
-function versionTag(packageName: string): string {
-  return `${packageName}@${OO_CLI_VERSION}`
+function versionTag(packageName: string, version: string): string {
+  return `${packageName}@${version}`
 }
 
-async function isUpToDate(destPath: string, versionMarker: string, packageName: string): Promise<boolean> {
+async function isUpToDate(
+  destPath: string,
+  versionMarker: string,
+  packageName: string,
+  version: string,
+): Promise<boolean> {
   try {
     await stat(destPath)
     const marker = (await readFile(versionMarker, "utf-8")).trim()
-    return marker === versionTag(packageName)
+    return marker === versionTag(packageName, version)
   } catch {
     return false
   }
@@ -155,7 +161,7 @@ interface TarballMeta {
 }
 
 /** 查 registry packument，取指定版本的 tarball URL 与 integrity（SRI），用于下载与完整性校验。 */
-async function resolveTarballMeta(packageName: string): Promise<TarballMeta> {
+async function resolveTarballMeta(packageName: string, version: string): Promise<TarballMeta> {
   const response = await fetchWithRetry(`https://registry.npmjs.org/${packageName}`)
   if (!response.ok) {
     throw new Error(`fetch packument failed: HTTP ${response.status} ${packageName}`)
@@ -163,9 +169,9 @@ async function resolveTarballMeta(packageName: string): Promise<TarballMeta> {
   const packument = (await response.json()) as {
     versions?: Record<string, { dist?: { tarball?: string; integrity?: string } }>
   }
-  const dist = packument.versions?.[OO_CLI_VERSION]?.dist
+  const dist = packument.versions?.[version]?.dist
   if (!dist?.tarball || !dist?.integrity) {
-    throw new Error(`no dist info for ${packageName}@${OO_CLI_VERSION}`)
+    throw new Error(`no dist info for ${packageName}@${version}`)
   }
   return { tarball: dist.tarball, integrity: dist.integrity }
 }
@@ -193,17 +199,28 @@ export function verifyTarballIntegrity(tgz: Buffer, integrity: string, source: s
  * chmod 0o755 →原子 rename 落位。全程不依赖任何外部命令或 npm 包，macOS/Linux/Windows 一致可用。
  */
 export async function downloadOoBinary(): Promise<string> {
+  return downloadOoBinaryVersion(OO_CLI_VERSION, localOoBinDir)
+}
+
+/** Download one explicit candidate version into an isolated directory. */
+export async function downloadOoBinaryVersion(version: string, destinationDirectory: string): Promise<string> {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
+    throw new Error(`invalid oo version: ${version}`)
+  }
   const target = resolvePlatformTarget()
   const exe = target.executableFileName
-  const destPath = localOoBinPath()
-  const versionMarker = path.join(localOoBinDir, ".version")
+  const destPath = path.join(destinationDirectory, exe)
+  const versionMarker = path.join(destinationDirectory, ".version")
 
-  if (await isUpToDate(destPath, versionMarker, target.packageName)) {
+  if (await isUpToDate(destPath, versionMarker, target.packageName, version)) {
     return destPath
   }
 
-  const meta = await resolveTarballMeta(target.packageName)
-  const response = await fetchWithRetry(meta.tarball)
+  const meta = await resolveTarballMeta(target.packageName, version)
+  // Platform binaries are tens of MiB. A healthy but slower npm/CDN route can
+  // exceed the shared 30s metadata timeout, so give the verified tarball body
+  // enough time without weakening the retry or SRI checks.
+  const response = await fetchWithRetry(meta.tarball, {}, { timeoutMs: ooTarballTimeoutMs })
   if (!response.ok) {
     throw new Error(`download oo failed: HTTP ${response.status} ${meta.tarball}`)
   }
@@ -216,7 +233,7 @@ export async function downloadOoBinary(): Promise<string> {
     throw new Error(`oo binary not found inside tarball: ${meta.tarball}`)
   }
 
-  await mkdir(localOoBinDir, { recursive: true })
+  await mkdir(destinationDirectory, { recursive: true })
   // 先写临时文件、补可执行位（上游 tarball 内是 0644），再原子 rename，避免中断留下半截可执行文件。
   const tmpPath = `${destPath}.download`
   try {
@@ -228,6 +245,6 @@ export async function downloadOoBinary(): Promise<string> {
     await rm(tmpPath, { force: true })
   }
 
-  await writeFile(versionMarker, `${versionTag(target.packageName)}\n`, "utf-8")
+  await writeFile(versionMarker, `${versionTag(target.packageName, version)}\n`, "utf-8")
   return destPath
 }

@@ -1,9 +1,10 @@
 export type AppShellRoute =
+  | "knowledge"
+  | "flows"
   | "archived"
   | "billing"
   | "chat"
   | "connections"
-  | "knowledge"
   | "teams"
   | "skills"
   | "settings"

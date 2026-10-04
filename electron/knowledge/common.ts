@@ -1,92 +1,50 @@
-import type { ServiceName } from "@oomol/connection"
-
-import { serviceName } from "../branding.ts"
-
-export const KNOWLEDGE_LIBRARY_CONTEXT_ID = "wikg://lib"
-
-export interface KnowledgeCoverageMetric {
-  coveredWords?: number
-  totalWords?: number
-}
-
-export interface KnowledgeChapterNode {
-  children?: KnowledgeChapterNode[]
-  title: string
-}
-
-export interface KnowledgeBaseSummary {
+export const knowledgeFileStatuses = [
+  "queued",
+  "upload_sending",
+  "parsing",
+  "parsed",
+  "index_sending",
+  "indexing",
+  "mapping",
+  "ready",
+  "failed",
+  "uncertain",
+  "deleting",
+  "deleted",
+] as const
+export type KnowledgeFileStatus = (typeof knowledgeFileStatuses)[number]
+export interface KnowledgeFile {
   id: string
-  title: string
-  authors: string[]
-  publisher?: string
-  publishedAt?: string
-  language?: string
-  relativePath: string
-  sourceFileName: string
-  size: number
-  importedAt: number
-  coverDataUrl?: string
-  capabilities: {
-    fullTextSearch: boolean
-    knowledgeGraph: boolean
-    readingGraph: boolean
-    summary: boolean
-  }
-  coverage?: {
-    knowledgeGraph?: KnowledgeCoverageMetric
-    readingGraph?: KnowledgeCoverageMetric
-    summary?: KnowledgeCoverageMetric
-  }
-  chapters?: KnowledgeChapterNode[]
-  statistics: {
-    totalChapters?: number
-    contentChapters?: number
-    sourceWords?: number
-  }
+  name: string
+  size_bytes: number
+  status: KnowledgeFileStatus
+  error_code?: string
+  created_at: string
+  updated_at: string
 }
-
-export interface ImportKnowledgeBaseRequest {
-  sourcePath?: string
-  targetDirectory?: string
+export interface KnowledgeFilePage {
+  items: KnowledgeFile[]
+  next_cursor: string
 }
-
-export interface MoveKnowledgeBaseRequest {
-  id: string
-  targetDirectory?: string
-  fileName?: string
+export interface KnowledgeHit {
+  file_id: string
+  filename: string
+  text: string
+  score: number
 }
-
-export interface RenameKnowledgeBaseRequest {
-  authors?: string[]
-  id: string
-  fileName?: string
-  title?: string
+export interface KnowledgeResults {
+  request_id: string
+  items: KnowledgeHit[]
 }
-
-export interface KnowledgeFolderRequest {
-  path: string
+export const knowledgeUploadMaxBytes = 150 * 1024 * 1024
+export const knowledgeUploadAccept = ".txt,.docx,.pdf,.xlsx,.epub,.mobi,.md,.bmp,.png,.jpg,.jpeg,.gif"
+export function knowledgeUploadError(file: { name: string; size: number }): "tooLarge" | "unsupportedType" | null {
+  if (file.size > knowledgeUploadMaxBytes) return "tooLarge"
+  return file.name.includes(".") &&
+    knowledgeUploadAccept.split(",").includes(`.${file.name.toLowerCase().split(".").pop()}`)
+    ? null
+    : "unsupportedType"
 }
-
-export interface KnowledgeBasesChangedEvent {
-  reason: string
+export function knowledgeFilePending(status: KnowledgeFileStatus): boolean {
+  return !["ready", "failed", "uncertain", "deleted"].includes(status)
 }
-
-export type KnowledgeService = typeof KnowledgeService
-export const KnowledgeService = serviceName("knowledge-service") as ServiceName<{
-  ServerEvents: {
-    knowledgeBasesChanged: KnowledgeBasesChangedEvent
-  }
-  ClientInvokes: {
-    list(): Promise<KnowledgeBaseSummary[]>
-    listFolders(): Promise<string[]>
-    importKnowledgeBase(request?: ImportKnowledgeBaseRequest | string): Promise<KnowledgeBaseSummary | null>
-    readChapters(id: string): Promise<KnowledgeChapterNode[]>
-    move(request: MoveKnowledgeBaseRequest): Promise<KnowledgeBaseSummary>
-    rename(request: RenameKnowledgeBaseRequest): Promise<KnowledgeBaseSummary>
-    createFolder(request: KnowledgeFolderRequest | string): Promise<string>
-    removeFolder(request: KnowledgeFolderRequest | string): Promise<void>
-    remove(id: string): Promise<void>
-    reveal(id: string): Promise<void>
-    refresh(id: string): Promise<KnowledgeBaseSummary>
-  }
-}>

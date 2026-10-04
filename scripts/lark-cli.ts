@@ -13,15 +13,15 @@ const execFileAsync = promisify(execFile)
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.join(dirname, "..")
 
-export const LARK_CLI_VERSION = "1.0.87"
+export const LARK_CLI_VERSION = "1.0.95"
 const LARK_CLI_CHECKSUMS: Readonly<Record<string, string>> = {
-  "lark-cli-1.0.87-darwin-amd64.tar.gz": "40f005dc39e955ad3fa51a05b1a91619f0ccec1e781038fa247058e4c85b02a7",
-  "lark-cli-1.0.87-darwin-arm64.tar.gz": "b4cf7b1b7ff9c3d8c9ac3dd577fd178f3c8a84ec82184a82de809335840d5b20",
-  "lark-cli-1.0.87-linux-amd64.tar.gz": "6027b1ddc12440400581bbdf9554850d8e119c7dd400439b1220e7a87b9673c5",
-  "lark-cli-1.0.87-linux-arm64.tar.gz": "fade9a22d363172a9c18a8287c99c80d6d106a2900f3fce4015e4e156c5fc776",
-  "lark-cli-1.0.87-linux-riscv64.tar.gz": "c567a9b9848b1c8497a995e1fb1b1e76042315d9f80f6dfc431f9e136bcf08fa",
-  "lark-cli-1.0.87-windows-amd64.zip": "5cb039b20502d02d93f2829f82dd5a30eae8ed7674c1c5a229a7f93563526518",
-  "lark-cli-1.0.87-windows-arm64.zip": "01730490c52fbf69843cc9a57c69fe641578e99cb86bc7f04c02f9c37cef01a2",
+  "lark-cli-1.0.95-darwin-amd64.tar.gz": "b8b817e7ffe793c9be2579e0b3f9165610b01ca3d425a7b8ee6fb4d528dc6cef",
+  "lark-cli-1.0.95-darwin-arm64.tar.gz": "7ae7241b7de5ebfe86aa6b2b24af3600bd5019ec5b6206ea3bfdc0894f6fd925",
+  "lark-cli-1.0.95-linux-amd64.tar.gz": "7da92d426b7d000908c76a36b87a7d0357c270debf4c7149bbc6010b20d2541e",
+  "lark-cli-1.0.95-linux-arm64.tar.gz": "063012a63bb22479855e335d922cc588b883e00d115de51da76a8ffe22db987a",
+  "lark-cli-1.0.95-linux-riscv64.tar.gz": "88dacebc23f19a2749e64ee63049cd96e8e6b553c4225ed5d4cbf1e63e3053ff",
+  "lark-cli-1.0.95-windows-amd64.zip": "f2d5c3d6316b19ceec0996871ca4cff89541b82ed0d90220b3643ee0e84890a8",
+  "lark-cli-1.0.95-windows-arm64.zip": "61df77e3692b304959de43950c1b3337ce3d08aef09f73ca936d3afd4e536b0f",
 }
 export const localLarkCliBinDir = path.join(repoRoot, ".lark-cli-bin")
 export const bundledLarkSkillsDir = path.join(repoRoot, "resources", "lark-skills")

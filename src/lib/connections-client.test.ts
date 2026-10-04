@@ -8,9 +8,11 @@ import {
   getConnectionActions,
   getConnectionCatalogSummary,
   getConnectionExecutionLogs,
+  getConnectionLingxingErpUsers,
   getConnectionProviderDetail,
   getConnectionSummary,
   listOAuthClientConfigs,
+  setDefaultConnection,
   startOAuthConnect,
   upsertOAuthClientConfig,
 } from "./connections-client.ts"
@@ -19,6 +21,51 @@ import { consoleBaseUrl } from "./domain.ts"
 const managementWorkspace = { manageable: true, teamName: "team-name" } as const
 
 describe("connections-client", () => {
+  it.each([undefined, "app-1"])("accepts OAuth completion without a redirect (app %s)", async (appId) => {
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(new URL(String(input)).pathname).toBe(
+        appId ? "/v1/connections/by-id/app-1/connect" : "/v1/connections/gmail/connect",
+      )
+      const body = JSON.parse(String(init?.body))
+      expect(body.authorizationOptionIds).toEqual(["mail.read"])
+      expect(body).not.toHaveProperty("authorizationScopes")
+      return Response.json({ data: { app: { id: "app-1", service: "gmail", status: "active", authType: "oauth2" } } })
+    })
+    vi.stubGlobal("fetch", fetcher)
+    const result = await startOAuthConnect(
+      { appId, service: "gmail", authType: "oauth2", authorizationOptionIds: ["mail.read"] },
+      managementWorkspace,
+    )
+    expect(result.app).toMatchObject({ id: "app-1", service: "gmail", status: "active" })
+    expect(result.authorizationUrl).toBeUndefined()
+  })
+
+  it.each([undefined, "app-1"])(
+    "follows Console URL precedence when OAuth also returns app metadata (app %s)",
+    async (appId) => {
+      vi.stubGlobal("fetch", async () =>
+        Response.json({
+          data: {
+            authorizationUrl: "https://accounts.example.com/oauth",
+            app: { id: "app-1", service: "gmail", status: "reauth_required", authType: "oauth2" },
+          },
+        }),
+      )
+      await expect(
+        startOAuthConnect({ appId, service: "gmail", authType: "oauth2" }, managementWorkspace),
+      ).resolves.toEqual({
+        authorizationUrl: "https://accounts.example.com/oauth",
+      })
+    },
+  )
+
+  it("rejects an OAuth response with neither a URL nor a valid app", async () => {
+    vi.stubGlobal("fetch", async () => Response.json({ data: { app: {} } }))
+    await expect(startOAuthConnect({ service: "gmail", authType: "oauth2" }, managementWorkspace)).rejects.toThrow(
+      "connected app",
+    )
+  })
+
   afterEach(() => {
     clearConnectorCache()
     vi.useRealTimers()
@@ -82,6 +129,25 @@ describe("connections-client", () => {
     await expect(
       connectProvider({ authType: "no_auth", service: "github" }, { manageable: false, teamName: "team-name" }),
     ).rejects.toThrow("Connection management is not allowed")
+    await expect(
+      setDefaultConnection("tikhub", "marketplace:oomol:tikhub", {
+        manageable: false,
+        teamName: "team-name",
+      }),
+    ).rejects.toThrow("Connection management is not allowed")
+  })
+
+  it("sets a Marketplace virtual app as the service default", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({ data: {} }))
+    vi.stubGlobal("fetch", fetchMock)
+
+    await setDefaultConnection("tikhub", "marketplace:oomol:tikhub", managementWorkspace)
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/v1/connections/services/tikhub/default")
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("PUT")
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      appId: "marketplace:oomol:tikhub",
+    })
   })
 
   it("loads connection app details through the by-id endpoint", async () => {
@@ -109,6 +175,21 @@ describe("connections-client", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it("loads Lingxing ERP users from the scoped management connection", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      Response.json({ data: [{ id: "erp-1", displayName: "Alice", status: "active" }] }),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await expect(getConnectionLingxingErpUsers("app-1", managementWorkspace)).resolves.toMatchObject({
+      data: [{ id: "erp-1", displayName: "Alice" }],
+    })
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/v1/connections/by-id/app-1/lingxing/erp-users")
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    expect(new Headers(init?.headers).get("x-oo-team-name")).toBe("team-name")
+  })
+
   it("loads the global Action catalog for a provider without a Team header", async () => {
     const fetchMock = vi.fn<typeof fetch>(async () =>
       Response.json({
@@ -127,11 +208,11 @@ describe("connections-client", () => {
     )
     vi.stubGlobal("fetch", fetchMock)
 
-    await expect(getConnectionActions("github")).resolves.toMatchObject({
+    await expect(getConnectionActions("github", {}, "zh-CN")).resolves.toMatchObject({
       data: [{ name: "list_issues", operationType: "read" }],
     })
 
-    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/v1/actions?service=github")
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/v1/actions?service=github&locale=zh-CN")
     expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).has("x-oo-team-name")).toBe(false)
   })
 
@@ -199,7 +280,7 @@ describe("connections-client", () => {
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    const summary = await getConnectionCatalogSummary({ manageable: false, teamName: "team-name" })
+    const summary = await getConnectionCatalogSummary({ manageable: false, teamName: "team-name" }, {}, "zh-CN")
 
     expect(summary.providers.map((provider) => provider.service)).toEqual(["gmail"])
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual(
@@ -207,8 +288,49 @@ describe("connections-client", () => {
     )
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/v1/usage/"))).toBe(false)
     const providerRequest = fetchMock.mock.calls.find(([url]) => String(url).includes("/v1/providers"))
+    expect(String(providerRequest?.[0])).toContain("/v1/providers?locale=zh-CN")
     const providerHeaders = new Headers(providerRequest?.[1]?.headers)
     expect(providerHeaders.has("x-oo-organization-name")).toBe(false)
+  })
+
+  it("preserves a policy-visible Marketplace app for read-only team members", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input)
+      if (url.includes("/v1/apps")) {
+        return Response.json({
+          data: [
+            {
+              authType: "marketplace",
+              connectionName: "marketplace_oomol",
+              id: "marketplace:oomol:tikhub",
+              isDefault: true,
+              marketplace: { id: "oomol", pricing: "metered" },
+              service: "tikhub",
+              status: "active",
+            },
+          ],
+        })
+      }
+      if (url.includes("/v1/providers")) {
+        return Response.json({ data: [{ authTypes: ["api_key"], displayName: "TikHub", service: "tikhub" }] })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const summary = await getConnectionCatalogSummary({ manageable: false, teamName: "read-only-team" })
+
+    expect(summary.appsStatus).toBe("ready")
+    expect(summary.providers[0]).toMatchObject({
+      appAuthType: "marketplace",
+      appCount: 1,
+      canDisconnect: false,
+      status: "connected",
+    })
+    expect(summary.providers[0]?.apps[0]).toMatchObject({
+      connectionName: "marketplace_oomol",
+      marketplace: { id: "oomol", pricing: "metered" },
+    })
   })
 
   it("loads execution logs for one connection through the by-id endpoint", async () => {
@@ -247,11 +369,12 @@ describe("connections-client", () => {
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    await expect(getConnectionProviderDetail("github")).resolves.toMatchObject({
+    await expect(getConnectionProviderDetail("github", "zh-CN")).resolves.toMatchObject({
       displayName: "GitHub",
       service: "github",
     })
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/v1/providers/github?locale=zh-CN")
     const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers)
     expect(headers.has("x-oo-organization-name")).toBe(false)
   })
@@ -354,6 +477,7 @@ describe("connections-client", () => {
       {
         authType: "oauth2",
         service: "twitter",
+        authorizationOptionIds: ["tweet.read", "users.read"],
         extra: { scopes: ["tweet.read", "users.read"] },
         secretExtra: { appBearerToken: "secret" },
       },
@@ -361,6 +485,7 @@ describe("connections-client", () => {
     )
 
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))
+    expect(body.authorizationOptionIds).toEqual(["tweet.read", "users.read"])
     expect(body.extra).toEqual({ scopes: ["tweet.read", "users.read"] })
     expect(body.secretExtra).toEqual({ appBearerToken: "secret" })
   })
@@ -552,9 +677,13 @@ describe("connections-client", () => {
 
     const first = getActiveConnectionAppIdsForService("gmail", { manageable: false, teamName: "team-name" })
     const second = getActiveConnectionAppIdsForService("gmail", { manageable: false, teamName: "team-name" })
-    resolveSecondApps(Response.json({ data: [{ id: "new-app", service: "gmail", status: "active" }] }))
+    resolveSecondApps(
+      Response.json({ data: [{ authType: "oauth2", id: "new-app", service: "gmail", status: "active" }] }),
+    )
     await expect(second).resolves.toEqual(["new-app"])
-    resolveFirstApps(Response.json({ data: [{ id: "old-app", service: "gmail", status: "active" }] }))
+    resolveFirstApps(
+      Response.json({ data: [{ authType: "oauth2", id: "old-app", service: "gmail", status: "active" }] }),
+    )
     await expect(first).resolves.toEqual(["old-app"])
 
     const summary = await getConnectionSummary({ manageable: false, teamName: "team-name" })

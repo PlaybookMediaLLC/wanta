@@ -16,8 +16,8 @@ export const llmBaseUrl = `https://llm.${ooEndpoint}/v1`
 /** 连接器网关基址，如 `https://connector.oomol.com`。 */
 export const connectorBaseUrl = `https://connector.${ooEndpoint}`
 
-/** 团队控制服务基址，如 `https://org-control.oomol.com`。 */
-export const teamControlBaseUrl = `https://org-control.${ooEndpoint}`
+/** 团队控制服务基址，如 `https://relation-control.oomol.com`。 */
+export const teamControlBaseUrl = `https://relation-control.${ooEndpoint}`
 
 /** 控制台基址，如 `https://console.oomol.com`。 */
 export const consoleBaseUrl = `https://console.${ooEndpoint}`
@@ -27,6 +27,9 @@ export const consoleServerBaseUrl = `https://console-server.${ooEndpoint}`
 
 /** 用量 / 余额查询服务基址，如 `https://insight.oomol.com`。 */
 export const insightBaseUrl = `https://insight.${ooEndpoint}`
+
+/** Full-stack website control plane. Credentials stay in the host. */
+export const spacesBaseUrl = `https://spaces.${ooEndpoint}`
 
 /** 账号 API 基址，如 `https://api.oomol.com`（登录换 token / api-key / profile）。 */
 export const apiBaseUrl = `https://api.${ooEndpoint}`
@@ -67,3 +70,9 @@ export const externalModelProviderBaseUrls = {
   xiaomiTokenSgp: "https://token-plan-sgp.xiaomimimo.com/v1",
   xiaomiTokenAms: "https://token-plan-ams.xiaomimimo.com/v1",
 } as const
+
+/** Team-scoped cloud knowledge gateway. */
+export const knowledgeBaseUrl = `https://knowledge-base.${ooEndpoint}`
+
+/** Team-scoped Open Flow workbench and notification service. */
+export const openFlowBaseUrl = `https://open-flow.${ooEndpoint}`

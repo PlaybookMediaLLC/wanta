@@ -7,15 +7,19 @@
 //   - rg：.oo-bin/（download-ripgrep.ts 下载；OpenCode 内置 grep 工具运行时从 PATH 查找）。
 //   - Direct CLI：各自的项目本地 bin 目录；同时导出与固定版本匹配的官方 Skills。
 import { chmodSync, copyFileSync, mkdirSync } from "node:fs"
+import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { EXTERNAL_OO_CONTRACT_VERSION } from "../electron/agent/external/oo-capability-contract.ts"
 import { buildAgentToolRuntime } from "./build-agent-tool-runtime.ts"
+import { bundleClaudeAgentAcp } from "./claude-agent-acp.ts"
 import { bundleCodexAcp } from "./codex-acp.ts"
 import { dingTalkCliBinaryName, downloadDingTalkCliBinary, exportDingTalkCliSkills } from "./dingtalk-cli.ts"
 import { downloadLarkCliBinary, exportLarkCliSkills, larkCliBinaryName } from "./lark-cli.ts"
-import { downloadOoBinary, ooExecutableName } from "./oo-cli.ts"
+import { downloadOoBinary, ooExecutableName, OO_CLI_VERSION } from "./oo-cli.ts"
 import { downloadRipgrepBinary, ripgrepExecutableName } from "./ripgrep.ts"
-import { bundledSkillsDir, exportBundledSkills } from "./skills.ts"
+import { bundledOoSkillHashes, bundledSkillsDir, exportBundledSkills, verifyBundledOoSkillLock } from "./skills.ts"
+import { downloadSpacesBinary } from "./spaces-cli.ts"
 import { downloadWecomCliBinary, exportWecomCliSkills, wecomCliBinaryName } from "./wecom-cli.ts"
 
 const dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -45,6 +49,11 @@ bundle(
 const bundledCodexAcp = bundleCodexAcp(binDir, platform)
 console.log(`[wanta] bundled codex-acp: ${path.basename(bundledCodexAcp.entryPath)}@${bundledCodexAcp.version}`)
 
+const bundledClaudeAgentAcp = await bundleClaudeAgentAcp(binDir, platform)
+console.log(
+  `[wanta] bundled claude-agent-acp: ${path.basename(bundledClaudeAgentAcp.entryPath)}@${bundledClaudeAgentAcp.version}`,
+)
+
 // oo 不再依赖 node_modules：确保 .oo-bin/ 已就绪（缺失则下载当前平台的二进制）后复制。
 const ooSrc = await downloadOoBinary()
 bundle("oo", ooSrc, ooExecutableName())
@@ -68,9 +77,26 @@ bundle("DingTalk CLI", dingTalkCliSrc, dingTalkCliBinaryName())
 await exportDingTalkCliSkills()
 console.log("[wanta] bundled DingTalk CLI skills")
 
+const spacesBinary = await downloadSpacesBinary()
+if (spacesBinary) bundle("Spaces runtime", spacesBinary, "spaces")
+
 // 内置 4 个 oo skill：导出到 resources/skills/，由 electron-builder extraResources 打入 Resources/skills，
 // 运行时拷进 OpenCode workspace 的 .opencode/skill/（见 electron/agent/workspace.ts）。
 await exportBundledSkills()
+await verifyBundledOoSkillLock()
+await writeFile(
+  path.join(binDir, "oo-runtime-integrity.json"),
+  `${JSON.stringify(
+    {
+      contractVersion: EXTERNAL_OO_CONTRACT_VERSION,
+      files: await bundledOoSkillHashes(),
+      ooCliVersion: OO_CLI_VERSION,
+    },
+    null,
+    2,
+  )}\n`,
+  "utf8",
+)
 console.log(`[wanta] bundled skills: ${path.basename(bundledSkillsDir)}`)
 
 // 自定义工具的 tool helper + Zod 合并为单文件，随包发布，工具加载不依赖首次启动隐式联网安装 npm 包。

@@ -11,9 +11,10 @@ import type {
 } from "../../../electron/chat/common.ts"
 import type { ChatErrorKind } from "../../../electron/chat/error.ts"
 import type { ConnectionProvider } from "../../../electron/connections/common.ts"
-import type { KnowledgeBaseSummary } from "../../../electron/knowledge/common.ts"
+import type { KnowledgeHit } from "../../../electron/knowledge/common.ts"
 import type { ConnectionCatalogFilter } from "../Connections/connection-route-model.ts"
 import type { ChatTurnRetrySource } from "./chat-turns.ts"
+import type { ComposerDraftBinding } from "./composer-draft-store.ts"
 import type { ComposerState } from "./composer-state.ts"
 import type { EmptyStateConnectionSummary } from "./empty-state-connections.ts"
 import type { QuestionDraftStore } from "./question-fields.ts"
@@ -38,8 +39,13 @@ import { ErrorNotice } from "@/components/ErrorNotice"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useT } from "@/i18n/i18n"
 import { cn } from "@/lib/utils"
+import { KnowledgeNavigationContext } from "@/routes/Knowledge/navigation"
 
 interface ChatAreaProps {
+  compact?: boolean
+  knowledgeTeamId?: string
+  knowledgeRequired?: boolean
+  onOpenKnowledgeSource?: (hit: KnowledgeHit) => void
   activeSessionId: string | null
   agentKind?: AgentKind
   agentModesEnabled?: boolean
@@ -53,11 +59,6 @@ interface ChatAreaProps {
   onSelectAgentKind?: (kind: AgentKind) => void
   voiceEnabled?: boolean
   messages: ChatMessage[]
-  knowledgeBaseIds: string[]
-  knowledgeEnabled: boolean
-  knowledgeError: string | null
-  knowledgeItems: KnowledgeBaseSummary[]
-  knowledgeLoading: boolean
   modelRequired?: boolean
   permissionMode: AgentPermissionMode
   pendingPermissions: ChatPermissionRequest[]
@@ -74,6 +75,7 @@ interface ChatAreaProps {
   historyScope: string
   submitDisabled: boolean
   willQueueMessage: boolean
+  draftBinding?: ComposerDraftBinding
   initialComposerState?: ComposerState
   initialSendPending: boolean
   providers: ConnectionProvider[]
@@ -81,7 +83,6 @@ interface ChatAreaProps {
   queuedMessages: QueuedChatMessage[]
   placeholder: string
   contextBar?: React.ReactNode
-  pinnedContextBar?: React.ReactNode
   emptyStateConnectionSummary?: EmptyStateConnectionSummary | null
   canManageWorkspaceConnections: boolean
   teamSkillEntryVisible?: boolean
@@ -99,7 +100,7 @@ interface ChatAreaProps {
   onSelectAgentModel?: (modelId?: string) => void
   onSelectAgentEffort?: (effortId?: string) => void
   onAnswerQuestion: (requestId: string, answers: string[][]) => Promise<void>
-  onAnswerPermission: (requestId: string, reply: ChatPermissionReply) => Promise<void>
+  onAnswerPermission: (requestId: string, reply: ChatPermissionReply, optionId?: string) => Promise<void>
   onRejectQuestion: (requestId: string) => Promise<void>
   questionDrafts: QuestionDraftStore
   onStop: () => Promise<void> | void
@@ -116,10 +117,8 @@ interface ChatAreaProps {
   onTurnOutputAvailable: (selection: TurnOutputSelection) => void
   onOpenConnections?: (filter?: ConnectionCatalogFilter) => void
   onOpenConnectionProvider?: (service: string, displayName: string) => void
-  onOpenKnowledgeLibrary?: () => void
   onOpenTeams?: () => void
   onViewBilling?: () => void
-  onSelectKnowledgeBase: (id: string) => void
 }
 
 const CHAT_CONTENT_MAX_WIDTH_CLASS = "min-w-0 max-w-[50rem]"
@@ -256,6 +255,10 @@ function EmptyCapabilityAction({
 }
 
 export const ChatArea = React.memo(function ChatArea({
+  compact = false,
+  knowledgeTeamId,
+  knowledgeRequired = false,
+  onOpenKnowledgeSource,
   activeSessionId,
   agentKind = "opencode",
   agentModesEnabled = true,
@@ -269,11 +272,6 @@ export const ChatArea = React.memo(function ChatArea({
   onSelectAgentKind,
   voiceEnabled = false,
   messages,
-  knowledgeBaseIds,
-  knowledgeEnabled,
-  knowledgeError,
-  knowledgeItems,
-  knowledgeLoading,
   modelRequired = false,
   permissionMode,
   pendingPermissions,
@@ -290,6 +288,7 @@ export const ChatArea = React.memo(function ChatArea({
   historyScope,
   submitDisabled,
   willQueueMessage,
+  draftBinding,
   initialComposerState,
   initialSendPending,
   providers,
@@ -302,7 +301,6 @@ export const ChatArea = React.memo(function ChatArea({
   queuedMessages,
   placeholder,
   contextBar,
-  pinnedContextBar,
   teamSkills,
   selfManagedSetup,
   onComposerStateChange,
@@ -329,10 +327,8 @@ export const ChatArea = React.memo(function ChatArea({
   onTurnOutputAvailable,
   onOpenConnections,
   onOpenConnectionProvider,
-  onOpenKnowledgeLibrary,
   onOpenTeams,
   onViewBilling,
-  onSelectKnowledgeBase,
 }: ChatAreaProps) {
   const t = useT()
   const [fullAccessDialogOpen, setFullAccessDialogOpen] = React.useState(false)
@@ -358,9 +354,11 @@ export const ChatArea = React.memo(function ChatArea({
     setFullAccessDialogOpen(false)
   }, [onPermissionModeChange])
 
-  const showCenteredEmptyState = showEmptyState && !hasMessages && !isGenerating
+  const showCenteredEmptyState = !compact && showEmptyState && !hasMessages && !isGenerating
   const composer = (
     <ChatComposer
+      knowledgeTeamId={knowledgeTeamId}
+      knowledgeRequired={knowledgeRequired}
       key={composerDraftKey}
       agentKind={agentKind}
       agentEffortId={agentEffortId}
@@ -378,13 +376,9 @@ export const ChatArea = React.memo(function ChatArea({
       generatedArtifacts={generatedArtifacts}
       hasMessages={hasMessages}
       historyScope={historyScope}
+      draftBinding={draftBinding}
       initialComposerState={initialComposerState}
       messages={messages}
-      knowledgeBaseIds={knowledgeBaseIds}
-      knowledgeEnabled={knowledgeEnabled}
-      knowledgeError={knowledgeError}
-      knowledgeItems={knowledgeItems}
-      knowledgeLoading={knowledgeLoading}
       modelRequired={modelRequired}
       permissionMode={permissionMode}
       pendingQuestions={pendingQuestions}
@@ -406,9 +400,7 @@ export const ChatArea = React.memo(function ChatArea({
       onPermissionModeSelect={onPermissionModeChange}
       onPermissionModeFullAccess={requestFullAccess}
       onOpenConnectionProvider={onOpenConnectionProvider}
-      onOpenKnowledgeLibrary={onOpenKnowledgeLibrary}
       selfManagedSetup={selfManagedSetup}
-      onSelectKnowledgeBase={onSelectKnowledgeBase}
       onStop={onStop}
       onViewBilling={onViewBilling}
     />
@@ -444,7 +436,6 @@ export const ChatArea = React.memo(function ChatArea({
           <h2 className="oo-text-empty-title mx-auto max-w-2xl">{emptyTitle ?? t("chat.emptyTitle")}</h2>
         </div>
         <div className="flex flex-col gap-3">
-          {pinnedContextBar}
           {composer}
           <EmptyStateActions
             canManageWorkspaceConnections={canManageWorkspaceConnections}
@@ -488,11 +479,12 @@ export const ChatArea = React.memo(function ChatArea({
     <BillingRequestScopeContext.Provider value={billingRequestScope}>
       <div className="flex h-full min-h-0 w-full min-w-0 overflow-hidden">
         <div className="flex min-w-0 flex-1 flex-col pb-4">
-          <div className="flex min-h-0 flex-1 overflow-hidden">{content}</div>
+          <KnowledgeNavigationContext.Provider value={onOpenKnowledgeSource ?? null}>
+            <div className="flex min-h-0 flex-1 overflow-hidden">{content}</div>
+          </KnowledgeNavigationContext.Provider>
 
           {showCenteredEmptyState ? null : (
             <div className={cn("mx-auto flex w-full flex-col gap-2 px-4", CHAT_CONTENT_MAX_WIDTH_CLASS)}>
-              {pinnedContextBar}
               {composer}
             </div>
           )}

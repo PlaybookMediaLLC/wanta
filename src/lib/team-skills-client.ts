@@ -99,7 +99,10 @@ function compareTeamSkills(left: TeamSkillConfigItem, right: TeamSkillConfigItem
 
 export function normalizeTeamSkillPackages(value: unknown): TeamSkillConfig {
   const payload = asPlainObject(value)
-  const rawPackages = Array.isArray(payload?.["data"]) ? payload["data"] : []
+  if (!Array.isArray(payload?.["data"])) {
+    throw new Error("Team Skill list returned an unsupported response.")
+  }
+  const rawPackages = payload["data"]
   return {
     skills: rawPackages
       .flatMap((entry, packageIndex) => normalizeTeamSkillPackage(entry, packageIndex))
@@ -200,11 +203,10 @@ export function teamSkillMentionId(skill: Pick<TeamSkillConfigItem, "id" | "pack
   return `team:${skill.id || `${skill.packageName}:${skill.skillName}`}`
 }
 
-export async function listTeamSkills(teamId: string): Promise<TeamSkillConfig> {
-  const response = await oomolFetchJson<TeamSkillPackageResponse>(
-    new URL(`/-/oomol/orgs/${encodeURIComponent(teamId.trim())}/package-infos`, registryBaseUrl),
-    { timeoutMs: teamSkillRequestTimeoutMs },
-  )
+export async function listTeamSkills(teamId: string, signal?: AbortSignal, lang?: string): Promise<TeamSkillConfig> {
+  const url = new URL(`/-/oomol/orgs/${encodeURIComponent(teamId.trim())}/package-infos`, registryBaseUrl)
+  if (lang) url.searchParams.set("lang", lang)
+  const response = await oomolFetchJson<TeamSkillPackageResponse>(url, { signal, timeoutMs: teamSkillRequestTimeoutMs })
   return normalizeTeamSkillPackages(response)
 }
 

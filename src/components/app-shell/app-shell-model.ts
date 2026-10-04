@@ -168,6 +168,11 @@ export interface ChatSendRequest {
   afterOptimisticSubmit?: () => void
   attachments?: ChatAttachment[]
   contextMentions?: ChatContextMention[]
+  /** Knowledge-library entry starts a distinct analysis task. */
+  startNewSession?: boolean
+  knowledgeMode?: boolean
+  /** Keep the knowledge workspace visible while its analysis task starts. */
+  stayOnKnowledge?: boolean
   mode?: AgentMode
   model?: ModelChoice
   teamSkills?: ChatTeamSkillContext[]
@@ -287,10 +292,11 @@ export function createQueuedChatMessage(
 export function initialRoute(): Route {
   const configuredRoute = (import.meta.env as Record<string, string | undefined>)["VITE_WANTA_ROUTE"]
   const route = configuredRoute === "organizations" ? "teams" : configuredRoute
-  return route === "settings" ||
+  return route === "knowledge" ||
+    route === "flows" ||
+    route === "settings" ||
     route === "connections" ||
     route === "skills" ||
-    route === "knowledge" ||
     route === "teams" ||
     route === "billing" ||
     route === "archived"
@@ -299,7 +305,7 @@ export function initialRoute(): Route {
 }
 
 export function routeAvailableForRuntime(route: Route, cloudEnabled: boolean): boolean {
-  return cloudEnabled || (route !== "billing" && route !== "teams")
+  return cloudEnabled || (route !== "billing" && route !== "teams" && route !== "knowledge" && route !== "flows")
 }
 
 export function authorizationHandlingForLinkRuntime(runtime: ActiveLinkRuntime): "connections" | "drawer" | "external" {

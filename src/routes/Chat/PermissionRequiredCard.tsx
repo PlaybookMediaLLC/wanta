@@ -1,22 +1,16 @@
-import type { ChatPermissionRequest } from "../../../electron/chat/common.ts"
-import type { PermissionRequestKind } from "./permission-request.ts"
+import type { ChatPermissionRequest, NativePermissionOption } from "../../../electron/chat/common.ts"
 
-import { FolderLock, ShieldAlert, Terminal, X } from "lucide-react"
+import { ChevronDown, FolderLock, RotateCw, ShieldAlert } from "lucide-react"
 import * as React from "react"
 import { toast } from "sonner"
-import {
-  isHighRiskPermissionRequest,
-  isLikelyProjectDevCommandRequest,
-  isPythonDependencyPermissionRequest,
-  managedPythonDependencyInstall,
-  permissionCommand,
-  permissionRequestHasSensitiveResource,
-  permissionPrimaryResource,
-  permissionRequestKind,
-} from "./permission-request.ts"
+import { permissionPresentation, permissionTargetLabel } from "./permission-presentation.ts"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
+import { Field, FieldLabel } from "@/components/ui/field"
 import { useT } from "@/i18n/i18n"
 import { reportRendererHandledError } from "@/lib/renderer-diagnostics"
+import { cn } from "@/lib/utils"
 
 interface PermissionRequiredCardProps {
   busy?: boolean
@@ -24,6 +18,7 @@ interface PermissionRequiredCardProps {
   onAllowOnce: (requestId: string) => Promise<void>
   onAllowForSession: (requestId: string) => Promise<void>
   onReject: (requestId: string) => Promise<void>
+  onSelectNativeOption?: (requestId: string, option: NativePermissionOption) => Promise<void>
 }
 
 export function PermissionRequiredCard({
@@ -32,122 +27,47 @@ export function PermissionRequiredCard({
   onAllowOnce,
   onAllowForSession,
   onReject,
+  onSelectNativeOption,
+}: PermissionRequiredCardProps) {
+  // A new request must never inherit a checked grant or a pending reply.
+  return (
+    <PermissionCardContent
+      key={`${request.sessionId}:${request.id}`}
+      {...{ busy, request, onAllowOnce, onAllowForSession, onReject, onSelectNativeOption }}
+    />
+  )
+}
+
+function PermissionCardContent({
+  busy = false,
+  request,
+  onAllowOnce,
+  onAllowForSession,
+  onReject,
+  onSelectNativeOption,
 }: PermissionRequiredCardProps) {
   const t = useT()
+  const presentation = permissionPresentation(request)
   const [submitting, setSubmitting] = React.useState(false)
+  const replyInFlight = React.useRef(false)
+  const [remember, setRemember] = React.useState(false)
+  const [detailsOpen, setDetailsOpen] = React.useState(presentation.detailsOpen)
+  const titleId = React.useId()
+  const rememberId = React.useId()
   const disabled = busy || submitting
-  const kind = permissionRequestKind(request)
-  const highRisk = isHighRiskPermissionRequest(request)
-  const resource = kind === "command" ? permissionCommand(request) : permissionPrimaryResource(request)
-  const projectDevCommand = kind === "command" && isLikelyProjectDevCommandRequest(request)
-  const pythonDependencyInstall = managedPythonDependencyInstall(request)
-  const pythonDependencyRequest = isPythonDependencyPermissionRequest(request)
-  const sensitiveResource = permissionRequestHasSensitiveResource(request)
-  const promptReason = request.wanta?.promptReason
-  const taskScopedDependencyInstall = Boolean(pythonDependencyInstall && !sensitiveResource)
-  const canAllowForSession = Boolean(
-    (!highRisk || taskScopedDependencyInstall) &&
-    !sensitiveResource &&
-    (request.save?.length || request.resources.length || (kind === "command" && resource)),
-  )
-  const Icon = kind === "command" ? Terminal : kind === "path" || kind === "edit" ? FolderLock : ShieldAlert
-  const copyByKind: Record<
-    PermissionRequestKind,
-    { allowForSessionLabel: string; description: string; title: string }
-  > = {
-    command: {
-      allowForSessionLabel: projectDevCommand
-        ? t("chat.permissionRequiredAllowProjectDevSession")
-        : t("chat.permissionRequiredAllowCommandSession"),
-      description: t("chat.permissionCommandDescription", { command: resource ?? request.action }),
-      title: t("chat.permissionCommandTitle"),
-    },
-    edit: {
-      allowForSessionLabel: t("chat.permissionRequiredAllowEditSession"),
-      description: t("chat.permissionEditDescription", { path: resource ?? request.action }),
-      title: t("chat.permissionEditTitle"),
-    },
-    local: {
-      allowForSessionLabel: t("chat.permissionRequiredAllowSession"),
-      description: t("chat.permissionRequiredDescription"),
-      title: t("chat.permissionRequiredTitle"),
-    },
-    network: {
-      allowForSessionLabel: t("chat.permissionRequiredAllowSession"),
-      description: t("chat.permissionRequiredDescription"),
-      title: t("chat.permissionRequiredTitle"),
-    },
-    path: {
-      allowForSessionLabel: t("chat.permissionRequiredAllowPathSession"),
-      description: t("chat.permissionPathDescription", { path: resource ?? request.action }),
-      title: t("chat.permissionPathTitle"),
-    },
-  }
-  const copy = request.wanta?.automaticReplyFailed
-    ? {
-        ...copyByKind[kind],
-        description: t("chat.permissionAutomaticReplyFailedDescription", {
-          operation: resource ?? request.action,
-        }),
-        title: t("chat.permissionAutomaticReplyFailedTitle"),
-      }
-    : sensitiveResource
-      ? {
-          ...copyByKind[kind],
-          description: t("chat.permissionSensitiveDataDescription", { resource: resource ?? request.action }),
-          title: t("chat.permissionSensitiveDataTitle"),
-        }
-      : pythonDependencyInstall
-        ? {
-            ...copyByKind.command,
-            allowForSessionLabel: t("chat.permissionRequiredAllowPythonDependenciesTask"),
-            description: t("chat.permissionPythonDependencyDescription", {
-              packages: pythonDependencyInstall.packages.join(", "),
-            }),
-            title: t("chat.permissionPythonDependencyTitle"),
-          }
-        : highRisk
-          ? {
-              ...copyByKind[kind],
-              description: t("chat.permissionHighRiskDescription", { command: resource ?? request.action }),
-              title: t("chat.permissionHighRiskTitle"),
-            }
-          : pythonDependencyRequest
-            ? {
-                ...copyByKind.command,
-                description: t("chat.permissionPythonDependencyBoundaryDescription", {
-                  command: resource ?? request.action,
-                }),
-                title: t("chat.permissionPythonDependencyTitle"),
-              }
-            : promptReason === "broad_resource"
-              ? {
-                  ...copyByKind[kind],
-                  description: t("chat.permissionBroadAccessDescription", {
-                    resource: resource ?? request.action,
-                  }),
-                  title: t("chat.permissionBroadAccessTitle"),
-                }
-              : promptReason === "dependency_mutation"
-                ? {
-                    ...copyByKind.command,
-                    description: t("chat.permissionDependencyBoundaryDescription", {
-                      command: resource ?? request.action,
-                    }),
-                    title: t("chat.permissionDependencyBoundaryTitle"),
-                  }
-                : copyByKind[kind]
-  React.useEffect(() => {
-    setSubmitting(false)
-  }, [request.id])
+  const Icon = presentation.caution ? ShieldAlert : presentation.recovery ? RotateCw : FolderLock
   const handleReply = React.useCallback(
-    async (reply: "once" | "always" | "reject"): Promise<void> => {
-      if (disabled) {
+    async (reply: "once" | "always" | "reject", option?: NativePermissionOption): Promise<void> => {
+      if (disabled || replyInFlight.current) {
         return
       }
+      replyInFlight.current = true
       setSubmitting(true)
       try {
-        if (reply === "once") {
+        if (option) {
+          if (!onSelectNativeOption) throw new Error("Native permission handler unavailable")
+          await onSelectNativeOption(request.id, option)
+        } else if (reply === "once") {
           await onAllowOnce(request.id)
         } else if (reply === "always") {
           await onAllowForSession(request.id)
@@ -155,54 +75,140 @@ export function PermissionRequiredCard({
           await onReject(request.id)
         }
       } catch (error) {
+        replyInFlight.current = false
         setSubmitting(false)
         reportRendererHandledError("chat", "permission reply failed", error)
         toast.error(t("chat.permissionSubmitFailed"))
       }
     },
-    [disabled, onAllowForSession, onAllowOnce, onReject, request.id, t],
+    [disabled, onAllowForSession, onAllowOnce, onReject, onSelectNativeOption, request.id, t],
   )
   return (
-    <section className="rounded-lg border border-border bg-background p-3 shadow-sm">
+    <section aria-labelledby={titleId} className="rounded-lg border border-border bg-background p-4 shadow-sm">
       <div className="flex items-start gap-3">
-        <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-[var(--oo-warning-foreground)]">
-          <Icon className="size-4" />
+        <div
+          className={cn(
+            "flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground",
+            presentation.caution && "text-[var(--oo-warning-foreground)]",
+          )}
+        >
+          <Icon className="size-4" aria-hidden="true" />
         </div>
-        <div className="min-w-0 flex-1 space-y-3">
-          <div className="min-w-0">
-            <h3 className="oo-text-label font-medium">{copy.title}</h3>
-            <p className="oo-text-caption break-words whitespace-pre-line text-muted-foreground">{copy.description}</p>
+        <div className="flex min-w-0 flex-1 flex-col gap-3">
+          <div className="flex min-w-0 flex-col gap-1">
+            <h3 id={titleId} className="oo-text-label font-medium">
+              {request.nativeOptions ? request.action : t(presentation.title)}
+            </h3>
+            <p className="oo-text-body break-words text-muted-foreground">
+              {t(request.nativeOptions ? "permissionPrompt.nativeBody" : presentation.description)}
+            </p>
           </div>
+          {presentation.targets.length > 0 ? (
+            <div className="flex min-w-0 flex-col gap-1">
+              <p className="oo-text-caption text-muted-foreground">{t("permissionPrompt.targets")}</p>
+              <ul className="flex min-w-0 flex-col gap-1">
+                {presentation.targets.map((target) => {
+                  const label = permissionTargetLabel(target)
+                  return (
+                    <li key={target} className="oo-text-caption flex min-w-0 flex-col break-all whitespace-pre-wrap">
+                      <span>{label.name}</span>
+                      {label.location ? <span className="text-muted-foreground">{label.location}</span> : null}
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          ) : null}
+          <Collapsible open={detailsOpen} onOpenChange={setDetailsOpen}>
+            <CollapsibleTrigger asChild>
+              <Button variant="ghost" size="sm" type="button">
+                <ChevronDown aria-hidden="true" className={cn(detailsOpen && "rotate-180")} />
+                {t("permissionPrompt.details")}
+              </Button>
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="mt-2 flex min-w-0 flex-col gap-2 rounded-md bg-muted p-3">
+                <p className="oo-text-caption break-all">{request.action}</p>
+                {presentation.command ? (
+                  <pre className="oo-text-caption break-all whitespace-pre-wrap">{presentation.command}</pre>
+                ) : null}
+                {presentation.targets.map((resource, index) => (
+                  <p key={index} className="oo-text-caption break-all whitespace-pre-wrap">
+                    {resource}
+                  </p>
+                ))}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+          {!request.nativeOptions && presentation.repeat ? (
+            <Field orientation="horizontal">
+              <Checkbox
+                id={rememberId}
+                checked={remember}
+                disabled={disabled}
+                onCheckedChange={(checked) => setRemember(checked === true)}
+              />
+              <FieldLabel htmlFor={rememberId}>{t(presentation.repeat)}</FieldLabel>
+            </Field>
+          ) : null}
+          {!request.nativeOptions && remember && presentation.repeat && presentation.grantPatterns.length > 0 ? (
+            <div className="flex min-w-0 flex-col gap-1">
+              <p className="oo-text-caption text-muted-foreground">{t("permissionPrompt.scope")}</p>
+              {presentation.grantPatterns.map((pattern, index) => (
+                <p key={index} className="oo-text-caption break-all whitespace-pre-wrap">
+                  {pattern}
+                </p>
+              ))}
+            </div>
+          ) : null}
           <div className="flex flex-wrap gap-2">
-            {taskScopedDependencyInstall ? (
+            {request.nativeOptions ? (
               <>
-                <Button size="sm" onClick={() => void handleReply("always")} disabled={disabled}>
-                  <Terminal className="size-4" />
-                  {copy.allowForSessionLabel}
-                </Button>
-                <Button size="sm" variant="outline" onClick={() => void handleReply("once")} disabled={disabled}>
-                  <ShieldAlert className="size-4" />
-                  {t("chat.permissionRequiredAllowOnce")}
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button size="sm" onClick={() => void handleReply("once")} disabled={disabled}>
-                  <ShieldAlert className="size-4" />
-                  {t("chat.permissionRequiredAllowOnce")}
-                </Button>
-                {canAllowForSession ? (
-                  <Button size="sm" variant="outline" onClick={() => void handleReply("always")} disabled={disabled}>
-                    <Icon className="size-4" />
-                    {copy.allowForSessionLabel}
+                {request.nativeOptions.map((option) => (
+                  <Button
+                    key={option.optionId}
+                    size="sm"
+                    type="button"
+                    variant={option.kind.startsWith("reject") ? "outline" : "default"}
+                    disabled={disabled || !onSelectNativeOption}
+                    onClick={() => void handleReply(option.kind.startsWith("reject") ? "reject" : "once", option)}
+                  >
+                    {option.name}
+                  </Button>
+                ))}
+                {request.nativeOptions.length === 0 ? (
+                  <Button
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                    disabled={disabled}
+                    onClick={() => void handleReply("reject")}
+                  >
+                    {t("chat.permissionRequiredReject")}
                   </Button>
                 ) : null}
               </>
+            ) : (
+              <>
+                <Button
+                  size="sm"
+                  type="button"
+                  onClick={() => void handleReply(remember && presentation.repeat ? "always" : "once")}
+                  disabled={disabled}
+                >
+                  {t(presentation.allow)}
+                </Button>
+                <Button
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                  onClick={() => void handleReply("reject")}
+                  disabled={disabled}
+                >
+                  {t("chat.permissionRequiredReject")}
+                </Button>
+              </>
             )}
-            <Button size="sm" variant="outline" onClick={() => void handleReply("reject")} disabled={disabled}>
-              <X className="size-4" />
-              {t("chat.permissionRequiredReject")}
-            </Button>
           </div>
         </div>
       </div>

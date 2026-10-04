@@ -2,8 +2,9 @@ import type { AuthorizationInfo, ChatMessagePart } from "../../../electron/chat/
 import type { TranslateFn } from "@/i18n/i18n"
 
 import { parseAuthorizationSignal } from "../../../electron/chat/authorization-signal.ts"
+import { parseConnectorCliInvocation } from "./connector-cli.ts"
+import { parseManagedOoCliInvocation } from "./managed-oo-cli.ts"
 import { compactPathDetail, compactToolDetail } from "./tool-activity.ts"
-import { isWgKnowledgeShellCommand } from "./wg-shell-detection.ts"
 
 export type ToolDisplayDetailKind = "code" | "text"
 
@@ -24,7 +25,7 @@ export function parseToolAuthorization(part: ChatMessagePart): AuthorizationInfo
   if (part.status !== "completed") {
     return null
   }
-  if (part.tool === "call_action") {
+  if (part.tool === "call_action" || parseConnectorCliInvocation(str(part.input?.command))?.operation === "run") {
     return parseAuthorizationSignal(part.output)
   }
   return null
@@ -129,64 +130,38 @@ function questionDetail(input: Record<string, unknown>): string {
   return str(first?.header) || str(first?.question)
 }
 
-function knowledgeOperation(input: Record<string, unknown>): string {
-  return str(input.operation)
-}
-
-function knowledgeOperationTitle(t: TranslateFn, input: Record<string, unknown>): string {
-  switch (knowledgeOperation(input)) {
-    case "inspect":
-      return t("chat.toolKnowledgeInspectGeneric")
-    case "related":
-      return t("chat.toolKnowledgeRelatedGeneric")
-    case "evidence":
-      return t("chat.toolKnowledgeEvidenceGeneric")
-    case "pack":
-      return t("chat.toolKnowledgePackGeneric")
-    case "search":
-    default:
-      return t("chat.toolKnowledgeSearchGeneric")
-  }
-}
-
-function knowledgeOperationSummary(t: TranslateFn, input: Record<string, unknown>): string {
-  const query = str(input.query)
-  const detail = query ? compactToolDetail(query) : ""
-  switch (knowledgeOperation(input)) {
-    case "inspect":
-      return t("chat.toolKnowledgeInspectGeneric")
-    case "related":
-      return detail ? t("chat.toolKnowledgeRelated", { detail }) : t("chat.toolKnowledgeRelatedGeneric")
-    case "evidence":
-      return detail ? t("chat.toolKnowledgeEvidence", { detail }) : t("chat.toolKnowledgeEvidenceGeneric")
-    case "pack":
-      return t("chat.toolKnowledgePackGeneric")
-    case "search":
-    default:
-      return detail ? t("chat.toolKnowledgeSearch", { detail }) : t("chat.toolKnowledgeSearchGeneric")
-  }
-}
-
-export function isWgKnowledgeBashPart(part: ChatMessagePart): boolean {
-  if (part.tool !== "bash") {
-    return false
-  }
-  return isWgKnowledgeShellCommand(str(part.input?.command))
-}
-
-export function isWikigraphKnowledgeSkillPart(part: ChatMessagePart): boolean {
-  return Boolean(part.title?.match(/^\s*Loaded\s+skill\s*:\s*wikigraph-knowledge\s*$/iu))
-}
-
-export function isWikigraphKnowledgeActivityPart(part: ChatMessagePart): boolean {
-  return isWgKnowledgeBashPart(part) || isWikigraphKnowledgeSkillPart(part)
-}
-
 export function toolDisplayLine(t: TranslateFn, part: ChatMessagePart): ToolDisplayLine {
   const input = part.input ?? {}
   const fallbackDetail = part.title || part.tool || "tool"
-  if (isWikigraphKnowledgeActivityPart(part)) {
-    return { title: t("chat.toolBashQueryKnowledge") }
+  const managedOo = parseManagedOoCliInvocation(str(input.command))
+  if (managedOo) {
+    const title =
+      managedOo.domain === "file"
+        ? managedOo.operation === "upload"
+          ? t("chat.toolUploadFile")
+          : t("chat.toolDownloadFile")
+        : managedOo.operation.startsWith("run")
+          ? t("chat.toolRunFlow")
+          : managedOo.operation.startsWith("publish")
+            ? t("chat.toolPublishFlow")
+            : t("chat.toolManageFlow")
+    return {
+      title,
+      ...(managedOo.detail ? { detail: compactToolDetail(managedOo.detail), detailKind: "text" as const } : {}),
+    }
+  }
+  const cli = parseConnectorCliInvocation(str(input.command))
+  if (cli) {
+    const detail = [cli.service, cli.action ?? cli.query].filter(Boolean).join(" · ")
+    const title =
+      cli.operation === "run"
+        ? t("chat.toolCallGeneric")
+        : cli.operation === "schema"
+          ? t("chat.toolInspectGeneric")
+          : cli.operation === "apps"
+            ? t("chat.toolListAppsGeneric")
+            : t("chat.toolSearchGeneric")
+    return { title, ...(detail ? { detail, detailKind: "text" as const } : {}) }
   }
   switch (part.tool) {
     case "list_apps": {
@@ -215,13 +190,6 @@ export function toolDisplayLine(t: TranslateFn, part: ChatMessagePart): ToolDisp
       return {
         title: t("chat.toolCallGeneric"),
         ...(target ? { detail: target, detailKind: "text" } : {}),
-      }
-    }
-    case "query_knowledge": {
-      const query = str(input.query)
-      return {
-        title: knowledgeOperationTitle(t, input),
-        ...(query ? { detail: compactToolDetail(query), detailKind: "text" } : {}),
       }
     }
     case "bash": {
@@ -303,12 +271,36 @@ export function toolDisplayLine(t: TranslateFn, part: ChatMessagePart): ToolDisp
 }
 
 /** 工具调用的一行人话动作摘要；原始命令只放在详情里。 */
+/** Remove live secrets that must not appear in expandable tool parameters. */
+export function toolDisplayInput(part: ChatMessagePart): Record<string, unknown> | undefined {
+  const input = part.input
+  if (!input) return undefined
+  const managedOo = parseManagedOoCliInvocation(str(input.command))
+  if (managedOo?.domain !== "file" || managedOo.operation !== "download") return input
+  const { command: _signedDownloadCommand, ...safeInput } = input
+  return Object.keys(safeInput).length > 0 ? safeInput : undefined
+}
+
 export function toolActionSummary(t: TranslateFn, part: ChatMessagePart): string {
   const input = part.input ?? {}
   const target = connectorTarget(input)
   const fallbackDetail = part.title || part.tool || "tool"
-  if (isWikigraphKnowledgeActivityPart(part)) {
-    return t("chat.toolBashQueryKnowledge")
+  const managedOo = parseManagedOoCliInvocation(str(input.command))
+  if (managedOo) {
+    if (managedOo.domain === "file") {
+      return managedOo.operation === "upload" ? t("chat.toolUploadFile") : t("chat.toolDownloadFile")
+    }
+    if (managedOo.operation.startsWith("run")) return t("chat.toolRunFlow")
+    if (managedOo.operation.startsWith("publish")) return t("chat.toolPublishFlow")
+    return t("chat.toolManageFlow")
+  }
+  const cli = parseConnectorCliInvocation(str(input.command))
+  if (cli) {
+    const detail = [cli.service, cli.action ?? cli.query].filter(Boolean).join(" · ")
+    if (cli.operation === "run") return detail ? t("chat.toolCall", { detail }) : t("chat.toolCallGeneric")
+    if (cli.operation === "schema") return detail ? t("chat.toolInspect", { detail }) : t("chat.toolInspectGeneric")
+    if (cli.operation === "apps") return t("chat.toolListAppsGeneric")
+    return detail ? t("chat.toolSearch", { detail }) : t("chat.toolSearchGeneric")
   }
   switch (part.tool) {
     case "list_apps": {
@@ -323,8 +315,6 @@ export function toolActionSummary(t: TranslateFn, part: ChatMessagePart): string
       return target ? t("chat.toolInspect", { detail: target }) : t("chat.toolInspectGeneric")
     case "call_action":
       return target ? t("chat.toolCall", { detail: target }) : t("chat.toolCallGeneric")
-    case "query_knowledge":
-      return knowledgeOperationSummary(t, input)
     case "bash": {
       const command = str(input.command).split("\n")[0]
       return command ? bashActionSummary(t, command) : t("chat.toolRunGeneric")

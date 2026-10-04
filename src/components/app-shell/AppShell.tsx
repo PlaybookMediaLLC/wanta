@@ -6,7 +6,7 @@ import type {
   ChatPermissionReply,
 } from "../../../electron/chat/common.ts"
 import type { ChatErrorKind } from "../../../electron/chat/error.ts"
-import type { KnowledgeBaseSummary } from "../../../electron/knowledge/common.ts"
+import type { KnowledgeHit } from "../../../electron/knowledge/common.ts"
 import type { SessionInfo, SessionScope } from "../../../electron/session/common.ts"
 import type { ChatSendRequest, ChatSendResult } from "./app-shell-model.ts"
 import type { AppShellRoute as Route } from "./app-shell-types.ts"
@@ -15,11 +15,11 @@ import type { SidebarSegment, SidebarTaskSortMode } from "./sidebar-persistence.
 import type { ChatConnectionDrawerState } from "./use-chat-connection-retry.ts"
 import type { BillingDetailsTarget } from "@/components/app-shell/BillingUsagePopover"
 import type { UseAuth } from "@/hooks/useAuth"
-import type { KnowledgeBaseIdsUpdate } from "@/hooks/useSessions"
 import type { ChatTurnRetrySource } from "@/routes/Chat/chat-turns"
 import type { ComposerState } from "@/routes/Chat/composer-state"
 import type { ConnectionAuthIntent } from "@/routes/Connections/connection-route-model.ts"
 import type { ConnectionCatalogFilter } from "@/routes/Connections/connection-route-model.ts"
+import type { KnowledgeSourceSelection } from "@/routes/Knowledge/navigation"
 import type { ChatStatus } from "ai"
 
 import { PanelRightClose, PanelRightOpen } from "lucide-react"
@@ -27,7 +27,6 @@ import * as React from "react"
 import { toast } from "sonner"
 import { AGENT_PROFILES, isExternalAgentKind } from "../../../electron/agent/contract/profile.ts"
 import { APP_COMMANDS } from "../../../electron/app-command.ts"
-import { KNOWLEDGE_LIBRARY_CONTEXT_ID } from "../../../electron/knowledge/common.ts"
 import { buildFallbackSessionTitle } from "../../../electron/session/title.ts"
 import {
   activeProjectIdForComposer,
@@ -62,7 +61,6 @@ import {
   writeStoredDefaultAgentKind,
   writeStoredAgentComposerPrefs,
 } from "./composer-agent-prefs.ts"
-import { KnowledgeContextBar } from "./KnowledgeContextBar.tsx"
 import { isPendingChatCaughtUp, pendingChatTransitionForActiveSession } from "./pending-chat.ts"
 import {
   readStoredSidebarSegment,
@@ -92,12 +90,12 @@ import { ProjectContextBar } from "@/components/app-shell/ProjectContextBar"
 import { useAttentionService, useBrowserService, useChatService } from "@/components/AppContext"
 import { useSkillInventoryResource } from "@/components/AppDataHooks"
 import { AppUpdateTitlebarEntry } from "@/components/AppUpdateTitlebarEntry"
+import { PageRouteShell } from "@/components/PageRouteShell"
 import { useAppSettings } from "@/hooks/useAppSettings"
 import { useAppUpdate } from "@/hooks/useAppUpdate"
 import { useAttention } from "@/hooks/useAttention"
 import { useChat } from "@/hooks/useChat"
 import { useConnections } from "@/hooks/useConnections"
-import { useKnowledgeBases } from "@/hooks/useKnowledgeBases"
 import { useLinkRuntime } from "@/hooks/useLinkRuntime"
 import { useProjectGit } from "@/hooks/useProjectGit"
 import { useRuntimeCapabilities } from "@/hooks/useRuntimeCapabilities"
@@ -111,7 +109,6 @@ import { reportRendererHandledError } from "@/lib/renderer-diagnostics"
 import { resolveUserFacingError, userFacingErrorDescription } from "@/lib/user-facing-error"
 import { cn } from "@/lib/utils"
 import { composerCapabilitiesForProfile } from "@/routes/Chat/agent-control-options"
-import { releaseAttachmentSnapshots } from "@/routes/Chat/chat-attachment-utils"
 import {
   chatTurnAllowsDirectSend,
   chatTurnAllowsStop,
@@ -119,11 +116,16 @@ import {
   resolveChatTurnState,
 } from "@/routes/Chat/chat-turn-state"
 import { chatTurnInputKey } from "@/routes/Chat/chat-turns"
-import { hasComposerDraftContent, toCachedComposerState } from "@/routes/Chat/composer-state"
+import { ComposerDrafts } from "@/routes/Chat/composer-draft-store"
+import { hasComposerDraftContent } from "@/routes/Chat/composer-state"
 import { summarizeEmptyStateConnections } from "@/routes/Chat/empty-state-connections"
 import { normalizeConnectionCatalogFilter } from "@/routes/Connections/connection-route-model.ts"
-import { knowledgeBreadcrumbs, normalizeKnowledgePath } from "@/routes/Knowledge/knowledge-route-model.ts"
+import { FlowsLoading } from "@/routes/Flows/FlowsLoading"
 
+const KnowledgeRoute = React.lazy(() =>
+  import("@/routes/Knowledge").then((module) => ({ default: module.KnowledgeRoute })),
+)
+const FlowsRoute = React.lazy(() => import("@/routes/Flows").then((module) => ({ default: module.FlowsRoute })))
 const ArchivedRoute = React.lazy(() =>
   import("@/routes/Archived").then((module) => ({ default: module.ArchivedRoute })),
 )
@@ -145,9 +147,6 @@ const SelfHostedConnectionsPlaceholder = React.lazy(() =>
 )
 const TeamManagementRoute = React.lazy(() =>
   import("@/routes/Skills/TeamManagement").then((module) => ({ default: module.TeamManagementRoute })),
-)
-const KnowledgeRoute = React.lazy(() =>
-  import("@/routes/Knowledge").then((module) => ({ default: module.KnowledgeRoute })),
 )
 const SettingsRoute = React.lazy(() =>
   import("@/routes/Settings").then((module) => ({ default: module.SettingsRoute })),
@@ -206,8 +205,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     }
   }, [auth.error, t])
   const [ready, setReady] = React.useState(false)
-  const [knowledgeDirectory, setKnowledgeDirectory] = React.useState("")
-  const [knowledgeTitlebarNavigationVersion, setKnowledgeTitlebarNavigationVersion] = React.useState(0)
   const [billingInitialTarget, setBillingInitialTarget] = React.useState<BillingDetailsTarget | null>(null)
   const [tasksDialogOpen, setTasksDialogOpen] = React.useState(false)
   const [agentStatus, setAgentStatus] = React.useState<AgentRuntimeStatus>({ status: "starting" })
@@ -215,8 +212,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   const teamWorkspace = useTeamWorkspace(accountId)
   const teamSkills = useTeamSkills(teamWorkspace.activeWorkspace, accountId)
   const skillInventory = useSkillInventoryResource()
-  const knowledgeBaseBetaEnabled = appSettings.settings.knowledgeBaseBetaEnabled
-  const knowledgeLibrary = useKnowledgeBases(knowledgeBaseBetaEnabled)
   const connections = useConnections(oomolLinkActive ? teamWorkspace.connectionWorkspace : null)
   const sessionScope = React.useMemo(
     () => sessionScopeFromWorkspace(teamWorkspace.activeWorkspace),
@@ -234,7 +229,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     create,
     createProject,
     assignSessionProject,
-    setSessionKnowledgeBases,
     renameProject: renameProjectAction,
     pinProject: pinProjectAction,
     archiveProject: archiveProjectAction,
@@ -305,6 +299,17 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     [projects, sessionsSettledForCurrentScope],
   )
   const [route, setRoute] = React.useState<Route>(initialRoute)
+  const [knowledgeAnalysisActive, setKnowledgeAnalysisActive] = React.useState(false)
+  const knowledgeDraft = route === "knowledge" && !knowledgeAnalysisActive
+  const [knowledgeSelection, setKnowledgeSelection] = React.useState<KnowledgeSourceSelection | null>(null)
+  const flowWorkspaceScope = `${accountId}:${teamWorkspace.activeWorkspace.teamId}`
+  const [openedFlowWorkspaceScope, setOpenedFlowWorkspaceScope] = React.useState<string | null>(null)
+  React.useEffect(() => {
+    if (route === "flows") setOpenedFlowWorkspaceScope(flowWorkspaceScope)
+  }, [flowWorkspaceScope, route])
+  React.useEffect(() => {
+    if (route !== "knowledge") setKnowledgeAnalysisActive(false)
+  }, [route])
   React.useEffect(() => {
     if (!routeAvailableForRuntime(route, oomolEnabled)) {
       setRoute("chat")
@@ -345,7 +350,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   }, [agentSelections])
   /** `<sessionKey>:<axis>` -> latest dispatched selection request, for rollback ordering. */
   const agentSelectionRequestSeq = React.useRef(new Map<string, number>())
-  const [draftKnowledgeBaseIds, setDraftKnowledgeBaseIds] = React.useState<string[]>([])
   const [draftProjectId, setDraftProjectId] = React.useState<string | null>(null)
   const [sidebarSegment, setSidebarSegment] = React.useState<SidebarSegment>(() =>
     readStoredSidebarSegment(globalThis.localStorage),
@@ -372,62 +376,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     Boolean(selectedSession) && sessionRecordScopeKey(selectedSession?.scope) === currentScopeKey
   const activeChatSessionId = selectedSessionMatchesScope ? selectedSessionId : null
   const activeSession = selectedSessionMatchesScope ? (selectedSession ?? undefined) : undefined
-  const activeKnowledgeBaseIds = activeSession?.knowledgeBaseIds ?? draftKnowledgeBaseIds
-  const activeKnowledgeBases = React.useMemo(
-    () =>
-      knowledgeBaseBetaEnabled
-        ? activeKnowledgeBaseIds.flatMap((id) => {
-            if (id === KNOWLEDGE_LIBRARY_CONTEXT_ID) {
-              return [
-                {
-                  authors: [],
-                  capabilities: {
-                    fullTextSearch: true,
-                    knowledgeGraph: true,
-                    readingGraph: true,
-                    summary: true,
-                  },
-                  id: KNOWLEDGE_LIBRARY_CONTEXT_ID,
-                  importedAt: Number.MAX_SAFE_INTEGER,
-                  relativePath: KNOWLEDGE_LIBRARY_CONTEXT_ID,
-                  size: 0,
-                  sourceFileName: "",
-                  statistics: {},
-                  title: t("knowledge.libraryContextName"),
-                } satisfies KnowledgeBaseSummary,
-              ]
-            }
-            const item = knowledgeLibrary.items.find((candidate) => candidate.id === id)
-            return item ? [item] : []
-          })
-        : [],
-    [activeKnowledgeBaseIds, knowledgeBaseBetaEnabled, knowledgeLibrary.items, t],
-  )
-  React.useEffect(() => {
-    if (!knowledgeBaseBetaEnabled || knowledgeLibrary.loading || knowledgeLibrary.error) return
-    const availableIds = new Set([KNOWLEDGE_LIBRARY_CONTEXT_ID, ...knowledgeLibrary.items.map((item) => item.id)])
-    setDraftKnowledgeBaseIds((current) => {
-      const next = current.filter((id) => availableIds.has(id))
-      return next.length === current.length ? current : next
-    })
-  }, [knowledgeBaseBetaEnabled, knowledgeLibrary.error, knowledgeLibrary.items, knowledgeLibrary.loading])
-  const pinnedKnowledgeMentions = React.useMemo(
-    () =>
-      activeKnowledgeBases.map((item) => ({
-        id: item.id,
-        kind: "knowledge" as const,
-        name: item.title,
-        scope: item.id === KNOWLEDGE_LIBRARY_CONTEXT_ID ? ("library" as const) : ("archive" as const),
-      })),
-    [activeKnowledgeBases],
-  )
-
-  React.useEffect(() => {
-    if (!appSettings.loading && !knowledgeBaseBetaEnabled && route === "knowledge") {
-      setRoute("chat")
-    }
-  }, [appSettings.loading, knowledgeBaseBetaEnabled, route])
-
   const {
     messages,
     pendingPermissions,
@@ -642,7 +590,26 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   const [chatConnectionDrawers, setChatConnectionDrawers] = React.useState<Record<string, ChatConnectionDrawerState>>(
     {},
   )
-  const composerDraftsByKey = React.useRef<Map<string, ComposerState>>(new Map())
+  const draftOwner = auth.state?.account?.id ?? "local"
+  const drafts = React.useMemo(
+    () =>
+      new ComposerDrafts(
+        () => chatService.invoke("getComposerDrafts", draftOwner),
+        (key, value) => chatService.invoke("saveComposerDraft", { owner: draftOwner, key, value }),
+      ),
+    [chatService, draftOwner],
+  )
+  React.useEffect(() => {
+    void drafts.initialize()
+    const flush = () => {
+      void drafts.flush()
+    }
+    window.addEventListener("pagehide", flush)
+    return () => {
+      flush()
+      window.removeEventListener("pagehide", flush)
+    }
+  }, [drafts])
   const lastChatProjectId = React.useRef<string | null>(null)
   const workspaceResetKeyRef = React.useRef(activeWorkspaceKey)
   const previousActiveChatSessionIdRef = React.useRef<string | null>(null)
@@ -761,16 +728,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     },
     [setChatPermissionMode, t],
   )
-  const persistKnowledgeBaseIds = React.useCallback(
-    (sessionId: string, update: KnowledgeBaseIdsUpdate): void => {
-      void setSessionKnowledgeBases(sessionId, update).catch((cause: unknown) => {
-        console.error("[wanta] persist session knowledge bases failed", cause)
-        reportRendererHandledError("appShell.knowledgeBases", "Failed to persist session knowledge bases", cause)
-        toast.error(userFacingErrorDescription(resolveUserFacingError(cause, { area: "session" }), t))
-      })
-    },
-    [setSessionKnowledgeBases, t],
-  )
   const {
     clearAutoFallbackTitle,
     getAutoFallbackTitle,
@@ -834,7 +791,10 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   const activeComposerDraftKey = activeChatSessionId
     ? existingSessionComposerDraftKey(currentScopeKey, activeChatSessionId)
     : newSessionComposerDraftKeyForScopeKey(newSessionDraftScopeKey, activeProjectId)
-  const initialComposerState = composerDraftsByKey.current.get(activeComposerDraftKey)
+  // The Knowledge draft is new even while an older task remains selected.
+  const composerSettingsSessionId = knowledgeDraft ? null : activeChatSessionId
+  const activeDraftBinding = drafts.binding(activeComposerDraftKey)
+  const draftReady = React.useSyncExternalStore(activeDraftBinding.subscribe, activeDraftBinding.isReady)
   const activeChatConnectionDrawer = chatConnectionDrawers[activeComposerDraftKey] ?? null
   const chatConnectionAuthIntent = activeChatConnectionDrawer?.authIntent ?? null
   const chatConnectionSelectedService = activeChatConnectionDrawer?.selectedService ?? null
@@ -891,10 +851,12 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     taskSessions: visibleTaskSessions,
     taskSortMode,
   })
-  const displayedPermissionMode = activeChatSessionId ? permissionMode : draftPermissionMode
+  const displayedPermissionMode = composerSettingsSessionId ? permissionMode : draftPermissionMode
   // Agent choice is fixed at session creation; existing sessions without an
   // agentKind belong to the built-in kernel.
-  const displayedAgentKind: AgentKind = activeSession?.agentKind ?? (activeChatSessionId ? "opencode" : draftAgentKind)
+  const displayedAgentKind: AgentKind = composerSettingsSessionId
+    ? (activeSession?.agentKind ?? "opencode")
+    : draftAgentKind
   const activeAgentProfile = AGENT_PROFILES[displayedAgentKind]
   const { agentModesEnabled, attachmentsEnabled, modelRoutingEnabled } =
     composerCapabilitiesForProfile(activeAgentProfile)
@@ -911,6 +873,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   const chatReady = modelRoutingEnabled ? ready : true
   const workspaceStartupError = workspaceActivationState.status === "failed" ? workspaceActivationState.error : null
   const startupError = agentStartupError ?? workspaceStartupError ?? sessionSnapshotError
+  const composerStartupError = knowledgeDraft ? (agentStartupError ?? workspaceStartupError) : startupError
   const retryWorkspaceActivation = React.useCallback(() => {
     if (workspaceActivationState.status !== "failed") {
       return
@@ -965,26 +928,24 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   const showComposerProjectContext = route === "chat"
   const chatEmptyTitle = activeProject ? t("project.chatEmptyTitle", { project: activeProject.name }) : undefined
   const titlebarTitle =
-    route === "settings"
-      ? t("settings.title")
-      : route === "billing"
-        ? t("billing.title")
-        : route === "connections"
-          ? t("connections.title")
-          : route === "skills"
-            ? t("skills.title")
-            : route === "knowledge" && knowledgeBaseBetaEnabled
-              ? t("knowledge.title")
-              : route === "teams"
-                ? t("teams.title")
-                : route === "archived"
-                  ? t("archived.title")
-                  : (activeSession?.title ?? t("chat.newSession"))
+    route === "flows"
+      ? t("flows.title")
+      : route === "knowledge"
+        ? t("knowledge.title")
+        : route === "settings"
+          ? t("settings.title")
+          : route === "billing"
+            ? t("billing.title")
+            : route === "connections"
+              ? t("connections.title")
+              : route === "skills"
+                ? t("skills.title")
+                : route === "teams"
+                  ? t("teams.title")
+                  : route === "archived"
+                    ? t("archived.title")
+                    : (activeSession?.title ?? t("chat.newSession"))
   const titlebarEditable = route === "chat" && Boolean(activeSession)
-  const titlebarBreadcrumbs =
-    route === "knowledge" && knowledgeBaseBetaEnabled
-      ? knowledgeBreadcrumbs(knowledgeDirectory, t("knowledge.title"))
-      : undefined
 
   React.useEffect(() => {
     writeStoredSidebarSegment(globalThis.localStorage, sidebarSegment)
@@ -1020,34 +981,18 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     }
   }, [activePendingChatTransition, status])
 
-  const handleComposerStateChange = React.useCallback(
-    (state: ComposerState): void => {
-      const cached = toCachedComposerState(state)
-      if (hasComposerDraftContent(cached)) {
-        composerDraftsByKey.current.set(activeComposerDraftKey, cached)
-      } else {
-        composerDraftsByKey.current.delete(activeComposerDraftKey)
-      }
+  const clearComposerDraft = React.useCallback(
+    (draftKey: string): void => {
+      drafts.clear(draftKey)
     },
-    [activeComposerDraftKey],
+    [drafts],
   )
-
-  const clearComposerDraft = React.useCallback((draftKey: string): void => {
-    const draft = composerDraftsByKey.current.get(draftKey)
-    if (draft) {
-      releaseAttachmentSnapshots(draft.attachments)
-    }
-    composerDraftsByKey.current.delete(draftKey)
-  }, [])
-  const commitComposerDraft = React.useCallback((draftKey: string): void => {
-    composerDraftsByKey.current.delete(draftKey)
-  }, [])
-  const clearAllComposerDrafts = React.useCallback((): void => {
-    for (const draft of composerDraftsByKey.current.values()) {
-      releaseAttachmentSnapshots(draft.attachments)
-    }
-    composerDraftsByKey.current.clear()
-  }, [])
+  const commitComposerDraft = React.useCallback(
+    (draftKey: string, submitted?: ComposerState): void => {
+      drafts.consume(draftKey, submitted)
+    },
+    [drafts],
+  )
   const readLastProjectId = React.useCallback((): string | null => lastChatProjectId.current, [])
   // A fresh draft inherits the last explicitly selected agent. Passing a kind
   // means the user changed the default; opening historical sessions never does.
@@ -1067,9 +1012,11 @@ export function AppShell({ auth }: { auth: UseAuth }) {
       return { ...next, ...draftSelectionEntry(prefs) }
     })
   }, [])
+  React.useEffect(() => {
+    if (knowledgeDraft && activeChatSessionId && !agentSelections.draft) applyDraftComposerDefaults()
+  }, [activeChatSessionId, agentSelections.draft, applyDraftComposerDefaults, knowledgeDraft])
   const {
     handleNewSession,
-    handleNewTaskSession,
     handleOpenProjectDraft,
     handleSelectComposerProject,
     handleSelectComposerProjectFolder,
@@ -1080,15 +1027,29 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     activeChatSessionId,
     activeSession,
     assignSessionProject,
-    clearComposerDraft,
+    prepareDraftProjectChange: (projectId) => {
+      const targetKey = newSessionComposerDraftKeyForScopeKey(newSessionDraftScopeKey, projectId)
+      if (targetKey === activeComposerDraftKey || !hasComposerDraftContent(activeDraftBinding.getSnapshot()))
+        return true
+      if (drafts.move(activeComposerDraftKey, targetKey)) return true
+      toast(t("chat.draftProjectConflict"), {
+        action: {
+          label: t("chat.draftOpenExisting"),
+          onClick: () => {
+            setDraftProjectId(projectId ?? NO_DRAFT_PROJECT_ID)
+            setIsDraftSession(true)
+            setSidebarSegment(projectId ? "projects" : "tasks")
+          },
+        },
+      })
+      return false
+    },
     createProject,
     draftProjectId,
     isDraftSession,
     lastProjectId: readLastProjectId,
     releaseTransientFocus,
     route,
-    sessionScope,
-    applyDraftComposerDefaults,
     setComposerFocusRequest,
     setDraftProjectId,
     setIsDraftSession,
@@ -1102,16 +1063,22 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   const handleSelectSession = React.useCallback(
     (session: SessionInfo): void => {
       navigateToSession(session)
+      if (
+        session.knowledgeMode &&
+        session.scope?.kind === "team" &&
+        session.scope.teamId === teamWorkspace.activeWorkspace.team?.id
+      ) {
+        setKnowledgeAnalysisActive(true)
+        setRoute("knowledge")
+      } else {
+        setKnowledgeAnalysisActive(false)
+      }
       void attentionService.invoke("markSessionViewed", session.id).catch((error: unknown) => {
         reportRendererHandledError("attention", "mark selected session viewed failed", error)
       })
     },
-    [attentionService, navigateToSession],
+    [attentionService, navigateToSession, teamWorkspace.activeWorkspace.team?.id],
   )
-  const handleNewSessionWithKnowledgeReset = React.useCallback((): void => {
-    setDraftKnowledgeBaseIds([])
-    handleNewSession()
-  }, [handleNewSession])
   const commitDraftAgentSelection = React.useCallback((sessionId: string): void => {
     setAgentSelections((prev) => {
       const draft = prev["draft"]
@@ -1151,9 +1118,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     onDraftAgentSelectionCommitted: commitDraftAgentSelection,
     messages,
     messagesLoaded,
-    knowledgeBaseIds: activeKnowledgeBaseIds,
     teamSkills: teamSkills.chatContextSkills,
-    persistKnowledgeBaseIds,
     persistPermissionMode,
     send,
     sessionScope,
@@ -1360,17 +1325,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     [activeComposerDraftKey, cancelRetryForDrawer, connections.refresh],
   )
 
-  const handleOpenTeamConnection = React.useCallback(
-    ({ appId, service }: { appId: string; service: string }): void => {
-      setSelectedService(service)
-      setSelectedConnectionAppId(appId)
-      setConnectionCatalogFilter({ kind: "all" })
-      setRoute("connections")
-      void connections.refresh({}, { silent: true })
-    },
-    [connections.refresh],
-  )
-
   const handleOpenChatConnectionProvider = React.useCallback(
     (service: string): void => {
       setRoute("chat")
@@ -1418,16 +1372,15 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     previousActiveChatSessionIdRef.current = null
     resetChatSessionCache()
     resetComposerSubmissionMemory()
-    clearAllComposerDrafts()
+    void drafts.flush()
     clearRetries()
     setChatConnectionDrawers({})
     setSelectedService(null)
     setSelectedConnectionAppId(null)
     setConnectionCatalogFilter({ kind: "all" })
     setSelectedSessionId(null)
-    setIsDraftSession(false)
+    setKnowledgeAnalysisActive(false)
     applyDraftComposerDefaults()
-    setDraftKnowledgeBaseIds([])
     setDraftProjectId(null)
     setPendingChatTransition(null)
     sessionActions.resetDialogs()
@@ -1437,7 +1390,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   }, [
     activeWorkspaceKey,
     applyDraftComposerDefaults,
-    clearAllComposerDrafts,
+    drafts,
     clearRetries,
     handleArtifactsReset,
     holdQueuedSessionIfQueued,
@@ -1457,6 +1410,44 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     clearQueuedSession(activeChatSessionId)
   }, [activeChatSessionId, clearQueuedSession, sessionsSettledForCurrentScope, visibleSessions])
 
+  const restoringDraftPreferences = React.useRef<string | null>(null)
+  React.useEffect(() => {
+    if (activeChatSessionId || !draftReady) return
+    const preferences = drafts.entries.get(activeComposerDraftKey)?.preferences
+    if (!preferences) {
+      restoringDraftPreferences.current = null
+      return
+    }
+    const safe = {
+      ...preferences,
+      permissionMode: preferences.permissionMode === "full_access" ? ("default" as const) : preferences.permissionMode,
+    }
+    restoringDraftPreferences.current = JSON.stringify(safe)
+    setDraftAgentKind(safe.agentKind)
+    setDraftPermissionMode(safe.permissionMode)
+    setAgentSelections((current) => ({ ...current, draft: { modelId: safe.modelId, effortId: safe.effortId } }))
+  }, [activeChatSessionId, activeComposerDraftKey, draftReady, drafts])
+  React.useEffect(() => {
+    if (activeChatSessionId || !draftReady) return
+    const preferences = {
+      agentKind: draftAgentKind,
+      permissionMode: draftPermissionMode === "full_access" ? ("default" as const) : draftPermissionMode,
+      modelId: agentSelections.draft?.modelId,
+      effortId: agentSelections.draft?.effortId,
+    }
+    if (restoringDraftPreferences.current && restoringDraftPreferences.current !== JSON.stringify(preferences)) return
+    restoringDraftPreferences.current = null
+    drafts.preferences(activeComposerDraftKey, preferences)
+  }, [
+    activeChatSessionId,
+    activeComposerDraftKey,
+    draftReady,
+    drafts,
+    draftAgentKind,
+    draftPermissionMode,
+    agentSelections.draft,
+  ])
+
   const handleSend = React.useCallback(
     async (request: ChatSendRequest): Promise<ChatSendResult> => {
       const {
@@ -1469,20 +1460,16 @@ export function AppShell({ auth }: { auth: UseAuth }) {
         reasoningLevel,
         text,
       } = request
-      const effectiveContextMentions = [
-        ...contextMentions.filter((mention) => mention.kind !== "knowledge"),
-        ...pinnedKnowledgeMentions,
-      ]
       const draftKey = activeComposerDraftKey
+      const submitted = drafts.entries.get(draftKey)
       const clearSubmittedDraft = (): void => {
-        commitComposerDraft(draftKey)
         afterOptimisticSubmit?.()
       }
       if (activeChatSessionId && (!chatTurnAllowsDirectSend(activeChatTurnState) || isDraftSendInFlight(draftKey))) {
         queueActiveMessage(
           text,
           attachments,
-          effectiveContextMentions,
+          contextMentions,
           model,
           reasoningLevel,
           mode,
@@ -1491,13 +1478,14 @@ export function AppShell({ auth }: { auth: UseAuth }) {
           activeProjectContext,
           sessionScope ?? undefined,
         )
+        commitComposerDraft(draftKey, submitted)
         clearSubmittedDraft()
         return { delivery: "queued", status: "accepted" }
       }
       const result = await sendNow({
         afterOptimisticSubmit: clearSubmittedDraft,
         attachments,
-        contextMentions: effectiveContextMentions,
+        contextMentions,
         mode,
         model,
         permissionMode,
@@ -1506,7 +1494,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
       })
       if (chatSendAccepted(result)) {
         releaseActiveQueue()
-        commitComposerDraft(draftKey)
+        commitComposerDraft(draftKey, submitted)
       }
       return result
     },
@@ -1516,13 +1504,39 @@ export function AppShell({ auth }: { auth: UseAuth }) {
       activeChatTurnState,
       activeProjectContext,
       commitComposerDraft,
+      drafts,
       teamSkills.chatContextSkills,
-      pinnedKnowledgeMentions,
       queueActiveMessage,
       releaseActiveQueue,
       sendNow,
       sessionScope,
     ],
+  )
+
+  const handleKnowledgeAsk = React.useCallback(
+    async (request: ChatSendRequest): Promise<ChatSendResult> => {
+      const teamId = teamWorkspace.activeWorkspace.team?.id
+      if (!oomolLinkActive || !teamId || sessionScope?.kind !== "team" || sessionScope.teamId !== teamId) {
+        return { reason: "workspace_not_ready", status: "rejected" }
+      }
+      const result = await sendNow({
+        ...request,
+        contextMentions: [
+          ...(request.contextMentions ?? []).filter((mention) => mention.kind !== "cloud-knowledge"),
+          { kind: "cloud-knowledge", id: teamId, displayName: t("knowledge.title") },
+        ],
+        sessionScope,
+        startNewSession: true,
+        knowledgeMode: true,
+        stayOnKnowledge: true,
+      })
+      if (chatSendAccepted(result)) {
+        setKnowledgeSelection(null)
+        setKnowledgeAnalysisActive(true)
+      }
+      return result
+    },
+    [oomolLinkActive, sendNow, sessionScope, t, teamWorkspace.activeWorkspace.team?.id],
   )
 
   const handleAnswerQuestion = React.useCallback(
@@ -1532,8 +1546,8 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   )
 
   const handleAnswerPermission = React.useCallback(
-    (requestId: string, reply: ChatPermissionReply): Promise<void> =>
-      activeChatSessionId ? answerPermission(activeChatSessionId, requestId, reply) : Promise.resolve(),
+    (requestId: string, reply: ChatPermissionReply, optionId?: string): Promise<void> =>
+      activeChatSessionId ? answerPermission(activeChatSessionId, requestId, reply, optionId) : Promise.resolve(),
     [activeChatSessionId, answerPermission],
   )
 
@@ -1663,7 +1677,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
 
       titleGeneration.rememberAutoFallbackTitle(session.id, fallbackTitle)
       await persistPermissionMode(session.id, permissionMode)
-      persistKnowledgeBaseIds(session.id, activeKnowledgeBaseIds)
       setSelectedSessionId(session.id)
       setIsDraftSession(false)
       setPendingChatTransition(null)
@@ -1682,14 +1695,12 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     },
     [
       activeChatSessionId,
-      activeKnowledgeBaseIds,
       activeProject?.id,
       activeProjectContext,
       activeSession?.agentKind,
       create,
       displayedPermissionMode,
       teamSkills.chatContextSkills,
-      persistKnowledgeBaseIds,
       persistPermissionMode,
       send,
       sessionScope,
@@ -1733,6 +1744,10 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     ],
   )
   const handleOpenSearch = React.useCallback((): void => setSearchOpen(true), [])
+  const handleLogin = React.useCallback((): void => {
+    void auth.login()
+  }, [auth.login])
+  const handleManageTasks = React.useCallback((): void => setTasksDialogOpen(true), [])
   const handleChatStop = React.useCallback(async (): Promise<void> => {
     if (activeChatSessionId) {
       await stop(activeChatSessionId)
@@ -1780,9 +1795,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     },
     [closeBrowserPanel, handleTurnOutputOpen, setArtifactsPanelMaximizedState],
   )
-  const handleOpenKnowledgeLibrary = React.useCallback((): void => {
-    setRoute("knowledge")
-  }, [])
   const handleStopGenerationCommand = React.useCallback((): void => {
     if (chatTurnAllowsStop(activeChatTurnState)) {
       void handleChatStop().catch(() => undefined)
@@ -1791,7 +1803,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   useAppShellCommands({
     appUpdate,
     onFocusComposer: requestComposerFocus,
-    onNewChat: handleNewSessionWithKnowledgeReset,
+    onNewChat: handleNewSession,
     onOpenConnections: handleOpenConnectionsCommand,
     onOpenSearch: handleOpenSearch,
     onOpenSettings: handleOpenSettingsCommand,
@@ -1802,27 +1814,27 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     (mode: AgentPermissionMode): void => {
       // Sticky per-agent default for future chats (full_access never sticks).
       writeStoredAgentComposerPrefs(globalThis.localStorage, displayedAgentKind, { permissionMode: mode })
-      if (activeChatSessionId) {
-        void persistPermissionMode(activeChatSessionId, mode).catch(() => undefined)
+      if (composerSettingsSessionId) {
+        void persistPermissionMode(composerSettingsSessionId, mode).catch(() => undefined)
         return
       }
       setDraftPermissionMode(mode)
     },
-    [activeChatSessionId, displayedAgentKind, persistPermissionMode],
+    [composerSettingsSessionId, displayedAgentKind, persistPermissionMode],
   )
   // Agent backends remain immutable per session. Choosing another agent while
   // viewing a session starts a fresh draft, then restores that agent's sticky
   // model/effort/permission choices.
   const handleSelectAgentKind = React.useCallback(
     (kind: AgentKind): void => {
-      if (activeChatSessionId) {
-        handleNewSessionWithKnowledgeReset()
+      if (composerSettingsSessionId) {
+        handleNewSession()
       }
       applyDraftComposerDefaults(kind)
     },
-    [activeChatSessionId, applyDraftComposerDefaults, handleNewSessionWithKnowledgeReset],
+    [applyDraftComposerDefaults, composerSettingsSessionId, handleNewSession],
   )
-  const activeAgentSelection = agentSelections[activeChatSessionId ?? "draft"]
+  const activeAgentSelection = agentSelections[composerSettingsSessionId ?? "draft"]
   // One shared optimistic-update/rollback dance for both agent-selection axes;
   // only the stored field and the IPC call differ.
   const makeAgentSelectionHandler = React.useCallback(
@@ -1832,7 +1844,7 @@ export function AppShell({ auth }: { auth: UseAuth }) {
           ? chatService.invoke("setExternalSessionModel", { sessionId, ...(value ? { modelId: value } : {}) })
           : chatService.invoke("setExternalSessionEffort", { sessionId, ...(value ? { effortId: value } : {}) })
       return (value?: string): void => {
-        const key = activeChatSessionId ?? "draft"
+        const key = composerSettingsSessionId ?? "draft"
         // Read the rollback target from committed state before scheduling the
         // update: an updater may run later than (or be replayed after) this
         // handler, so a value captured inside it can be unset when the request
@@ -1841,27 +1853,35 @@ export function AppShell({ auth }: { auth: UseAuth }) {
         const previousValue = agentSelectionsRef.current[key]?.[field]
         const token = (agentSelectionRequestSeq.current.get(`${key}:${field}`) ?? 0) + 1
         agentSelectionRequestSeq.current.set(`${key}:${field}`, token)
-        writeStoredAgentComposerPrefs(
-          globalThis.localStorage,
-          displayedAgentKind,
-          field === "modelId" ? { modelId: value } : { effortId: value },
-        )
+        const persistSelection = () =>
+          writeStoredAgentComposerPrefs(
+            globalThis.localStorage,
+            displayedAgentKind,
+            field === "modelId" ? { modelId: value } : { effortId: value },
+          )
         setAgentSelections((prev) => ({ ...prev, [key]: { ...prev[key], [field]: value } }))
-        if (activeChatSessionId) {
-          void send(activeChatSessionId, value).catch((error: unknown) => {
-            reportRendererHandledError("chat", `set agent ${field === "modelId" ? "model" : "effort"} failed`, error)
-            if (agentSelectionRequestSeq.current.get(`${key}:${field}`) !== token) {
-              return
-            }
-            // The adapter refused the switch; the optimistic value must not stick.
-            setAgentSelections((prev) =>
-              prev[key]?.[field] === value ? { ...prev, [key]: { ...prev[key], [field]: previousValue } } : prev,
-            )
-          })
+        if (composerSettingsSessionId) {
+          void send(composerSettingsSessionId, value)
+            .then(() => {
+              if (agentSelectionRequestSeq.current.get(`${key}:${field}`) === token) persistSelection()
+            })
+            .catch((error: unknown) => {
+              reportRendererHandledError("chat", `set agent ${field === "modelId" ? "model" : "effort"} failed`, error)
+              if (agentSelectionRequestSeq.current.get(`${key}:${field}`) !== token) {
+                return
+              }
+              toast.error(userFacingErrorDescription(resolveUserFacingError(error, { area: "chat" }), t))
+              // The adapter refused the switch; the optimistic value must not stick.
+              setAgentSelections((prev) =>
+                prev[key]?.[field] === value ? { ...prev, [key]: { ...prev[key], [field]: previousValue } } : prev,
+              )
+            })
+        } else {
+          persistSelection()
         }
       }
     },
-    [activeChatSessionId, chatService, displayedAgentKind],
+    [chatService, composerSettingsSessionId, displayedAgentKind, t],
   )
   const handleSelectAgentModel = React.useMemo(() => makeAgentSelectionHandler("modelId"), [makeAgentSelectionHandler])
   const handleSelectAgentEffort = React.useMemo(
@@ -1872,10 +1892,10 @@ export function AppShell({ auth }: { auth: UseAuth }) {
   // live-process fallback for renderer reloads and in-flight native changes.
   React.useEffect(() => {
     const inputs = AGENT_PROFILES[displayedAgentKind].inputs
-    if (!activeChatSessionId || (!inputs.setModel && !inputs.setEffort)) {
+    if (!composerSettingsSessionId || (!inputs.setModel && !inputs.setEffort)) {
       return
     }
-    const sessionId = activeChatSessionId
+    const sessionId = composerSettingsSessionId
     if (agentSelectionsRef.current[sessionId]) {
       return
     }
@@ -1902,49 +1922,18 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     return () => {
       cancelled = true
     }
-  }, [activeChatSessionId, activeSession?.agentEffortId, activeSession?.agentModelId, chatService, displayedAgentKind])
+  }, [
+    activeSession?.agentEffortId,
+    activeSession?.agentModelId,
+    chatService,
+    composerSettingsSessionId,
+    displayedAgentKind,
+  ])
 
   const handleViewBilling = React.useCallback((target?: BillingDetailsTarget) => {
     setBillingInitialTarget(target ?? null)
     setRoute("billing")
   }, [])
-  const handleStartKnowledgeChat = React.useCallback(
-    (item: KnowledgeBaseSummary): void => {
-      handleNewTaskSession()
-      setDraftKnowledgeBaseIds([item.id])
-    },
-    [handleNewTaskSession],
-  )
-  const handleToggleKnowledgeBaseReference = React.useCallback(
-    (id: string): void => {
-      const toggle = (current: string[]): string[] =>
-        current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
-      if (activeChatSessionId) persistKnowledgeBaseIds(activeChatSessionId, toggle)
-      else setDraftKnowledgeBaseIds(toggle)
-    },
-    [activeChatSessionId, persistKnowledgeBaseIds],
-  )
-  const handleAddKnowledgeBaseReference = React.useCallback(
-    (id: string): void => {
-      const add = (current: string[]): string[] => (current.includes(id) ? current : [...current, id])
-      if (activeChatSessionId) persistKnowledgeBaseIds(activeChatSessionId, add)
-      else setDraftKnowledgeBaseIds(add)
-    },
-    [activeChatSessionId, persistKnowledgeBaseIds],
-  )
-  const pinnedKnowledgeContextBar = React.useMemo(
-    () =>
-      activeKnowledgeBases.length > 0 ? (
-        <KnowledgeContextBar
-          activeItems={activeKnowledgeBases}
-          items={knowledgeLibrary.items}
-          queuedMessageCount={activeQueuedMessages.length}
-          onOpenLibrary={() => setRoute("knowledge")}
-          onToggle={handleToggleKnowledgeBaseReference}
-        />
-      ) : null,
-    [activeKnowledgeBases, activeQueuedMessages.length, handleToggleKnowledgeBaseReference, knowledgeLibrary.items],
-  )
   const handleOpenTeams = React.useCallback(() => setRoute("teams"), [])
   // Keep the same titlebar affordance available to close an already open panel.
   const showArtifactsToggle = showArtifactsPanelToggle(
@@ -2040,6 +2029,18 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     [handleSelectSession],
   )
 
+  const activeTeamIdForKnowledge = teamWorkspace.activeWorkspace.team?.id
+  const activeSessionKnowledgeMode = activeSession?.knowledgeMode === true
+  const handleOpenKnowledgeSource = React.useCallback(
+    (hit: KnowledgeHit) => {
+      if (!oomolLinkActive || !activeTeamIdForKnowledge) return
+      setKnowledgeSelection({ hit, teamId: activeTeamIdForKnowledge })
+      if (activeSessionKnowledgeMode) setKnowledgeAnalysisActive(true)
+      setRoute("knowledge")
+    },
+    [activeSessionKnowledgeMode, activeTeamIdForKnowledge, oomolLinkActive],
+  )
+
   if (route === "settings") {
     return (
       <>
@@ -2052,6 +2053,31 @@ export function AppShell({ auth }: { auth: UseAuth }) {
           />
         </React.Suspense>
       </>
+    )
+  }
+
+  if (route === "teams" && oomolEnabled) {
+    return (
+      <React.Suspense fallback={<RouteLoadingFallback />}>
+        <PageRouteShell
+          animateContent
+          backLabel={t("settings.backToApp")}
+          title={t("teams.title")}
+          contentLayout="fill"
+          contentClassName="max-w-[90rem] gap-4"
+          onBack={() => setRoute("chat")}
+          titlebarActions={<AppUpdateTitlebarEntry update={appUpdate} />}
+        >
+          <div className="min-h-0 flex-1">
+            <TeamManagementRoute
+              connectedProvidersLoading={activeProvidersLoading}
+              teamSkills={teamSkills}
+              providerSkillRecommendationsState={providerSkillRecommendations}
+              workspace={teamWorkspace}
+            />
+          </div>
+        </PageRouteShell>
+      </React.Suspense>
     )
   }
 
@@ -2091,11 +2117,137 @@ export function AppShell({ auth }: { auth: UseAuth }) {
     )
   }
 
+  const knowledgeTaskActive =
+    activeSession?.knowledgeMode === true &&
+    activeSession.scope?.kind === "team" &&
+    activeSession.scope.teamId === teamWorkspace.activeWorkspace.team?.id
+  const knowledgeContextRequired = route === "knowledge" || knowledgeTaskActive
+  const chatArea = (
+    <ChatArea
+      compact={route === "knowledge"}
+      knowledgeTeamId={oomolLinkActive ? teamWorkspace.activeWorkspace.team?.id : undefined}
+      knowledgeRequired={knowledgeContextRequired}
+      onOpenKnowledgeSource={handleOpenKnowledgeSource}
+      activeSessionId={knowledgeDraft ? null : activeChatSessionId}
+      agentKind={displayedAgentKind}
+      agentModesEnabled={agentModesEnabled}
+      attachmentsEnabled={attachmentsEnabled}
+      modelRoutingEnabled={modelRoutingEnabled}
+      agentModelId={activeAgentSelection?.modelId}
+      agentEffortId={activeAgentSelection?.effortId}
+      onSelectAgentModel={handleSelectAgentModel}
+      onSelectAgentEffort={handleSelectAgentEffort}
+      onSelectAgentKind={handleSelectAgentKind}
+      billingCacheScope={billingCacheScope}
+      billingRequestScope={billingRequestScope}
+      composerDraftKey={
+        knowledgeDraft ? `knowledge-new:${teamWorkspace.activeWorkspace.team?.id ?? ""}` : activeComposerDraftKey
+      }
+      messages={knowledgeDraft || bridgeInitialSendPending ? [] : messages}
+      modelRequired={modelRequired}
+      permissionMode={displayedPermissionMode}
+      pendingPermissions={knowledgeDraft || bridgeInitialSendPending ? [] : pendingPermissions}
+      pendingQuestions={knowledgeDraft || bridgeInitialSendPending ? [] : pendingQuestions}
+      status={knowledgeDraft ? "ready" : displayedStatus}
+      activity={knowledgeDraft || bridgeInitialSendPending ? null : activity}
+      showEmptyState={knowledgeDraft || showChatEmptyState}
+      bootstrapping={knowledgeDraft ? !chatReady || workspaceActivationBlocked : chatBootstrapping}
+      startupError={composerStartupError}
+      onStartupRetry={
+        workspaceStartupError ? retryWorkspaceActivation : sessionSnapshotError ? retrySessionSnapshot : undefined
+      }
+      error={knowledgeDraft ? null : error}
+      emptyTitle={chatEmptyTitle}
+      generatedArtifacts={knowledgeDraft ? null : latestArtifactSelection}
+      historyScope={billingCacheScope}
+      submitDisabled={knowledgeDraft ? !chatReady || workspaceActivationBlocked || !sessionScope : chatSubmitDisabled}
+      willQueueMessage={
+        !knowledgeDraft &&
+        Boolean(activeChatSessionId && (!chatTurnAllowsDirectSend(activeChatTurnState) || isSendInFlight()))
+      }
+      draftBinding={knowledgeDraft ? undefined : activeDraftBinding}
+      initialSendPending={knowledgeDraft ? false : initialSendPending}
+      composerFocusRequest={composerFocusRequest}
+      cloudModelsEnabled={runtimeCapabilities?.oomolCloudModels === true}
+      voiceEnabled={runtimeCapabilities?.voice === true}
+      canManageWorkspaceConnections={oomolLinkActive && canManageWorkspaceConnections}
+      emptyStateConnectionSummary={oomolLinkActive ? emptyStateConnectionSummary : null}
+      teamSkillEntryVisible={oomolEnabled && teamSkillEntryVisible}
+      teamSkillShowcaseItems={oomolEnabled ? teamSkillShowcaseItems : []}
+      teamSkillPendingInstallCount={oomolEnabled ? recommendedSkillPendingInstallCount : 0}
+      teamSkills={oomolEnabled ? teamSkills.chatContextSkills : []}
+      selfManagedSetup={
+        appSettings.settings.operatingMode === "self-managed" && !appSettings.settings.selfManagedSetupDismissed
+          ? {
+              onConfigureOpenConnector: handleOpenSettingsCommand,
+              onDismiss: () => {
+                void appSettings.setSelfManagedSetupDismissed(true).catch((error: unknown) => {
+                  reportRendererHandledError("settings", "dismiss self-managed setup reminder failed", error)
+                })
+              },
+            }
+          : undefined
+      }
+      providers={oomolLinkActive ? activeProviders : []}
+      queueHeld={knowledgeDraft ? false : activeQueueHeld}
+      queuedMessages={knowledgeDraft ? [] : activeQueuedMessages}
+      contextBar={knowledgeDraft ? undefined : composerProjectContext}
+      placeholder={
+        knowledgeDraft && chatReady
+          ? t("knowledge.askPlaceholder")
+          : composerStartupError
+            ? t("error.agent.title")
+            : modelRequired
+              ? t("chat.modelRequiredPlaceholder")
+              : chatReady
+                ? t(linksEnabled ? "chat.inputPlaceholder" : "chat.inputPlaceholderLocal")
+                : t("chat.agentStarting")
+      }
+      onSend={
+        knowledgeDraft
+          ? handleKnowledgeAsk
+          : knowledgeContextRequired
+            ? (request) => {
+                const teamId = teamWorkspace.activeWorkspace.team?.id
+                if (!teamId) return Promise.resolve({ reason: "workspace_not_ready", status: "rejected" } as const)
+                return handleSend({
+                  ...request,
+                  contextMentions: [
+                    ...(request.contextMentions ?? []).filter((mention) => mention.kind !== "cloud-knowledge"),
+                    { kind: "cloud-knowledge", id: teamId, displayName: t("knowledge.title") },
+                  ],
+                })
+              }
+            : handleSend
+      }
+      onAnswerQuestion={handleAnswerQuestion}
+      onAnswerPermission={handleAnswerPermission}
+      onPermissionModeChange={handlePermissionModeChange}
+      onRejectQuestion={handleRejectQuestion}
+      questionDrafts={questionDrafts}
+      onStop={handleChatStop}
+      onQueuedMessageMove={handleQueuedMessageMove}
+      onQueuedMessageRemove={handleQueuedMessageRemove}
+      onQueuedMessageResume={handleQueuedMessageResume}
+      onAuthorize={handleAuthorize}
+      onRecover={handleChatErrorRecovery}
+      onRetryFresh={handleRetryFresh}
+      onArtifactsOpen={handleArtifactsOpenWithBrowserClose}
+      onArtifactsAvailable={handleArtifactsAvailable}
+      onTurnOutputOpen={handleTurnOutputOpenWithBrowserClose}
+      onTurnOutputAvailable={handleTurnOutputAvailable}
+      onOpenConnections={linksEnabled ? handleOpenConnectionsCommand : undefined}
+      onOpenConnectionProvider={oomolLinkActive ? handleOpenChatConnectionProvider : undefined}
+      onOpenTeams={oomolEnabled ? handleOpenTeams : undefined}
+      onViewBilling={oomolEnabled ? handleViewBilling : undefined}
+    />
+  )
+
   return (
     <div
       ref={appChromeRef}
       className={cn(
-        "oo-app-chrome grid h-full text-foreground",
+        "oo-app-chrome oo-app-enter grid h-full text-foreground",
         sidebarCollapsed && "oo-sidebar-collapsed",
         isSidebarRestoring && "oo-sidebar-restoring",
         isSidebarResizing && "oo-sidebar-resizing",
@@ -2125,7 +2277,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
         projectSidebarGroups={projectSidebarGroups}
         restoring={isSidebarRestoring}
         sessionsError={sessionsError}
-        showKnowledge={knowledgeBaseBetaEnabled}
         sidebarSegment={sidebarSegment}
         sidebarSessionGroups={sidebarSessionGroups}
         taskSessions={visibleTaskSessions}
@@ -2135,10 +2286,10 @@ export function AppShell({ auth }: { auth: UseAuth }) {
         onArchiveProjectRequest={projectActions.requestArchive}
         onArchiveSessionRequest={sessionActions.requestArchive}
         onLogout={auth.logout}
-        onLogin={() => void auth.login()}
-        onManageTasks={() => setTasksDialogOpen(true)}
+        onLogin={handleLogin}
+        onManageTasks={handleManageTasks}
         onNavigate={setRoute}
-        onNewSession={handleNewSessionWithKnowledgeReset}
+        onNewSession={handleNewSession}
         onOpenConnections={handleOpenConnectionsCommand}
         onOpenSearch={handleOpenSearch}
         onPinProject={projectActions.handlePin}
@@ -2183,7 +2334,6 @@ export function AppShell({ auth }: { auth: UseAuth }) {
             showBrowserToggle={showBrowserToggle}
             sidebarCollapsed={sidebarCollapsed}
             titlebarEditable={titlebarEditable}
-            titlebarBreadcrumbs={titlebarBreadcrumbs}
             titlebarTitle={titlebarTitle}
             windowControlsOnRight={!rightPanelVisible}
             workspace={teamWorkspace.activeWorkspace}
@@ -2191,17 +2341,41 @@ export function AppShell({ auth }: { auth: UseAuth }) {
             onBrowserToggle={handleBrowserToggle}
             onOpenSearch={handleOpenSearch}
             onRenameSession={sessionActions.handleRename}
-            onTitlebarBreadcrumbNavigate={(path) => {
-              setKnowledgeDirectory(normalizeKnowledgePath(path))
-              setKnowledgeTitlebarNavigationVersion((version) => version + 1)
-            }}
             onToggleSidebar={handleToggleSidebar}
             onViewBilling={oomolEnabled ? handleViewBilling : undefined}
           />
 
           <main className="oo-content-surface min-h-0 min-w-0 overflow-hidden">
-            <React.Suspense fallback={<RouteLoadingFallback />}>
-              {route === "connections" ? (
+            <React.Suspense fallback={route === "flows" ? <FlowsLoading /> : <RouteLoadingFallback />}>
+              {/* Keep the same team's editor alive during a Connections round trip, including blur-triggered saves. */}
+              {oomolEnabled && (route === "flows" || openedFlowWorkspaceScope === flowWorkspaceScope) ? (
+                <div hidden={route !== "flows"} inert={route !== "flows"} className="h-full min-h-0">
+                  <FlowsRoute
+                    key={flowWorkspaceScope}
+                    accountId={accountId ?? ""}
+                    team={teamWorkspace.activeWorkspace.team}
+                    writable={teamWorkspace.activeWorkspace.canManage}
+                    onConfigureConnector={oomolLinkActive ? () => setRoute("connections") : undefined}
+                  />
+                </div>
+              ) : null}
+              {route === "flows" && oomolEnabled ? null : route === "knowledge" && oomolEnabled ? (
+                <KnowledgeRoute
+                  key={`${accountId}:${teamWorkspace.activeWorkspace.teamId}`}
+                  teamId={teamWorkspace.activeWorkspace.team?.id ?? ""}
+                  writable={teamWorkspace.activeWorkspace.canManage}
+                  analysisContent={chatArea}
+                  conversationActive={knowledgeAnalysisActive}
+                  onCloseAnalysis={() => {
+                    setKnowledgeAnalysisActive(false)
+                    setKnowledgeSelection(null)
+                  }}
+                  sourceSelection={
+                    knowledgeSelection?.teamId === teamWorkspace.activeWorkspace.team?.id ? knowledgeSelection : null
+                  }
+                  onSourceSelectionConsumed={() => setKnowledgeSelection(null)}
+                />
+              ) : route === "connections" ? (
                 linkRuntime.state?.active === "openconnector" ? (
                   <OpenConnectorConnectionsPanel runtime={linkRuntime} onOpenSettings={handleOpenSettingsCommand} />
                 ) : oomolLinkActive ? (
@@ -2226,140 +2400,9 @@ export function AppShell({ auth }: { auth: UseAuth }) {
                   providerSkillRecommendationsState={providerSkillRecommendations}
                   workspace={teamWorkspace}
                 />
-              ) : route === "knowledge" && knowledgeBaseBetaEnabled ? (
-                <KnowledgeRoute
-                  currentDirectory={knowledgeDirectory}
-                  knowledge={knowledgeLibrary}
-                  titlebarNavigationVersion={knowledgeTitlebarNavigationVersion}
-                  onCurrentDirectoryChange={setKnowledgeDirectory}
-                  onStartChat={handleStartKnowledgeChat}
-                />
-              ) : route === "teams" && oomolEnabled ? (
-                <TeamManagementRoute
-                  connectionProviders={activeProviders}
-                  connectedProvidersLoading={activeProvidersLoading}
-                  onOpenConnection={handleOpenTeamConnection}
-                  teamSkills={teamSkills}
-                  providerSkillRecommendationsState={providerSkillRecommendations}
-                  workspace={teamWorkspace}
-                />
               ) : (
                 <div className="flex h-full min-h-0 overflow-hidden">
-                  <div className="min-w-0 flex-1 overflow-hidden">
-                    <ChatArea
-                      activeSessionId={activeChatSessionId}
-                      agentKind={displayedAgentKind}
-                      agentModesEnabled={agentModesEnabled}
-                      attachmentsEnabled={attachmentsEnabled}
-                      modelRoutingEnabled={modelRoutingEnabled}
-                      agentModelId={activeAgentSelection?.modelId}
-                      agentEffortId={activeAgentSelection?.effortId}
-                      onSelectAgentModel={handleSelectAgentModel}
-                      onSelectAgentEffort={handleSelectAgentEffort}
-                      onSelectAgentKind={handleSelectAgentKind}
-                      billingCacheScope={billingCacheScope}
-                      billingRequestScope={billingRequestScope}
-                      composerDraftKey={activeComposerDraftKey}
-                      messages={bridgeInitialSendPending ? [] : messages}
-                      knowledgeBaseIds={activeKnowledgeBaseIds}
-                      knowledgeEnabled={knowledgeBaseBetaEnabled}
-                      knowledgeError={
-                        knowledgeLibrary.error ? userFacingErrorDescription(knowledgeLibrary.error, t) : null
-                      }
-                      knowledgeItems={knowledgeLibrary.items}
-                      knowledgeLoading={knowledgeLibrary.loading}
-                      modelRequired={modelRequired}
-                      permissionMode={displayedPermissionMode}
-                      pendingPermissions={bridgeInitialSendPending ? [] : pendingPermissions}
-                      pendingQuestions={bridgeInitialSendPending ? [] : pendingQuestions}
-                      status={displayedStatus}
-                      activity={bridgeInitialSendPending ? null : activity}
-                      showEmptyState={showChatEmptyState}
-                      bootstrapping={chatBootstrapping}
-                      startupError={startupError}
-                      onStartupRetry={
-                        workspaceStartupError
-                          ? retryWorkspaceActivation
-                          : sessionSnapshotError
-                            ? retrySessionSnapshot
-                            : undefined
-                      }
-                      error={error}
-                      emptyTitle={chatEmptyTitle}
-                      generatedArtifacts={latestArtifactSelection}
-                      historyScope={billingCacheScope}
-                      submitDisabled={chatSubmitDisabled}
-                      willQueueMessage={Boolean(
-                        activeChatSessionId && (!chatTurnAllowsDirectSend(activeChatTurnState) || isSendInFlight()),
-                      )}
-                      initialComposerState={initialComposerState}
-                      initialSendPending={initialSendPending}
-                      composerFocusRequest={composerFocusRequest}
-                      cloudModelsEnabled={runtimeCapabilities?.oomolCloudModels === true}
-                      voiceEnabled={runtimeCapabilities?.voice === true}
-                      canManageWorkspaceConnections={oomolLinkActive && canManageWorkspaceConnections}
-                      emptyStateConnectionSummary={oomolLinkActive ? emptyStateConnectionSummary : null}
-                      teamSkillEntryVisible={oomolEnabled && teamSkillEntryVisible}
-                      teamSkillShowcaseItems={oomolEnabled ? teamSkillShowcaseItems : []}
-                      teamSkillPendingInstallCount={oomolEnabled ? recommendedSkillPendingInstallCount : 0}
-                      teamSkills={oomolEnabled ? teamSkills.chatContextSkills : []}
-                      selfManagedSetup={
-                        appSettings.settings.operatingMode === "self-managed" &&
-                        !appSettings.settings.selfManagedSetupDismissed
-                          ? {
-                              onConfigureOpenConnector: handleOpenSettingsCommand,
-                              onDismiss: () => {
-                                void appSettings.setSelfManagedSetupDismissed(true).catch((error: unknown) => {
-                                  reportRendererHandledError(
-                                    "settings",
-                                    "dismiss self-managed setup reminder failed",
-                                    error,
-                                  )
-                                })
-                              },
-                            }
-                          : undefined
-                      }
-                      providers={oomolLinkActive ? activeProviders : []}
-                      queueHeld={activeQueueHeld}
-                      queuedMessages={activeQueuedMessages}
-                      contextBar={composerProjectContext}
-                      pinnedContextBar={pinnedKnowledgeContextBar}
-                      placeholder={
-                        startupError
-                          ? t("error.agent.title")
-                          : modelRequired
-                            ? t("chat.modelRequiredPlaceholder")
-                            : chatReady
-                              ? t(linksEnabled ? "chat.inputPlaceholder" : "chat.inputPlaceholderLocal")
-                              : t("chat.agentStarting")
-                      }
-                      onComposerStateChange={handleComposerStateChange}
-                      onSend={handleSend}
-                      onAnswerQuestion={handleAnswerQuestion}
-                      onAnswerPermission={handleAnswerPermission}
-                      onPermissionModeChange={handlePermissionModeChange}
-                      onRejectQuestion={handleRejectQuestion}
-                      questionDrafts={questionDrafts}
-                      onStop={handleChatStop}
-                      onQueuedMessageMove={handleQueuedMessageMove}
-                      onQueuedMessageRemove={handleQueuedMessageRemove}
-                      onQueuedMessageResume={handleQueuedMessageResume}
-                      onAuthorize={handleAuthorize}
-                      onRecover={handleChatErrorRecovery}
-                      onRetryFresh={handleRetryFresh}
-                      onArtifactsOpen={handleArtifactsOpenWithBrowserClose}
-                      onArtifactsAvailable={handleArtifactsAvailable}
-                      onTurnOutputOpen={handleTurnOutputOpenWithBrowserClose}
-                      onTurnOutputAvailable={handleTurnOutputAvailable}
-                      onOpenConnections={linksEnabled ? handleOpenConnectionsCommand : undefined}
-                      onOpenConnectionProvider={oomolLinkActive ? handleOpenChatConnectionProvider : undefined}
-                      onOpenKnowledgeLibrary={handleOpenKnowledgeLibrary}
-                      onOpenTeams={oomolEnabled ? handleOpenTeams : undefined}
-                      onSelectKnowledgeBase={handleAddKnowledgeBaseReference}
-                      onViewBilling={oomolEnabled ? handleViewBilling : undefined}
-                    />
-                  </div>
+                  <div className="min-w-0 flex-1 overflow-hidden">{chatArea}</div>
                   <AppShellConnectionDrawer
                     accessContext={connectionAccessContext}
                     authIntent={chatConnectionAuthIntent}

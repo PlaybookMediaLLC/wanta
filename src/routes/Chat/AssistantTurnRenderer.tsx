@@ -28,7 +28,6 @@ import { ProcessActivityViewport } from "./ProcessActivityViewport.tsx"
 import { formatWholeSecondDuration } from "./tool-activity.ts"
 import { toolActionSummary, toolServiceSlug } from "./tool-display.ts"
 import { ToolActivityStep } from "./ToolActivityStep.tsx"
-import { groupedToolActivityParts } from "./wikigraph-tool-grouping.ts"
 import { MessageResponse } from "@/components/ai-elements/message"
 import { MarkdownImage } from "@/components/ai-elements/message-image"
 import { Task, TaskContent, TaskTrigger } from "@/components/ai-elements/task"
@@ -81,8 +80,6 @@ function processStatusText(t: TranslateFn, status: ChatTurnProcessStatus): strin
       return t("chat.processStopped")
     case "completed":
       return t("chat.processCompleted")
-    case "completedWithIssues":
-      return t("chat.processCompletedWithIssues")
   }
 }
 
@@ -95,6 +92,7 @@ export function TurnProcessActivity({
   blocks,
   process,
   live = false,
+  pendingResponse = false,
   billingCacheScope,
   providerByService,
   onAuthorize,
@@ -106,6 +104,7 @@ export function TurnProcessActivity({
   blocks: AssistantTimelineBlock[]
   process: ReturnType<typeof summarizeTurnProcess>
   live?: boolean
+  pendingResponse?: boolean
   billingCacheScope: string
   providerByService: Map<string, ConnectionProvider>
   onAuthorize: (auth: AuthorizationInfo, source?: ChatTurnRetrySource) => void
@@ -205,7 +204,15 @@ export function TurnProcessActivity({
               onViewBilling={onViewBilling}
             />
           ))}
-          {showLiveStatus ? <LiveStatusBar process={process} live={live} /> : null}
+          {pendingResponse ? (
+            <div className="rounded-md text-muted-foreground">
+              <div className="flex min-h-6 min-w-0 items-center">
+                <LoadingShimmerText className="min-w-0 truncate">{t("chat.activityFinalizing")}</LoadingShimmerText>
+              </div>
+            </div>
+          ) : showLiveStatus ? (
+            <LiveStatusBar process={process} live={live} />
+          ) : null}
         </ProcessActivityViewport>
       </TaskContent>
     </Task>
@@ -353,7 +360,7 @@ export function AssistantBlock({
         ) : null
       ) : (
         <div className="space-y-0.5">
-          {groupedToolActivityParts(block.parts).map((part) => {
+          {block.parts.map((part) => {
             const service = toolServiceSlug(part)
             return (
               <ToolActivityStep

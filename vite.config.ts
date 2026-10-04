@@ -148,23 +148,25 @@ export default defineConfig(({ command, mode }) => {
           vite: {
             define: buildDefines,
             build: {
-              rollupOptions: {
+              rolldownOptions: {
                 input: {
                   main: path.join(dirname, "electron/main.ts"),
                   "spreadsheet-preview-worker": path.join(dirname, "electron/chat/spreadsheet-preview-worker.ts"),
-                  "wanta-wg": path.join(dirname, "electron/knowledge/wg.ts"),
                   "wanta-oo-guard": path.join(dirname, "electron/agent/oo-guard.ts"),
+                  "wanta-opencode-oo-guard": path.join(dirname, "electron/agent/opencode-oo-guard.ts"),
                 },
-                // @opencode-ai/sdk 依赖 cross-spawn（CJS require("child_process")）、electron-updater 走
-                // CJS 动态 require，playwright-core 需要保留其运行时模块结构，都不能打进 ESM 主进程包；
+                // AI SDK / @opencode-ai/sdk 依赖含 CJS 动态 require，electron-updater 走 CJS 动态
+                // require，playwright-core 需要保留其运行时模块结构，都不能打进 ESM 主进程包；
                 // 外部化后由 Node 运行时解析（electron-builder 随 dependencies 打包）。正则覆盖子路径导入
                 // （如 @opencode-ai/sdk/v2/client）——精确字符串匹配不会命中子路径，否则 v2 client 会被
                 // 错误内联进主进程包。
                 external: [
+                  /^@ai-sdk\//,
                   /^@opencode-ai\/sdk(\/|$)/,
+                  /^ai(\/|$)/,
+                  /^fsevents(\/|$)/,
                   /^playwright-core(\/|$)/,
-                  /^wiki-graph(\/|$)/,
-                  /^wiki-graph-core(\/|$)/,
+                  /^yazl(\/|$)/,
                   "electron-updater",
                 ],
               },
@@ -177,7 +179,7 @@ export default defineConfig(({ command, mode }) => {
           vite: {
             define: buildDefines,
             build: {
-              rollupOptions: {
+              rolldownOptions: {
                 output: {
                   entryFileNames: "preload.js",
                 },
@@ -195,6 +197,7 @@ export default defineConfig(({ command, mode }) => {
     // 一次性 esbuild 预构建，避免渲染进程首次触达这些依赖时才即时优化、进而触发整页 reload 的卡顿。
     optimizeDeps: {
       include: [
+        "@oomol-lab/open-flow/workbench",
         "@iconify-icons/simple-icons/cloudflare",
         "@iconify-icons/simple-icons/googlebigquery",
         "@iconify-icons/simple-icons/openai",

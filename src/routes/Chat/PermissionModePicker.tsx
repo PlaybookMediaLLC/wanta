@@ -1,6 +1,6 @@
 import type { AgentPermissionMode } from "../../../electron/chat/common.ts"
 
-import { Check, ChevronDown, Eye, Map as MapIcon, PencilLine, ShieldCheck, Sparkles, TriangleAlert } from "lucide-react"
+import { ChevronDown, Eye, Map as MapIcon, PencilLine, ShieldCheck, Sparkles, TriangleAlert } from "lucide-react"
 import * as React from "react"
 import { createPortal } from "react-dom"
 import { nextModelMenuIndex } from "./model-control-utils.ts"
@@ -75,11 +75,13 @@ function PermissionModeIcon({ mode, active = false }: { mode: AgentPermissionMod
  */
 export function PermissionModePicker({
   disabled,
+  nativePermissions = false,
   modes,
   value,
   onSelect,
 }: {
   disabled: boolean
+  nativePermissions?: boolean
   modes?: readonly AgentPermissionMode[]
   value: AgentPermissionMode
   onSelect: (mode: AgentPermissionMode) => void
@@ -169,7 +171,9 @@ export function PermissionModePicker({
             const active = value === mode
             const highlighted = index === activeIndex
             const label = permissionModeLabel(mode, t)
-            const description = permissionModeDescription(mode, t)
+            const description = nativePermissions
+              ? t("chat.permissionModeNativeDescription")
+              : permissionModeDescription(mode, t)
             return (
               <button
                 key={mode}
@@ -188,8 +192,8 @@ export function PermissionModePicker({
                 title={`${label} · ${description}`}
                 className={cn(
                   "flex min-h-14 w-full min-w-0 items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-accent hover:text-accent-foreground",
-                  active && "font-medium",
-                  highlighted && "bg-accent text-accent-foreground",
+                  active && "bg-secondary font-medium text-secondary-foreground hover:bg-secondary",
+                  highlighted && !active && "bg-accent text-accent-foreground",
                 )}
                 disabled={disabled}
                 onMouseEnter={() => {
@@ -203,14 +207,13 @@ export function PermissionModePicker({
                   <PermissionModeIcon mode={mode} active={active} />
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className={cn("oo-text-label block truncate", active && "font-medium")}>{label}</span>
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className={cn("oo-text-label min-w-0 flex-1 truncate", active && "font-medium")}>
+                      {label}
+                    </span>
+                  </span>
                   <span className="oo-text-caption mt-0.5 block text-muted-foreground">{description}</span>
                 </span>
-                {active ? (
-                  <Check className="mt-0.5 size-4 shrink-0" />
-                ) : (
-                  <span className="size-4 shrink-0" aria-hidden />
-                )}
               </button>
             )
           })}

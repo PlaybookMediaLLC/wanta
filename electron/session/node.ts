@@ -9,7 +9,6 @@ import type {
   GenerateSessionTitleRequest,
   GenerateSessionTitleResult,
   SetSessionPermissionModeRequest,
-  SetSessionKnowledgeBasesRequest,
   SetSessionAgentSelectionRequest,
   SessionInfo,
   SessionPlacement,
@@ -27,7 +26,7 @@ import type { IConnectionService } from "@oomol/connection"
 import { ConnectionService } from "@oomol/connection"
 import { randomUUID } from "node:crypto"
 import path from "node:path"
-import { EXTERNAL_AGENT_KINDS, isExternalAgentKind } from "../agent/contract/profile.ts"
+import { isExternalAgentKind } from "../agent/contract/profile.ts"
 import {
   externalAgentKindForSessionId,
   isExternalSessionId,
@@ -36,7 +35,6 @@ import {
 import { AGENT_PERMISSION_MODES } from "../chat/common.ts"
 import { logDiagnostic } from "../diagnostics-log.ts"
 import { normalizeSessionScopeValue, sessionScopesEqual, SessionService as SessionServiceName } from "./common.ts"
-import { normalizeKnowledgeBaseIds } from "./metadata-store.ts"
 
 interface SessionServiceDeps {
   activityStore?: SessionActivityStore
@@ -217,17 +215,19 @@ export class SessionServiceImpl
   }
 
   private async createMutation(req: CreateSessionRequest, revision: number): Promise<SessionInfo> {
-    // Only a REGISTERED external kind mints an external session id; isExternalAgentKind
-    // alone is `!== "opencode"`, so RPC-erased junk (unknown or prototype-chain kinds)
-    // must not reach mintExternalSessionId. Unknown kinds fall through to the kernel.
-    if (req.agentKind && isExternalAgentKind(req.agentKind) && EXTERNAL_AGENT_KINDS.includes(req.agentKind)) {
+    if (isExternalAgentKind(req.agentKind)) {
       return this.createExternalMutation(req, req.agentKind, revision)
+    }
+    if (req.agentKind !== undefined && req.agentKind !== "opencode") {
+      logDiagnostic("session-service", "rejected unregistered agent kind", { agentKind: req.agentKind }, "warn")
+      throw new Error(`Unsupported agent kind: ${String(req.agentKind)}`)
     }
     const agent = this.agent
     if (!agent) {
       throw new Error("Agent not configured (sign in first)")
     }
     const scope = normalizeRequestedSessionScope(req.scope)
+    if (req.knowledgeMode && scope.kind !== "team") throw new Error("Knowledge analysis requires a team workspace")
     const projectId = req.projectId?.trim() || undefined
     const info = await agent.createSession(req.title)
     if (!this.runtimeMatches(agent, revision)) {
@@ -260,6 +260,7 @@ export class SessionServiceImpl
       {
         ...this.sessionMetadata.get(info.id),
         scope,
+        ...(req.knowledgeMode ? { knowledgeMode: true } : {}),
         ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
       },
       nextMetadata,
@@ -275,7 +276,12 @@ export class SessionServiceImpl
       throw error
     }
     this.broadcastChangedBestEffort("create session")
-    return { ...info, scope, ...(scopedProjectId ? { projectId: scopedProjectId } : {}) }
+    return {
+      ...info,
+      scope,
+      ...(req.knowledgeMode ? { knowledgeMode: true } : {}),
+      ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+    }
   }
 
   /** External (BYOA) sessions are Wanta-owned records; no kernel round trip is involved. */
@@ -285,6 +291,7 @@ export class SessionServiceImpl
     revision: number,
   ): Promise<SessionInfo> {
     const scope = normalizeRequestedSessionScope(req.scope)
+    if (req.knowledgeMode && scope.kind !== "team") throw new Error("Knowledge analysis requires a team workspace")
     const projectId = req.projectId?.trim() || undefined
     await this.ensureMetadataLoaded(revision)
     await this.ensureProjectsLoaded(revision)
@@ -303,7 +310,11 @@ export class SessionServiceImpl
     const nextMetadata = new Map(this.sessionMetadata)
     this.setMetadataEntry(
       record.id,
-      { scope, ...(scopedProjectId ? { projectId: scopedProjectId } : {}) },
+      {
+        scope,
+        ...(req.knowledgeMode ? { knowledgeMode: true } : {}),
+        ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+      },
       nextMetadata,
     )
     await this.commitExternal(nextExternal)
@@ -327,6 +338,7 @@ export class SessionServiceImpl
       updatedAt: record.updatedAt,
       agentKind,
       scope,
+      ...(req.knowledgeMode ? { knowledgeMode: true } : {}),
       ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
     }
   }
@@ -447,53 +459,6 @@ export class SessionServiceImpl
     this.setMetadataEntry(req.id, next, nextMetadata)
     await this.commitMetadata(nextMetadata)
     this.broadcastChangedBestEffort("set session permission mode")
-  }
-
-  public setKnowledgeBases(req: SetSessionKnowledgeBasesRequest): Promise<void> {
-    return this.enqueueMutation((revision) => this.setKnowledgeBasesMutation(req, revision))
-  }
-
-  private async setKnowledgeBasesMutation(req: SetSessionKnowledgeBasesRequest, revision: number): Promise<void> {
-    await this.ensureMetadataLoaded(revision)
-    const current = this.sessionMetadata.get(req.id) ?? {}
-    const knowledgeBaseIds = normalizeKnowledgeBaseIds(req.knowledgeBaseIds) ?? []
-    const currentIds = current.knowledgeBaseIds ?? []
-    const currentIdSet = new Set(currentIds)
-    if (currentIds.length === knowledgeBaseIds.length && knowledgeBaseIds.every((id) => currentIdSet.has(id))) return
-    const next = { ...current }
-    if (knowledgeBaseIds.length > 0) next.knowledgeBaseIds = knowledgeBaseIds
-    else delete next.knowledgeBaseIds
-    const nextMetadata = new Map(this.sessionMetadata)
-    this.setMetadataEntry(req.id, next, nextMetadata)
-    await this.commitMetadata(nextMetadata)
-    this.broadcastChangedBestEffort("set session knowledge bases")
-  }
-
-  /** 知识库删除后的跨会话清理；不是 RPC 面，只由主进程知识库服务调用。 */
-  public removeKnowledgeBaseReferences(knowledgeBaseId: string): Promise<number> {
-    return this.enqueueMutation((revision) => this.removeKnowledgeBaseReferencesMutation(knowledgeBaseId, revision))
-  }
-
-  private async removeKnowledgeBaseReferencesMutation(knowledgeBaseId: string, revision: number): Promise<number> {
-    const normalizedId = knowledgeBaseId.trim()
-    if (!normalizedId) return 0
-    await this.ensureMetadataLoaded(revision)
-    const nextMetadata = new Map(this.sessionMetadata)
-    let changed = 0
-    for (const [sessionId, metadata] of this.sessionMetadata) {
-      const current = metadata.knowledgeBaseIds
-      if (!current?.includes(normalizedId)) continue
-      const next = { ...metadata }
-      const ids = current.filter((id) => id !== normalizedId)
-      if (ids.length > 0) next.knowledgeBaseIds = ids
-      else delete next.knowledgeBaseIds
-      this.setMetadataEntry(sessionId, next, nextMetadata)
-      changed += 1
-    }
-    if (changed === 0) return 0
-    await this.commitMetadata(nextMetadata)
-    this.broadcastChangedBestEffort("remove knowledge base references")
-    return changed
   }
 
   public renameProject(req: { id: string; name: string }): Promise<void> {
@@ -1199,9 +1164,9 @@ export class SessionServiceImpl
       metadata.scope ||
       metadata.projectId ||
       metadata.permissionMode ||
+      metadata.knowledgeMode ||
       metadata.agentModelId ||
       metadata.agentEffortId ||
-      metadata.knowledgeBaseIds ||
       metadata.pinnedAt ||
       metadata.archivedAt
     ) {
@@ -1238,9 +1203,9 @@ export class SessionServiceImpl
       scope,
       ...(project ? { projectId: project.id } : {}),
       ...(metadata?.permissionMode ? { permissionMode: metadata.permissionMode } : {}),
+      ...(metadata?.knowledgeMode ? { knowledgeMode: true } : {}),
       ...(metadata?.agentModelId ? { agentModelId: metadata.agentModelId } : {}),
       ...(metadata?.agentEffortId ? { agentEffortId: metadata.agentEffortId } : {}),
-      ...(metadata?.knowledgeBaseIds ? { knowledgeBaseIds: metadata.knowledgeBaseIds } : {}),
       ...(usedAt && usedAt > session.updatedAt ? { updatedAt: usedAt } : {}),
       ...(metadata?.pinnedAt ? { pinnedAt: metadata.pinnedAt } : {}),
       ...(metadata?.archivedAt ? { archivedAt: metadata.archivedAt } : {}),
@@ -1314,9 +1279,9 @@ export class SessionServiceImpl
           scope,
           ...(project ? { projectId: project.id } : {}),
           ...(metadata?.permissionMode ? { permissionMode: metadata.permissionMode } : {}),
+          ...(metadata?.knowledgeMode ? { knowledgeMode: true } : {}),
           ...(metadata?.agentModelId ? { agentModelId: metadata.agentModelId } : {}),
           ...(metadata?.agentEffortId ? { agentEffortId: metadata.agentEffortId } : {}),
-          ...(metadata?.knowledgeBaseIds ? { knowledgeBaseIds: metadata.knowledgeBaseIds } : {}),
           ...(usedAt && usedAt > session.updatedAt ? { updatedAt: usedAt } : {}),
           ...(metadata?.pinnedAt ? { pinnedAt: metadata.pinnedAt } : {}),
           ...(metadata?.archivedAt ? { archivedAt: metadata.archivedAt } : {}),

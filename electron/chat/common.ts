@@ -1,5 +1,5 @@
-import type { ExternalAgentKind } from "../agent/contract/profile.ts"
-import type { ExternalAgentRuntimeStatus } from "../agent/external/status.ts"
+import type { AgentKind, ExternalAgentKind } from "../agent/contract/profile.ts"
+import type { ExternalAgentCatalog, ExternalAgentRuntimeStatus } from "../agent/external/status.ts"
 import type { WantaAgentMode } from "../agent/mode.ts"
 import type { WantaReasoningLevel } from "../agent/reasoning.ts"
 import type { AppLocale } from "../app-locale.ts"
@@ -10,6 +10,29 @@ import type { ChatErrorKind } from "./error.ts"
 import type { ServiceName } from "@oomol/connection"
 
 import { serviceName } from "../branding.ts"
+
+export interface ComposerDraftPreferences {
+  agentKind: AgentKind
+  permissionMode: AgentPermissionMode
+  modelId?: string
+  effortId?: string
+}
+
+export interface ComposerDraftRecord {
+  interruptedImport?: boolean
+  preferences?: ComposerDraftPreferences
+  attachments: ChatAttachment[]
+  contextMentions: ChatContextMention[]
+  command: "bug-report" | null
+  draft: string
+  draftSelection: { start: number; end: number }
+  dismissedTriggerKey: null
+}
+export interface ComposerDraftRequest {
+  owner: string
+  key: string
+  value: ComposerDraftRecord | null
+}
 
 export type ChatRole = "user" | "assistant"
 export type ToolStatus = "pending" | "running" | "completed" | "error"
@@ -46,6 +69,10 @@ export interface ToolTiming {
 
 // ── ServerEvents 负载（R7 流式：主进程把 OpenCode SSE 转译为这些事件推给渲染层）──
 export interface MessageStartedEvent {
+  /** Native user-message parent, when supplied by the backend. */
+  parentMessageId?: string
+  /** Host generation identity, attached before IPC buffering. */
+  runId?: string
   sessionId: string
   messageId: string
   role: ChatRole
@@ -56,6 +83,8 @@ export interface MessageStartedEvent {
   completedAt?: number
 }
 export interface MessageDeltaEvent {
+  /** Host generation identity, attached before IPC buffering. */
+  runId?: string
   sessionId: string
   messageId: string
   partId: string
@@ -67,6 +96,8 @@ export interface MessageDeltaEvent {
   synthetic?: boolean
 }
 export interface MessageReasoningDeltaEvent {
+  /** Host generation identity, attached before IPC buffering. */
+  runId?: string
   sessionId: string
   messageId: string
   partId: string
@@ -75,6 +106,8 @@ export interface MessageReasoningDeltaEvent {
   delta?: string
 }
 export interface MessageAttachmentEvent {
+  /** Host generation identity, attached before IPC buffering. */
+  runId?: string
   sessionId: string
   messageId: string
   partId: string
@@ -91,6 +124,8 @@ export interface TurnOutputUpdatedEvent {
 export type AssistantActivityPhase = "thinking" | "finalizing" | "retrying" | "compacting" | "resuming"
 
 export interface AssistantActivityEvent {
+  /** Host generation identity, attached before IPC buffering. */
+  runId?: string
   sessionId: string
   messageId?: string
   phase: AssistantActivityPhase
@@ -101,6 +136,8 @@ export interface AssistantActivityEvent {
   nextRetryAt?: number
 }
 export interface ToolCallStartedEvent {
+  /** Host generation identity, attached before IPC buffering. */
+  runId?: string
   sessionId: string
   messageId: string
   partId: string
@@ -122,6 +159,8 @@ export type ToolFailureKind =
   | "unknown"
 export type ToolUserImpact = "none" | "read_only" | "side_effect_possible"
 export interface ToolCallResultEvent {
+  /** Host generation identity, attached before IPC buffering. */
+  runId?: string
   sessionId: string
   messageId: string
   partId: string
@@ -183,14 +222,23 @@ export type LocalPermissionPromptReason =
   | "broad_resource"
   | "dependency_mutation"
   | "high_risk_command"
+  | "project_environment_write"
   | "sensitive_resource"
   | "unclassified_request"
+export interface NativePermissionOption {
+  optionId: string
+  name: string
+  kind: "allow_once" | "allow_always" | "reject_once" | "reject_always"
+}
+
 export interface ChatPermissionRequest {
   id: string
   sessionId: string
   action: string
   resources: string[]
   save?: string[]
+  /** Original choices from the native agent; Wanta only displays and forwards them. */
+  nativeOptions?: NativePermissionOption[]
   metadata?: Record<string, unknown>
   /** Wanta-owned presentation context. Never accepted as policy input from OpenCode. */
   wanta?: {
@@ -210,10 +258,15 @@ export interface PermissionResolvedEvent {
   sessionId: string
   requestId: string
 }
+export interface PermissionModeUpdatedEvent {
+  sessionId: string
+  permissionMode: AgentPermissionMode
+}
 export interface AnswerPermissionRequest {
   sessionId: string
   requestId: string
   reply: ChatPermissionReply
+  optionId?: string
 }
 export interface SetChatPermissionModeRequest {
   sessionId: string
@@ -221,7 +274,26 @@ export interface SetChatPermissionModeRequest {
   version?: number
 }
 export interface MessageCompletedEvent {
+  /** Native acknowledgement that a cancelled prompt has fully drained. */
+  outcome?: "cancelled"
+  /** Host generation identity; absent on native adapter input. */
+  runId?: string
   sessionId: string
+}
+/**
+ * Authoritative host-side terminal outcome for a user turn. `messageCompleted`
+ * remains the legacy successful-completion notification; consumers that need
+ * to distinguish stop, failure, and interruption should use this event.
+ */
+export type ChatTurnOutcomeKind = "completed" | "cancelled" | "failed" | "interrupted"
+export interface TurnOutcomeEvent {
+  /** Host generation identity; absent on native adapter input. */
+  runId?: string
+  sessionId: string
+  kind: ChatTurnOutcomeKind
+  messageId?: string
+  /** Stable host or adapter reason, safe to log and display as diagnostics. */
+  reason?: string
 }
 /** Cumulative token usage snapshot reported by an external agent mid-turn or at completion. */
 export interface UsageUpdatedEvent {
@@ -238,12 +310,19 @@ export interface SetExternalSessionEffortRequest {
   sessionId: string
   effortId?: string
 }
+/** Invoke an authentication method advertised by a local external agent. */
+export interface AuthenticateExternalAgentRequest {
+  kind: ExternalAgentKind
+  methodId: string
+}
 export interface MessagePartRemovedEvent {
   sessionId: string
   messageId: string
   partId: string
 }
 export interface MessageErrorEvent {
+  /** Host generation identity; absent on native adapter input. */
+  runId?: string
   sessionId: string
   messageId?: string
   partId: string
@@ -252,6 +331,8 @@ export interface MessageErrorEvent {
   errorCode?: string
 }
 export interface GenerationStoppedEvent {
+  /** Host generation identity; absent on native adapter input. */
+  runId?: string
   sessionId: string
   messageId?: string
   partIds?: string[]
@@ -267,6 +348,8 @@ export type GenerationInterruptedReason =
   | "submit_timeout"
 
 export interface GenerationInterruptedEvent {
+  /** Host generation identity; absent on native adapter input. */
+  runId?: string
   sessionId: string
   messageId?: string
   partIds?: string[]
@@ -444,6 +527,7 @@ export interface ChatTeamSkillContext {
 }
 
 export type ChatContextMention =
+  | { kind: "cloud-knowledge"; id: string; displayName: string }
   | {
       description?: string
       displayName?: string
@@ -458,12 +542,6 @@ export type ChatContextMention =
       displayName: string
       kind: "connection"
       service: string
-    }
-  | {
-      id: string
-      kind: "knowledge"
-      name: string
-      scope?: "archive" | "library"
     }
 
 export interface ChatAttachment {
@@ -487,6 +565,7 @@ export interface AttachmentPreviewRequest {
 
 export interface AttachmentPreviewResult {
   dataUrl: string | null
+  reason?: "unsupported_type" | "too_large" | "missing" | "read_failed"
   resourceExpiresAt?: number
   resourceUrl?: string
 }
@@ -546,7 +625,7 @@ export interface LocalArtifactArchiveEntry {
 export interface LocalArtifactArchivePreview {
   entries: LocalArtifactArchiveEntry[]
   format: "tar" | "zip"
-  totalEntries: number
+  totalEntries: number | null
 }
 
 export interface LocalArtifactPreviewRequest {
@@ -601,6 +680,8 @@ export type ArtifactBundleKind = LocalArtifactPackKind
 export type ArtifactBundleDisplay = LocalArtifactDisplayMode
 export type ArtifactBundleStatus = "ready" | "partial" | "failed"
 export type ArtifactBundleFailure =
+  | "artifact_declaration_invalid"
+  | "artifact_declaration_partial"
   | "generated_preview_not_persisted"
   | "generated_preview_persistence_unverified"
   | "project_output_publish_failed"
@@ -627,13 +708,19 @@ export interface LocalArtifactPack {
   supporting: LocalArtifactEntry[]
   totalItems: number
   truncated: boolean
+  rejectedItems?: number
 }
 
 export interface ArtifactBundle {
+  /** Version 2 bundles were built from a host-validated explicit artifact declaration. */
+  version?: 2
   id: string
   sessionId: string
   messageId: string
   rootPath: string
+  title?: string
+  summary?: string
+  classification?: "declared" | "inferred"
   status: ArtifactBundleStatus
   kind: ArtifactBundleKind
   display: ArtifactBundleDisplay
@@ -649,6 +736,10 @@ export interface ArtifactItem extends LocalArtifactItem {
   id: string
   status: ArtifactItemStatus
   origin: ArtifactItemOrigin
+  role?: Exclude<LocalArtifactEntryRole, "metadata">
+  order?: number
+  title?: string
+  description?: string
 }
 
 export interface ArtifactBundlesRequest {
@@ -683,6 +774,8 @@ export interface TurnOutputFile {
 export interface TurnOutputRecord {
   sessionId: string
   messageId: string
+  /** Managed artifact root may also contain explicitly undeclared execution files. */
+  artifactProcessRoot?: string
   processRoot?: string
   projectRoot?: string
   createdAt: number
@@ -811,39 +904,36 @@ export interface SubscriptionStatus {
   plans: string[]
   plan: string | null
   features: string[]
+  team: TeamAdditionalSeatsData
   platforms: Record<string, string[]>
-  team?: TeamAdditionalSeatsData
+}
+
+export interface SubscriptionSchedule {
+  plan: string
+  scheduled: boolean
+  reason?: "cancel" | "update"
+  targetPlan?: string | null
+  targetAdditionalSeats?: number | null
+  cancelAt?: number
+  currentPeriodEnd?: number
+  scheduledEffectiveAt?: number | null
 }
 
 export interface TeamAdditionalSeatsData {
   additionalSeats: number
+  maxMembers?: number
   updatedAt: number | null
   cached: boolean
 }
 
-export interface TeamSubscriptionChangePayload {
-  additional_seats?: number
-  plan?: TeamSubscriptionPlan | null
-}
-
-export interface TeamSubscriptionPreviewResult {
-  amountDue: number
-  changeTiming: "immediate" | "next_cycle"
-  currency: string | null
-  mode: "create" | "update"
-  targetAdditionalSeats: number
-  targetPlan: TeamSubscriptionPlan | null
-  total: number
-}
-
 export interface TeamSubscriptionUpdateResult {
-  subscriptionID: string
-  status: string
+  subscriptionID: string | null
+  status: string | null
   plan: TeamSubscriptionPlan | null
   additionalSeats: number
   targetPlan: TeamSubscriptionPlan | null
   targetAdditionalSeats: number
-  currentPeriodEnd: number
+  currentPeriodEnd: number | null
   latestInvoiceID: string | null
   paymentRequired: boolean
   paymentURL: string | null
@@ -856,20 +946,55 @@ export interface TeamSubscriptionUpdateResult {
   scheduledEffectiveAt: number | null
 }
 
-export interface TeamPendingPaymentResult {
+export interface TeamPendingPaymentResult extends Omit<
+  TeamSubscriptionUpdateResult,
+  "subscriptionID" | "status" | "currentPeriodEnd"
+> {
   subscriptionID: string | null
   status: string | null
-  plan: TeamSubscriptionPlan | null
-  additionalSeats: number
   currentPeriodEnd: number | null
-  latestInvoiceID: string | null
-  paymentRequired: boolean
-  paymentURL: string | null
-  invoiceStatus: string | null
-  amountRemaining: number | null
+}
+
+export interface TeamSubscriptionPreviewLine {
+  id: string
+  description: string | null
+  amount: number
+  discountAmount?: number
+  amountAfterDiscount?: number
+  currency: string
+  quantity: number | null
+  plan: string | null
+  priceID: string | null
+  subscriptionItemID: string | null
+  periodStart: number
+  periodEnd: number
+  proration: boolean
+}
+
+export interface TeamSubscriptionPreviewResult {
+  mode: "create" | "update"
+  changeTiming: "immediate" | "next_cycle"
+  subscriptionID: string | null
+  currentPlan: TeamSubscriptionPlan | null
+  currentAdditionalSeats: number
+  targetPlan: TeamSubscriptionPlan | null
+  targetAdditionalSeats: number
+  currentPeriodEnd: number | null
+  effectiveAt: number | null
+  billingCycleAnchor: number | null
+  prorationDate: number
+  amountDue: number
+  amountRemaining: number
+  subtotal: number
+  total: number
   currency: string | null
-  pendingUpdate: boolean
-  pendingUpdateExpiresAt: number | null
+  nextPaymentAttempt: number | null
+  lines: TeamSubscriptionPreviewLine[]
+}
+
+export type TeamSubscriptionChangePayload = {
+  additional_seats?: number
+  plan?: TeamSubscriptionPlan | null
 }
 
 export interface BillingOverviewResult {
@@ -902,7 +1027,9 @@ export const ChatService = serviceName("chat-service") as ServiceName<{
     questionRejected: QuestionResolvedEvent
     permissionAsked: PermissionAskedEvent
     permissionReplied: PermissionResolvedEvent
+    permissionModeUpdated: PermissionModeUpdatedEvent
     messageCompleted: MessageCompletedEvent
+    turnOutcome: TurnOutcomeEvent
     messagePartRemoved: MessagePartRemovedEvent
     messageError: MessageErrorEvent
     generationStopped: GenerationStoppedEvent
@@ -915,6 +1042,8 @@ export const ChatService = serviceName("chat-service") as ServiceName<{
     runtimeCapabilitiesChanged: RuntimeCapabilitiesChangedEvent
   }
   ClientInvokes: {
+    getComposerDrafts(owner: string): Promise<Record<string, ComposerDraftRecord>>
+    saveComposerDraft(req: ComposerDraftRequest): Promise<void>
     sendMessage(req: SendMessageRequest): Promise<void>
     getAttachmentPreview(req: AttachmentPreviewRequest): Promise<AttachmentPreviewResult>
     copyLocalImage(req: LocalImageRequest): Promise<void>
@@ -945,6 +1074,7 @@ export const ChatService = serviceName("chat-service") as ServiceName<{
     getAgentStatus(): Promise<AgentRuntimeStatus>
     getRuntimeCapabilities(): Promise<RuntimeCapabilities>
     getExternalAgents(): Promise<ExternalAgentRuntimeStatus[]>
+    authenticateExternalAgent(req: AuthenticateExternalAgentRequest): Promise<ExternalAgentRuntimeStatus>
     /** Live model/effort switch for an external session; rejects for kernel sessions. */
     setExternalSessionModel(req: SetExternalSessionModelRequest): Promise<void>
     setExternalSessionEffort(req: SetExternalSessionEffortRequest): Promise<void>
@@ -952,6 +1082,10 @@ export const ChatService = serviceName("chat-service") as ServiceName<{
     getExternalSessionSelection(sessionId: string): Promise<{ modelId?: string; effortId?: string }>
     /** Pre-populate an agent's model/effort catalog when the composer focuses it. */
     warmExternalAgent(kind: ExternalAgentKind): Promise<void>
+    previewExternalAgentCatalog(req: {
+      kind: ExternalAgentKind
+      modelId?: string
+    }): Promise<ExternalAgentCatalog | undefined>
     /** Agent sidecar 是否就绪；本地模式缺少 custom model 时为 false。 */
     isReady(): Promise<boolean>
   }

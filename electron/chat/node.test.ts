@@ -65,10 +65,8 @@ function createBridgeAgent(): {
   getPendingPermissionsForSessions: ReturnType<typeof vi.fn>
   getPendingQuestions: ReturnType<typeof vi.fn>
   getPendingQuestionsForSessions: ReturnType<typeof vi.fn>
-  inheritSessionKnowledgeBaseIds: ReturnType<typeof vi.fn>
   promptStreaming: ReturnType<typeof vi.fn>
   rejectQuestion: ReturnType<typeof vi.fn>
-  setSessionKnowledgeBaseIds: ReturnType<typeof vi.fn>
   setSessionTeamName: ReturnType<typeof vi.fn>
 } {
   let listener:
@@ -91,7 +89,6 @@ function createBridgeAgent(): {
     const results = await Promise.all(sessionIds.map((sessionId) => getPendingQuestions(sessionId)))
     return results.flat()
   })
-  const inheritSessionKnowledgeBaseIds = vi.fn(async () => undefined)
   const promptStreaming = vi.fn(
     async (_sessionId: string, _text: string, _options: { messageId?: string }) => undefined,
   )
@@ -117,9 +114,8 @@ function createBridgeAgent(): {
   })
   const rejectQuestion = vi.fn(async () => undefined)
   const clearSessionTeamName = vi.fn(async () => undefined)
-  const clearSessionKnowledgeBaseIds = vi.fn(async () => undefined)
-  const setSessionKnowledgeBaseIds = vi.fn(async () => undefined)
   const setSessionTeamName = vi.fn(async () => undefined)
+  const scrubSessionSensitiveOoOutputs = vi.fn(async () => 0)
   const manager = {
     isReady: () => true,
     subscribe: (
@@ -137,17 +133,15 @@ function createBridgeAgent(): {
     createArtifactDir,
     createProcessDir,
     clearSessionTeamName,
-    clearSessionKnowledgeBaseIds,
     rejectQuestion,
     setSessionTeamName,
-    setSessionKnowledgeBaseIds,
+    scrubSessionSensitiveOoOutputs,
     promptStreaming,
     getMessages,
     getPendingPermissions,
     getPendingPermissionsForSessions,
     getPendingQuestions,
     getPendingQuestionsForSessions,
-    inheritSessionKnowledgeBaseIds,
   } as unknown as AgentManager
   const agent = new OpencodeAgentAdapter(manager)
   // The stub manager reports ready, so start() only attaches the translated event stream (synchronous).
@@ -173,11 +167,9 @@ function createBridgeAgent(): {
     getPendingPermissionsForSessions,
     getPendingQuestions,
     getPendingQuestionsForSessions,
-    inheritSessionKnowledgeBaseIds,
     getMessages,
     promptStreaming,
     rejectQuestion,
-    setSessionKnowledgeBaseIds,
     setSessionTeamName,
   }
 }
@@ -530,14 +522,16 @@ test("active run snapshots track permission waits and completion", async () => {
     properties: {
       action: "bash",
       id: "permission-1",
-      resources: ["npm install"],
-      metadata: { command: "npm install" },
+      resources: ["npm install -g cowsay"],
+      metadata: { command: "npm install -g cowsay" },
       sessionID: "session-1",
     },
   })
 
   assert.equal((await service.getActiveRun("session-1"))?.phase, "awaiting_permission")
   assert.deepEqual((await service.getActiveRun("session-1"))?.blockingRequestIds, ["permission-1"])
+
+  await service.answerPermission({ sessionId: "session-1", requestId: "permission-1", reply: "once" })
 
   bridge.emit({
     type: "message.updated",
@@ -782,9 +776,9 @@ test("stopGeneration suppresses delayed streaming events until the next send", a
     type: "session.error",
     properties: { sessionID: "session-1", error: { name: "AbortError" } },
   })
-  await waitForEventCount(events, beforeAbortEventCount + 1)
-  assert.equal(events.length, beforeAbortEventCount + 1)
-  assert.equal(events.at(-1)?.event, "generationStopped")
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(events.length, beforeAbortEventCount)
+  assert.equal(events.filter((event) => event.event === "generationStopped").length, 1)
   const abortEventCount = events.length
   bridge.emit({
     type: "message.part.updated",
@@ -908,7 +902,12 @@ test("stopping during compaction clears internal state before the next generatio
   assert.deepEqual(events.slice(eventCount), [
     {
       event: "messageStarted",
-      data: { sessionId: "session-1", messageId: "reused-message", role: "user" },
+      data: {
+        sessionId: "session-1",
+        messageId: "reused-message",
+        role: "user",
+        runId: (await service.getActiveRun("session-1"))?.runId,
+      },
     },
   ])
 })
@@ -926,6 +925,7 @@ test("a late idle from a stopped generation does not complete the retried genera
   })
   await service.stopGeneration("session-1")
   await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "second" })
+  const runId = (await service.getActiveRun("session-1"))?.runId
   const userMessageId = bridge.promptStreaming.mock.calls[1]?.[2]?.messageId as string
   bridge.emit({
     type: "message.updated",
@@ -949,6 +949,12 @@ test("a late idle from a stopped generation does not complete the retried genera
   await waitForCondition(() => !service.hasActiveGeneration())
 
   assert.equal(service.hasActiveGeneration(), false)
+  assert.deepEqual(events.filter((event) => event.event === "turnOutcome").at(-1)?.data, {
+    sessionId: "session-1",
+    kind: "completed",
+    runId,
+    messageId: "assistant-2",
+  })
   assert.equal(events.filter((event) => event.event === "messageCompleted").length, 1)
 })
 
@@ -1055,6 +1061,288 @@ test("sendMessage rejects a second active generation for the same session", asyn
     message: "A generation is already active for this session.",
   })
   assert.equal(bridge.promptStreaming.mock.calls.length, 1)
+})
+
+test.each(["policy", "user"] as const)(
+  "idle after a %s rejection reports the blocked tool, not a save failure",
+  async (source) => {
+    vi.useFakeTimers()
+    const bridge = createBridgeAgent()
+    const service = new ChatServiceImpl(bridge.agent)
+    const events = captureServiceEvents(service)
+    service.startEventBridge()
+    await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "validate" })
+    const userMessageId = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string
+    bridge.emit({
+      type: "message.updated",
+      properties: { info: { id: "assistant-tools", sessionID: "session-1", role: "assistant" } },
+    })
+    bridge.emit({
+      type: "permission.v2.asked",
+      properties: {
+        id: "permission-1",
+        sessionID: "session-1",
+        action: "bash",
+        resources: [source === "policy" ? "printenv" : "rm -rf /"],
+        tool: { messageID: "assistant-tools", callID: "call-1" },
+      },
+    })
+    if (source === "user")
+      await service.answerPermission({ sessionId: "session-1", requestId: "permission-1", reply: "reject" })
+    await vi.advanceTimersByTimeAsync(1)
+    if (source === "policy") {
+      expect(bridge.answerPermission).toHaveBeenCalledWith(
+        "session-1",
+        "permission-1",
+        "reject",
+        expect.stringContaining("environment_dump"),
+      )
+      expect(events.some((event) => event.event === "permissionAsked")).toBe(false)
+    } else {
+      expect(bridge.answerPermission).toHaveBeenCalledWith(
+        "session-1",
+        "permission-1",
+        "reject",
+        expect.stringContaining("The user declined this entire tool call"),
+      )
+    }
+    bridge.getMessages.mockResolvedValue([
+      { id: userMessageId, role: "user", createdAt: 1, parts: [] },
+      {
+        id: "assistant-tools",
+        role: "assistant",
+        createdAt: 2,
+        completedAt: 3,
+        finishReason: "tool-calls",
+        parts: [{ kind: "tool", partId: "part-1", callId: "call-1", status: "error", tool: "bash" }],
+      },
+    ])
+    bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+    await vi.advanceTimersByTimeAsync(60_000)
+    vi.useRealTimers()
+    await waitForCondition(() => events.some((event) => event.event === "messageError"))
+    const error = events.findLast((event) => event.event === "messageError")
+    expect(error?.data).toMatchObject({
+      errorKind: "tool_blocked",
+      errorCode: source === "policy" ? "CHAT_TOOL_POLICY_BLOCKED_ENVIRONMENT_DUMP" : "CHAT_TOOL_USER_DECLINED",
+    })
+    expect(service.hasActiveGeneration()).toBe(false)
+    expect(bridge.abort).not.toHaveBeenCalled()
+    expect(bridge.promptStreaming).toHaveBeenCalledTimes(1)
+    service.dispose()
+  },
+)
+
+test.each(["policy", "user"] as const)(
+  "a final response after %s feedback completes even when idle preceded the permission acknowledgement",
+  async (source) => {
+    vi.useFakeTimers()
+    const bridge = createBridgeAgent()
+    const service = new ChatServiceImpl(bridge.agent)
+    const events = captureServiceEvents(service)
+    service.startEventBridge()
+    await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "validate" })
+    const userMessageId = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string
+    bridge.emit({
+      type: "message.updated",
+      properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
+    })
+    let acknowledge!: () => void
+    bridge.answerPermission.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          acknowledge = resolve
+        }),
+    )
+    bridge.emit({
+      type: "permission.v2.asked",
+      properties: {
+        id: "permission-1",
+        sessionID: "session-1",
+        action: "bash",
+        resources: [source === "policy" ? "printenv" : "rm -rf /tmp/unowned-profile"],
+        tool: { messageID: "assistant-1", callID: "call-1" },
+      },
+    })
+    const userReply =
+      source === "user"
+        ? service.answerPermission({ sessionId: "session-1", requestId: "permission-1", reply: "reject" })
+        : undefined
+    bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+    await vi.advanceTimersByTimeAsync(90_000)
+    expect(service.hasActiveGeneration()).toBe(true)
+    expect(bridge.getMessages).not.toHaveBeenCalled()
+    bridge.getMessages.mockResolvedValue([
+      { id: userMessageId, role: "user", createdAt: 1, parts: [] },
+      {
+        id: "assistant-1",
+        role: "assistant",
+        createdAt: 2,
+        finishReason: "tool-calls",
+        parts: [{ kind: "tool", partId: "part-1", callId: "call-1", status: "error" }],
+      },
+      { id: "final", role: "assistant", createdAt: 3, completedAt: 4, finishReason: "stop", parts: [] },
+    ])
+    vi.useRealTimers()
+    acknowledge()
+    await userReply
+    await waitForCondition(() => !service.hasActiveGeneration())
+    expect(events.some((event) => event.event === "messageError")).toBe(false)
+    expect(events.findLast((event) => event.event === "turnOutcome")?.data).toMatchObject({
+      kind: "completed",
+      messageId: "final",
+    })
+    expect(bridge.promptStreaming).toHaveBeenCalledTimes(1)
+    service.dispose()
+  },
+)
+
+test("idle while awaiting approval has no completion deadline and resumes verification after reply", async () => {
+  vi.useFakeTimers()
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "hello" })
+  const userMessageId = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string
+  expect(userMessageId).toBeTypeOf("string")
+  bridge.emit({
+    type: "permission.v2.asked",
+    properties: { id: "permission-1", sessionID: "session-1", action: "bash", resources: ["rm -rf /"] },
+  })
+  bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+  await vi.advanceTimersByTimeAsync(90_000)
+  expect(service.hasActiveGeneration()).toBe(true)
+  expect(bridge.getMessages).not.toHaveBeenCalled()
+  expect(events.some((event) => event.event === "messageError")).toBe(false)
+  bridge.getMessages.mockResolvedValue([
+    { id: userMessageId, role: "user", createdAt: 1, parts: [] },
+    { id: "final", role: "assistant", createdAt: 2, completedAt: 3, finishReason: "stop", parts: [] },
+  ])
+  vi.useRealTimers()
+  await service.answerPermission({ sessionId: "session-1", requestId: "permission-1", reply: "once" })
+  await waitForCondition(() => !service.hasActiveGeneration())
+  expect(service.hasActiveGeneration()).toBe(false)
+  service.dispose()
+})
+
+test.each(["message", "busy"])(
+  "new %s progress invalidates an idle history read and its completion deadline",
+  async (progress) => {
+    vi.useFakeTimers()
+    const bridge = createBridgeAgent()
+    const service = new ChatServiceImpl(bridge.agent)
+    const events = captureServiceEvents(service)
+    service.startEventBridge()
+    await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "hello" })
+    const userMessageId = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string
+    let release!: (messages: ChatMessage[]) => void
+    bridge.getMessages.mockImplementationOnce(
+      () =>
+        new Promise<ChatMessage[]>((resolve) => {
+          release = resolve
+        }),
+    )
+    bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+    if (progress === "busy") {
+      bridge.emit({ type: "session.status", properties: { sessionID: "session-1", status: { type: "busy" } } })
+    } else {
+      bridge.emit({
+        type: "message.updated",
+        properties: { info: { id: "assistant-2", sessionID: "session-1", role: "assistant" } },
+      })
+    }
+    release([
+      { id: userMessageId, role: "user", createdAt: 1, parts: [] },
+      { id: "old-final", role: "assistant", createdAt: 2, completedAt: 3, finishReason: "stop", parts: [] },
+    ])
+    await vi.advanceTimersByTimeAsync(90_000)
+    expect(service.hasActiveGeneration()).toBe(true)
+    expect(events.some((event) => event.event === "messageError" || event.event === "messageCompleted")).toBe(false)
+    service.dispose()
+  },
+)
+
+test("an idle signal cannot time out a running tool and its result resumes verification", async () => {
+  vi.useFakeTimers()
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "run" })
+  const userMessageId = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
+  })
+  const part = {
+    id: "part-1",
+    messageID: "assistant-1",
+    sessionID: "session-1",
+    type: "tool",
+    tool: "bash",
+    callID: "call-1",
+  }
+  bridge.emit({
+    type: "message.part.updated",
+    properties: { part: { ...part, state: { status: "running", input: { command: "sleep 90" }, time: { start: 1 } } } },
+  })
+  bridge.getMessages.mockResolvedValue([
+    { id: userMessageId, role: "user", createdAt: 1, parts: [] },
+    { id: "assistant-1", role: "assistant", createdAt: 2, finishReason: "tool-calls", parts: [] },
+  ])
+  bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+  await vi.advanceTimersByTimeAsync(90_000)
+  expect(service.hasActiveGeneration()).toBe(true)
+  expect(events.some((event) => event.event === "messageError")).toBe(false)
+  bridge.emit({
+    type: "message.part.updated",
+    properties: {
+      part: { ...part, state: { status: "completed", input: {}, output: "done", time: { start: 1, end: 2 } } },
+    },
+  })
+  await vi.advanceTimersByTimeAsync(60_000)
+  vi.useRealTimers()
+  await waitForCondition(() => events.some((event) => event.event === "messageError"))
+  expect(events.findLast((event) => event.event === "messageError")?.data).toMatchObject({
+    errorCode: "CHAT_RESPONSE_INCOMPLETE",
+  })
+  expect(bridge.abort).not.toHaveBeenCalled()
+  service.dispose()
+})
+
+test("history recovers a missed tool start and completion without a false terminal timeout", async () => {
+  vi.useFakeTimers()
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "run" })
+  const userMessageId = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
+  })
+  const user = { id: userMessageId, role: "user", createdAt: 1, parts: [] }
+  const assistant = { id: "assistant-1", role: "assistant", createdAt: 2, completedAt: 3, finishReason: "stop" }
+  bridge.getMessages.mockResolvedValue([
+    user,
+    { ...assistant, parts: [{ kind: "tool", partId: "part", status: "running" }] },
+  ])
+  bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+  await vi.advanceTimersByTimeAsync(90_000)
+  expect(service.hasActiveGeneration()).toBe(true)
+  expect(events.some((event) => event.event === "messageError" || event.event === "messageCompleted")).toBe(false)
+  bridge.getMessages.mockResolvedValue([
+    user,
+    { ...assistant, parts: [{ kind: "tool", partId: "part", status: "completed" }] },
+  ])
+  await vi.advanceTimersByTimeAsync(2_001)
+  vi.useRealTimers()
+  await waitForCondition(() => !service.hasActiveGeneration())
+  expect(events.some((event) => event.event === "messageError")).toBe(false)
+  expect(bridge.promptStreaming).toHaveBeenCalledTimes(1)
+  service.dispose()
 })
 
 test("event bridge deduplicates message starts and coalesces text updates", async () => {
@@ -1221,6 +1509,71 @@ test("message completion records intermediate code files left in artifact root",
     const record = (await store.read()).get("session-1")?.get("assistant-1")
     assert.equal(record?.summary.processFileCount, 1)
     assert.equal(record?.files[0]?.name, "create_ppt.js")
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})
+
+test("message completion separates declared deliverables from artifact-root process files", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "wanta-chat-declared-artifact-"))
+  try {
+    const artifactDir = path.join(root, "artifacts")
+    const processDir = path.join(root, "process")
+    await mkdir(artifactDir, { recursive: true })
+    await mkdir(processDir, { recursive: true })
+
+    const bridge = createBridgeAgent()
+    bridge.createArtifactDir.mockResolvedValue(artifactDir)
+    bridge.createProcessDir.mockResolvedValue(processDir)
+    const artifactBundleStore = new ArtifactBundleStore(root)
+    const turnOutputStore = new TurnOutputStore(root)
+    const service = new ChatServiceImpl(bridge.agent, { artifactBundleStore, turnOutputStore })
+    const events = captureServiceEvents(service)
+    service.startEventBridge()
+
+    await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "生成一份周报" })
+    bridge.emit({
+      type: "message.updated",
+      properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
+    })
+    const queryPath = path.join(artifactDir, "q_accounts.json")
+    await writeFile(path.join(artifactDir, "weekly-report.html"), "<!doctype html><title>Weekly report</title>")
+    await writeFile(queryPath, JSON.stringify({ results: [1, 2, 3] }))
+    await writeFile(
+      path.join(artifactDir, ".wanta-artifact.json"),
+      JSON.stringify({
+        version: 2,
+        title: "Weekly report",
+        kind: "web_page",
+        display: "single",
+        items: [{ path: "weekly-report.html", role: "primary", order: 1 }],
+      }),
+    )
+
+    bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+    await waitForCondition(
+      () =>
+        events.some((event) => event.event === "artifactBundleUpdated") &&
+        events.some((event) => event.event === "turnOutputUpdated"),
+    )
+
+    const bundle = (await artifactBundleStore.read()).get("session-1")?.get("assistant-1")
+    assert.equal(bundle?.version, 2)
+    assert.deepEqual(
+      bundle?.items.map((item) => item.name),
+      ["weekly-report.html"],
+    )
+
+    const record = (await turnOutputStore.read()).get("session-1")?.get("assistant-1")
+    assert.equal(record?.artifactProcessRoot, artifactDir)
+    assert.deepEqual(
+      record?.files.map((item) => item.name),
+      ["q_accounts.json"],
+    )
+    assert.equal(
+      (await service.getTurnFileDiff({ sessionId: "session-1", messageId: "assistant-1", path: queryPath })).kind,
+      "text",
+    )
   } finally {
     await rm(root, { force: true, recursive: true })
   }
@@ -1454,6 +1807,11 @@ test("message completion exposes a failed artifact bundle when an image preview 
     service.startEventBridge()
 
     await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "Create an image" })
+    const assistantHistory = await bridge.agent.getMessages("session-1")
+    bridge.getMessages.mockResolvedValue([
+      { id: bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string, role: "user", createdAt: 0, parts: [] },
+      ...assistantHistory,
+    ])
     bridge.emit({
       type: "message.updated",
       properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
@@ -1502,6 +1860,11 @@ test("message completion materializes a data image preview into a ready artifact
     service.startEventBridge()
 
     await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "Create an image" })
+    const assistantHistory = await bridge.agent.getMessages("session-1")
+    bridge.getMessages.mockResolvedValue([
+      { id: bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string, role: "user", createdAt: 0, parts: [] },
+      ...assistantHistory,
+    ])
     bridge.emit({
       type: "message.updated",
       properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
@@ -1561,6 +1924,11 @@ test("message completion materializes assistant file attachments into managed ar
     service.startEventBridge()
 
     await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "Create an image" })
+    const assistantHistory = await bridge.agent.getMessages("session-1")
+    bridge.getMessages.mockResolvedValue([
+      { id: bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string, role: "user", createdAt: 0, parts: [] },
+      ...assistantHistory,
+    ])
     bridge.emit({
       type: "message.updated",
       properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
@@ -1629,6 +1997,26 @@ test("late prompt rejection does not clear the replacement generation output", a
   } finally {
     await rm(root, { force: true, recursive: true })
   }
+})
+
+test("a rejected OpenCode prompt emits a failed turn outcome", async () => {
+  const bridge = createBridgeAgent()
+  bridge.promptStreaming.mockRejectedValueOnce(new Error("prompt rejected"))
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "hello" })
+  await waitForCondition(() => events.some((event) => event.event === "messageError"))
+
+  assert.equal(service.hasActiveGeneration(), false)
+  assert.ok(
+    events.some(
+      (event) =>
+        event.event === "turnOutcome" &&
+        (event.data as { kind?: string; reason?: string }).kind === "failed" &&
+        (event.data as { kind?: string; reason?: string }).reason === "prompt_dispatch_failed",
+    ),
+  )
 })
 
 test("agent errors from multiple opencode channels produce one message error per send", async () => {
@@ -1965,6 +2353,14 @@ test("sendMessage releases a submitted turn when OpenCode never accepts it", asy
 
   assert.equal(bridge.abort.mock.calls.length, 1)
   assert.ok(events.some((event) => event.event === "generationInterrupted"))
+  assert.ok(
+    events.some(
+      (event) =>
+        event.event === "turnOutcome" &&
+        (event.data as { kind?: string; reason?: string }).kind === "interrupted" &&
+        (event.data as { kind?: string; reason?: string }).reason === "submit_timeout",
+    ),
+  )
   assert.equal(
     events.some((event) => event.event === "generationStopped"),
     false,
@@ -2283,7 +2679,6 @@ test("sendMessage passes selected context, team skills, and project as per-turn 
         kind: "connection",
         service: "gmail",
       },
-      { id: "knowledge-1", kind: "knowledge", name: "Product handbook" },
     ],
     teamSkills: [
       {
@@ -2323,7 +2718,6 @@ test("sendMessage passes selected context, team skills, and project as per-turn 
   assert.match(options?.system ?? "", /User-selected context for this turn/)
   assert.match(options?.system ?? "", /ecommerce-image-studio/)
   assert.match(options?.system ?? "", /gmail/)
-  assert.match(options?.system ?? "", /Product handbook/)
   assert.doesNotMatch(options?.system ?? "", /account: "work"/)
   assert.match(options?.system ?? "", /consider the selected connection first/)
   assert.match(options?.system ?? "", /Do not use it for unrelated local files/)
@@ -2336,15 +2730,42 @@ test("sendMessage passes selected context, team skills, and project as per-turn 
   assert.match(options?.system ?? "", /Respond in English/)
   assert.match(options?.system ?? "", /primary language of the user's latest substantive request/)
   assert.match(options?.system ?? "", /application interface language: English/)
-  assert.deepEqual(bridge.setSessionKnowledgeBaseIds.mock.calls, [["session-1", ["knowledge-1"]]])
   assert.deepEqual(bridge.createArtifactDir.mock.calls, [["session-1", undefined]])
 })
 
-test("sendMessage turns /bug-report into a Markdown artifact-only turn", async () => {
+test("sendMessage turns /bug-report into a pack-backed diagnostic artifact turn", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "wanta-bug-report-"))
   const artifactDir = path.join(root, "artifacts")
+  const processDir = path.join(root, "process")
+  await mkdir(processDir, { recursive: true })
   const bridge = createBridgeAgent()
   bridge.createArtifactDir.mockResolvedValue(artifactDir)
+  bridge.createProcessDir.mockResolvedValue(processDir)
+  bridge.getMessages.mockResolvedValue([
+    {
+      id: "user-1",
+      role: "user",
+      createdAt: 1,
+      parts: [{ kind: "text", partId: "t1", text: "请帮我修好 Gmail 授权卡住。" }],
+    },
+    {
+      id: "assistant-1",
+      role: "assistant",
+      createdAt: 2,
+      finishReason: "stop",
+      parts: [
+        {
+          kind: "tool",
+          partId: "tool-1",
+          tool: "bash",
+          status: "error",
+          failureKind: "authorization",
+          error: "connector unauthorized",
+          authorization: { service: "gmail", displayName: "Gmail", errorCode: "unauthorized" },
+        },
+      ],
+    },
+  ])
   const service = new ChatServiceImpl(bridge.agent, {
     bugReportRuntime: {
       appCommit: "abc123",
@@ -2360,12 +2781,23 @@ test("sendMessage turns /bug-report into a Markdown artifact-only turn", async (
       permissionMode: "default",
       scope: { kind: "team", teamId: "team-id", teamName: "team-name" },
       sessionId: "session-1",
+      teamSkills: [
+        {
+          description: "Summarize inbound sales mail consistently",
+          id: "team:team-skill-1",
+          name: "Sales Mail Summary",
+          packageName: "@acme/sales-skills",
+          version: "1.2.3",
+        },
+      ],
       text: "/bug-report Focus on the authorization state mismatch.",
     })
 
     assert.equal(bridge.promptStreaming.mock.calls.length, 1)
     assert.equal(bridge.promptStreaming.mock.calls[0]?.[1], "/bug-report Focus on the authorization state mismatch.")
-    const options = bridge.promptStreaming.mock.calls[0]?.[2] as { mode?: string; system?: string } | undefined
+    const options = bridge.promptStreaming.mock.calls[0]?.[2] as
+      | { mode?: string; processDir?: string; system?: string }
+      | undefined
     assert.equal(options?.mode, "build")
     assert.match(options?.system ?? "", /built-in \/bug-report command/)
     assert.match(options?.system ?? "", /Focus on the authorization state mismatch/)
@@ -2373,6 +2805,60 @@ test("sendMessage turns /bug-report into a Markdown artifact-only turn", async (
     assert.match(options?.system ?? "", /Wanta version: 1\.2\.3/)
     assert.match(options?.system ?? "", /Build commit: abc123/)
     assert.match(options?.system ?? "", /Do not reproduce the report body in the assistant response/)
+    assert.match(options?.system ?? "", /index\.json/)
+    assert.match(options?.system ?? "", /## Wanta diagnosis/)
+    assert.match(options?.system ?? "", /classified the latest user instruction as Simplified Chinese/)
+    assert.doesNotMatch(options?.system ?? "", /Team-configured skills/)
+    assert.doesNotMatch(options?.system ?? "", /Use bash normally/)
+
+    const index = JSON.parse(await readFile(path.join(processDir, "bug-report", "index.json"), "utf8")) as {
+      friction: { toolFailures: Array<{ tool?: string }> }
+      userGoal?: string
+    }
+    assert.equal(index.userGoal, "请帮我修好 Gmail 授权卡住。")
+    assert.equal(index.friction.toolFailures[0]?.tool, "bash")
+  } finally {
+    await rm(root, { force: true, recursive: true })
+  }
+})
+
+test("sendMessage strips this-turn attachments from /bug-report agent prompts", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "wanta-bug-report-attach-"))
+  const artifactDir = path.join(root, "artifacts")
+  const processDir = path.join(root, "process")
+  await mkdir(processDir, { recursive: true })
+  const originalPath = path.join(root, "notes.md")
+  await writeFile(originalPath, "secret notes", "utf8")
+  const bridge = createBridgeAgent()
+  bridge.createArtifactDir.mockResolvedValue(artifactDir)
+  bridge.createProcessDir.mockResolvedValue(processDir)
+  const store = new UserAttachmentStore(root)
+  const service = new ChatServiceImpl(bridge.agent, {
+    trustedAttachmentPaths: new Set([originalPath]),
+    userAttachmentStore: store,
+  })
+
+  try {
+    await service.sendMessage({
+      attachments: [
+        {
+          id: "attachment-1",
+          kind: "file",
+          mime: "text/markdown",
+          name: "notes.md",
+          path: originalPath,
+          size: 12,
+        },
+      ],
+      scope: testTeamScope,
+      sessionId: "session-1",
+      text: "/bug-report",
+    })
+
+    const options = bridge.promptStreaming.mock.calls[0]?.[2] as { attachments?: unknown } | undefined
+    assert.equal(options?.attachments, undefined)
+    const messageId = (bridge.promptStreaming.mock.calls[0]?.[2] as { messageId?: string } | undefined)?.messageId
+    assert.equal((await store.read()).get("session-1")?.get(messageId ?? ""), undefined)
   } finally {
     await rm(root, { force: true, recursive: true })
   }
@@ -2518,6 +3004,58 @@ test("trusted project permissions are approved without showing a permission card
   )
 })
 
+test.each(["npm install && npm test && npm run build", "npm install 2>&1 | tail -5; npm test && npm run build"])(
+  "dependency list auto-replies and consequential suffixes remain pending: %s",
+  async (ordinary) => {
+    const bridge = createBridgeAgent()
+    const projectPath = "/Users/example/code/wanta"
+    const service = new ChatServiceImpl(bridge.agent, {
+      projectStore: projectStore([
+        { id: "project-1", name: "wanta", path: projectPath, createdAt: 1_000, updatedAt: 1_000 },
+      ]),
+    })
+    const events = captureServiceEvents(service)
+    service.startEventBridge()
+    await service.sendMessage({
+      scope: testTeamScope,
+      projectContext: { id: "project-1", name: "wanta", path: projectPath },
+      sessionId: "session-1",
+      text: "Install dependencies and run project checks",
+    })
+    bridge.emit({
+      type: "permission.v2.asked",
+      properties: {
+        id: "chain-1",
+        sessionID: "session-1",
+        action: "bash",
+        resources: [ordinary],
+        metadata: { command: ordinary, cwd: projectPath },
+      },
+    })
+    await waitForCondition(() => bridge.answerPermission.mock.calls.length === 1)
+    assert.deepEqual(bridge.answerPermission.mock.calls, [["session-1", "chain-1", "once"]])
+    assert.equal(
+      events.some((event) => event.event === "permissionAsked"),
+      false,
+    )
+    const deploy = "npm install && npx vercel deploy --prod"
+    bridge.emit({
+      type: "permission.v2.asked",
+      properties: {
+        id: "chain-2",
+        sessionID: "session-1",
+        action: "bash",
+        resources: [deploy],
+        metadata: { command: deploy, cwd: projectPath },
+      },
+    })
+    await waitForCondition(() => events.some((event) => event.event === "permissionAsked"))
+    assert.equal(bridge.answerPermission.mock.calls.length, 1)
+    await service.answerPermission({ sessionId: "session-1", requestId: "chain-2", reply: "once" })
+    assert.deepEqual(bridge.answerPermission.mock.calls.at(-1), ["session-1", "chain-2", "once"])
+  },
+)
+
 test("trusted project permission approval restarts inactivity monitoring", async () => {
   vi.useFakeTimers()
   const bridge = createBridgeAgent()
@@ -2591,7 +3129,6 @@ test("trusted project permissions are approved for task subagent sessions", asyn
 
   await service.sendMessage({
     scope: testTeamScope,
-    contextMentions: [{ id: "knowledge-1", kind: "knowledge", name: "Product handbook" }],
     projectContext: {
       id: "project-1",
       name: "wanta",
@@ -2622,8 +3159,7 @@ test("trusted project permissions are approved for task subagent sessions", asyn
       },
     },
   })
-  await waitForCondition(() => bridge.inheritSessionKnowledgeBaseIds.mock.calls.length === 1)
-  assert.deepEqual(bridge.inheritSessionKnowledgeBaseIds.mock.calls, [["parent-session", "child-session"]])
+  await waitForCondition(() => events.some((event) => event.event === "toolCallStarted"))
   bridge.emit({
     type: "permission.v2.asked",
     properties: {
@@ -2917,8 +3453,8 @@ test("full access mode propagates to active task subagents and clears their pare
     id: "permission-1",
     sessionId: "child-session",
     action: "bash",
-    resources: ["npm install"],
-    metadata: { command: "npm install" },
+    resources: ["npm install -g cowsay"],
+    metadata: { command: "npm install -g cowsay" },
   }
   bridge.getPendingPermissions.mockImplementation(async (sessionId: string) =>
     sessionId === "child-session" ? [childPermission] : [],
@@ -2948,8 +3484,8 @@ test("full access mode propagates to active task subagents and clears their pare
       id: "permission-2",
       sessionID: "child-session",
       action: "bash",
-      resources: ["npm install another-package"],
-      metadata: { command: "npm install another-package" },
+      resources: ["npm install -g cowsay another-package"],
+      metadata: { command: "npm install -g cowsay another-package" },
     },
   })
   await waitForCondition(() => bridge.answerPermission.mock.calls.length === 2)
@@ -3122,8 +3658,8 @@ test("forgetSession clears session-scoped permission state", async () => {
       id: "permission-1",
       sessionID: "session-1",
       action: "bash",
-      resources: ["npm install"],
-      metadata: { command: "npm install" },
+      resources: ["npm install -g cowsay"],
+      metadata: { command: "npm install -g cowsay" },
     },
   })
 
@@ -3171,8 +3707,8 @@ test("permission mode persistence failures roll back the runtime mode", async ()
       id: "permission-1",
       sessionID: "session-1",
       action: "bash",
-      resources: ["npm install"],
-      metadata: { command: "npm install" },
+      resources: ["npm install -g cowsay"],
+      metadata: { command: "npm install -g cowsay" },
     },
   })
 
@@ -3461,7 +3997,12 @@ test("OpenConnector credential commands are rejected even in full-access mode", 
   })
 
   await waitForCondition(() => bridge.answerPermission.mock.calls.length === 1)
-  assert.deepEqual(bridge.answerPermission.mock.calls, [["session-1", "permission-1", "reject"]])
+  expect(bridge.answerPermission).toHaveBeenCalledWith(
+    "session-1",
+    "permission-1",
+    "reject",
+    expect.stringContaining("credential_reference"),
+  )
   assert.equal(
     events.some((event) => event.event === "permissionAsked"),
     false,
@@ -3528,6 +4069,28 @@ test("always permission reply stores a main-process session grant", async () => 
   ])
   assert.equal(events.filter((event) => event.event === "permissionAsked").length, 1)
   assert.equal(bridge.getPendingPermissions.mock.calls.length, 0)
+})
+
+test("failed always reply does not leave a session grant behind", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  const ask = (id: string) =>
+    bridge.emit({
+      type: "permission.v2.asked",
+      properties: { id, sessionID: "session-1", action: "edit", resources: ["/Users/example"] },
+    })
+  ask("permission-1")
+  await waitForCondition(() => events.some((event) => event.event === "permissionAsked"))
+  bridge.answerPermission.mockRejectedValueOnce(new Error("transport unavailable"))
+  await assert.rejects(
+    service.answerPermission({ sessionId: "session-1", requestId: "permission-1", reply: "always" }),
+    /transport unavailable/u,
+  )
+  ask("permission-2")
+  await waitForCondition(() => events.filter((event) => event.event === "permissionAsked").length === 2)
+  assert.equal(bridge.answerPermission.mock.calls.length, 1)
 })
 
 test("always permission replies propagate grants to active task subagents", async () => {
@@ -3760,8 +4323,8 @@ test("default command approvals still prompt unsafe package mutations", async ()
       id: "permission-3",
       sessionID: "session-1",
       action: "bash",
-      resources: ["npm install"],
-      metadata: { command: "npm install" },
+      resources: ["npm install -g cowsay"],
+      metadata: { command: "npm install -g cowsay" },
     },
   })
 
@@ -4084,6 +4647,8 @@ test("resolveLocalArtifacts reads artifact pack manifests", async () => {
     sessionId: "session-1",
   })
   assert.ok(bundle)
+  assert.equal(bundle.status, "partial")
+  assert.equal(bundle.failure, "artifact_declaration_partial")
   const records = new Map()
   recordArtifactBundle(records, bundle)
   await artifactBundleStore.write(records)
@@ -4351,4 +4916,520 @@ test("getLocalArtifactPreview rejects binary-looking text files", async () => {
 
   assert.equal(result.kind, "unsupported")
   assert.equal(result.mime, "text/plain")
+})
+
+test("same-session concurrent sends reject the losing request instead of silently replacing it", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  captureServiceEvents(service)
+  const results = await Promise.allSettled([
+    service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" }),
+    service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "second" }),
+  ])
+  expect(results[0]?.status).toBe("fulfilled")
+  expect(results[1]).toMatchObject({
+    status: "rejected",
+    reason: new Error("A generation is already active for this session."),
+  })
+  expect(bridge.promptStreaming.mock.calls.map((call) => call[1])).toEqual(["first"])
+  await service.stopGeneration("session-1")
+})
+
+test("abort echoes do not start competing finalizers or stop the next turn", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" })
+  let release!: () => void
+  const outputPending = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const finalizer = vi
+    .spyOn(
+      service as unknown as { finalizeTurnOutput: (sessionId: string, messageId?: string) => Promise<void> },
+      "finalizeTurnOutput",
+    )
+    .mockReturnValue(outputPending)
+  const stopping = service.stopGeneration("session-1")
+  await waitForCondition(() => finalizer.mock.calls.length === 1)
+  bridge.emit({ type: "session.error", properties: { sessionID: "session-1", error: { name: "AbortError" } } })
+  expect(finalizer).toHaveBeenCalledTimes(1)
+  expect(await service.getActiveRun("session-1")).not.toBeNull()
+  release()
+  await stopping
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "second" })
+  expect(await service.getActiveRun("session-1")).not.toBeNull()
+  expect(events.filter((event) => event.event === "generationStopped")).toHaveLength(1)
+  finalizer.mockRestore()
+  await service.stopGeneration("session-1")
+})
+
+test("late tool events cannot use an old assistant to complete the current user turn", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" })
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "old-assistant", sessionID: "session-1", role: "assistant" } },
+  })
+  await service.stopGeneration("session-1")
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "second" })
+  const userMessageId = bridge.promptStreaming.mock.calls[1]?.[2]?.messageId as string
+  bridge.emit({
+    type: "message.part.updated",
+    properties: {
+      part: {
+        id: "old-tool",
+        sessionID: "session-1",
+        messageID: "old-assistant",
+        type: "tool",
+        callID: "old-call",
+        tool: "bash",
+        state: { status: "running", input: {} },
+      },
+    },
+  })
+  bridge.getMessages.mockResolvedValue([
+    { id: "old-assistant", role: "assistant", createdAt: 1, completedAt: 2, finishReason: "stop", parts: [] },
+    { id: userMessageId, role: "user", createdAt: 3, parts: [] },
+  ])
+  bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+  await new Promise((resolve) => setTimeout(resolve, 175))
+  expect(await service.getActiveRun("session-1")).not.toBeNull()
+  expect(events.filter((event) => event.event === "messageCompleted")).toHaveLength(0)
+  bridge.getMessages.mockResolvedValue([
+    { id: "old-assistant", role: "assistant", createdAt: 1, completedAt: 2, finishReason: "stop", parts: [] },
+    { id: userMessageId, role: "user", createdAt: 3, parts: [] },
+    { id: "current-assistant", role: "assistant", createdAt: 4, completedAt: 5, finishReason: "stop", parts: [] },
+  ])
+  bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+  await waitForCondition(() => events.some((event) => event.event === "messageCompleted"))
+  expect(events.filter((event) => event.event === "turnOutcome").at(-1)?.data).toMatchObject({
+    kind: "completed",
+    messageId: "current-assistant",
+  })
+})
+
+test.each(["before", "after"] as const)(
+  "normal completion arriving %s a failed cancellation releases the turn and permits another send",
+  async (completionTiming) => {
+    const bridge = createBridgeAgent()
+    const service = new ChatServiceImpl(bridge.agent)
+    const events = captureServiceEvents(service)
+    service.startEventBridge()
+    await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" })
+    bridge.emit({
+      type: "message.updated",
+      properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
+    })
+    const runId = (await service.getActiveRun("session-1"))?.runId
+    let rejectCancel!: (error: Error) => void
+    bridge.abort.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectCancel = reject
+        }),
+    )
+    const finalizer = vi
+      .spyOn(
+        service as unknown as { finalizeTurnOutput: (sessionId: string, messageId?: string) => Promise<void> },
+        "finalizeTurnOutput",
+      )
+      .mockResolvedValue(undefined)
+    const stopping = service.stopGeneration("session-1")
+    const rejected = expect(stopping).rejects.toThrow("cancel transport unavailable")
+    await waitForCondition(() => bridge.abort.mock.calls.length === 1)
+    if (completionTiming === "before") {
+      bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(finalizer).not.toHaveBeenCalled()
+    }
+    expect(await service.hasActiveGeneration()).toBe(true)
+    rejectCancel(new Error("cancel transport unavailable"))
+    await rejected
+    if (completionTiming === "after") {
+      // Failure alone does not prove the runtime stopped or completed.
+      expect(await service.hasActiveGeneration()).toBe(true)
+      expect(finalizer).not.toHaveBeenCalled()
+      await expect(
+        service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "too early" }),
+      ).rejects.toThrow("A generation is already active")
+      bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+    }
+    await waitForCondition(() => events.some((event) => event.event === "messageCompleted"))
+    expect(await service.getActiveRun("session-1")).toBeNull()
+    expect(finalizer).toHaveBeenCalledExactlyOnceWith("session-1", "assistant-1")
+    expect(events.filter((event) => event.event === "turnOutcome").map((event) => event.data)).toEqual([
+      { sessionId: "session-1", runId, kind: "completed", messageId: "assistant-1" },
+    ])
+    expect(events.filter((event) => event.event === "generationStopped")).toHaveLength(0)
+    finalizer.mockRestore()
+    await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "second" })
+    expect(await service.hasActiveGeneration()).toBe(true)
+    await service.stopGeneration("session-1")
+  },
+)
+
+test("failed cancellation completion waits for terminal history instead of releasing on idle alone", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" })
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
+  })
+  bridge.abort.mockRejectedValueOnce(new Error("cancel transport unavailable"))
+  await expect(service.stopGeneration("session-1")).rejects.toThrow("cancel transport unavailable")
+  const userMessageId = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId as string
+  bridge.getMessages.mockResolvedValue([
+    { id: userMessageId, role: "user", createdAt: 1, parts: [] },
+    { id: "assistant-1", role: "assistant", createdAt: 2, completedAt: 3, finishReason: "tool-calls", parts: [] },
+  ])
+  bridge.getMessages.mockClear()
+  bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+  await waitForCondition(() => bridge.getMessages.mock.calls.length >= 2)
+  expect(await service.hasActiveGeneration()).toBe(true)
+  expect(events.filter((event) => event.event === "messageCompleted")).toHaveLength(0)
+  bridge.getMessages.mockResolvedValue([
+    { id: userMessageId, role: "user", createdAt: 1, parts: [] },
+    { id: "assistant-1", role: "assistant", createdAt: 2, completedAt: 3, finishReason: "stop", parts: [] },
+  ])
+  await waitForCondition(() => events.some((event) => event.event === "messageCompleted"))
+  expect(await service.hasActiveGeneration()).toBe(false)
+})
+
+test.each([false, true])(
+  "completion during cancellation cannot release the session (previous failure: %s)",
+  async (previousFailure) => {
+    const bridge = createBridgeAgent()
+    const service = new ChatServiceImpl(bridge.agent)
+    const events = captureServiceEvents(service)
+    service.startEventBridge()
+    await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" })
+    bridge.emit({
+      type: "message.updated",
+      properties: { info: { id: "assistant-1", sessionID: "session-1", role: "assistant" } },
+    })
+    if (previousFailure) {
+      bridge.abort.mockRejectedValueOnce(new Error("cancel transport unavailable"))
+      await expect(service.stopGeneration("session-1")).rejects.toThrow("cancel transport unavailable")
+    }
+    let release!: () => void
+    bridge.abort.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve
+        }),
+    )
+    const runId = (await service.getActiveRun("session-1"))?.runId
+    const stopping = service.stopGeneration("session-1")
+    bridge.emit({ type: "session.idle", properties: { sessionID: "session-1" } })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(await service.getActiveRun("session-1")).not.toBeNull()
+    expect(events.filter((event) => event.event === "messageCompleted")).toHaveLength(0)
+    release()
+    await stopping
+    expect(await service.getActiveRun("session-1")).toBeNull()
+    expect(events.filter((event) => event.event === "turnOutcome").map((event) => event.data)).toEqual([
+      { sessionId: "session-1", runId, kind: "cancelled", messageId: "assistant-1" },
+    ])
+  },
+)
+
+test("late tool and activity events cannot mutate the replacement run or register child sessions", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" })
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "old-assistant", sessionID: "session-1", role: "assistant" } },
+  })
+  await service.stopGeneration("session-1")
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "second" })
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "new-assistant", sessionID: "session-1", role: "assistant" } },
+  })
+  const before = await service.getActiveRun("session-1")
+  const eventCount = events.length
+  for (const status of ["running", "completed"] as const) {
+    bridge.emit({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "old-tool",
+          sessionID: "session-1",
+          messageID: "old-assistant",
+          type: "tool",
+          callID: "old-call",
+          tool: "task",
+          state: { status, input: {}, output: "old output", metadata: { sessionId: "late-child" } },
+        },
+      },
+    })
+  }
+  bridge.emit({
+    type: "message.part.updated",
+    properties: { part: { id: "old-step", sessionID: "session-1", messageID: "old-assistant", type: "step-start" } },
+  })
+  bridge.emit({
+    type: "message.part.updated",
+    properties: {
+      part: { id: "old-text", sessionID: "session-1", messageID: "old-assistant", type: "text", text: "late" },
+    },
+  })
+  expect(await service.getActiveRun("session-1")).toEqual(before)
+  expect(events).toHaveLength(eventCount)
+  bridge.emit({
+    type: "message.part.updated",
+    properties: {
+      part: {
+        id: "new-tool",
+        sessionID: "session-1",
+        messageID: "new-assistant",
+        type: "tool",
+        callID: "new-call",
+        tool: "bash",
+        state: { status: "running", input: {} },
+      },
+    },
+  })
+  expect(await service.getActiveRun("session-1")).toMatchObject({
+    phase: "tool_running",
+    activeToolPartIds: ["new-tool"],
+    activeAssistantMessageId: "new-assistant",
+  })
+  expect(events.at(-1)).toMatchObject({ event: "toolCallStarted", data: { runId: before?.runId, partId: "new-tool" } })
+  await service.stopGeneration("session-1")
+  const stoppedCount = events.length
+  bridge.emit({
+    type: "message.part.updated",
+    properties: {
+      part: { id: "old-text", sessionID: "session-1", messageID: "old-assistant", type: "text", text: "late again" },
+    },
+  })
+  expect(events).toHaveLength(stoppedCount)
+})
+
+test("native parent identity rejects a first-seen old assistant after a retry", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "first" })
+  const oldParent = bridge.promptStreaming.mock.calls[0]?.[2]?.messageId
+  await service.stopGeneration("session-1")
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "second" })
+  const newParent = bridge.promptStreaming.mock.calls[1]?.[2]?.messageId
+  const before = await service.getActiveRun("session-1")
+  const count = events.length
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "unseen-old", sessionID: "session-1", role: "assistant", parentID: oldParent } },
+  })
+  bridge.emit({
+    type: "message.part.updated",
+    properties: {
+      part: { id: "unseen-text", sessionID: "session-1", messageID: "unseen-old", type: "text", text: "late" },
+    },
+  })
+  expect(await service.getActiveRun("session-1")).toEqual(before)
+  expect(events).toHaveLength(count)
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "current", sessionID: "session-1", role: "assistant", parentID: newParent } },
+  })
+  expect(await service.getActiveRun("session-1")).toMatchObject({
+    activeAssistantMessageId: "current",
+    phase: "thinking",
+  })
+  await service.stopGeneration("session-1")
+})
+
+test("current compaction continuation parents still advance the active run", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "continue work" })
+  bridge.emit({
+    type: "message.part.updated",
+    properties: { part: { id: "compact", sessionID: "session-1", messageID: "summary", type: "compaction" } },
+  })
+  bridge.emit({
+    type: "message.updated",
+    properties: { info: { id: "continuation", sessionID: "session-1", role: "user" } },
+  })
+  bridge.emit({
+    type: "message.updated",
+    properties: {
+      info: { id: "continued-assistant", sessionID: "session-1", role: "assistant", parentID: "continuation" },
+    },
+  })
+  expect(await service.getActiveRun("session-1")).toMatchObject({
+    phase: "thinking",
+    activeAssistantMessageId: "continued-assistant",
+  })
+  await service.stopGeneration("session-1")
+})
+
+test("previews persisted original attachments before history is opened without trusting internal files", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "wanta-persisted-preview-"))
+  try {
+    const original = path.join(root, "original.png")
+    const internal = path.join(root, "optimized.png")
+    const unrelated = path.join(root, "unrelated.png")
+    await Promise.all([original, internal, unrelated].map((file) => writeFile(file, Buffer.from([1, 2, 3]))))
+    const store = new UserAttachmentStore(root)
+    await store.record("session", "message", [
+      { id: "image", name: "original.png", mime: "image/png", size: 3, path: original, agentPath: internal },
+    ])
+    const service = new ChatServiceImpl(null, { userAttachmentStore: store })
+    assert.match(
+      (await service.getAttachmentPreview({ path: original, mime: "image/png" })).dataUrl ?? "",
+      /^data:image\/png/,
+    )
+    await assert.rejects(() => service.getAttachmentPreview({ path: internal, mime: "image/png" }))
+    await assert.rejects(() => service.getAttachmentPreview({ path: unrelated, mime: "image/png" }))
+    await store.removeMessage("session", "message")
+    await service.forgetSession("session")
+    await assert.rejects(() => service.getAttachmentPreview({ path: original, mime: "image/png" }))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("durable drafts restore attachment access without granting arbitrary or other-account paths", async () => {
+  const { ComposerDraftStore } = await import("./composer-drafts.ts")
+  const root = await mkdtemp(path.join(os.tmpdir(), "wanta-draft-access-"))
+  try {
+    const image = path.join(root, "image.png")
+    const untrusted = path.join(root, "private.png")
+    await Promise.all([writeFile(image, "image"), writeFile(untrusted, "private")])
+    const draftStore = new ComposerDraftStore(root)
+    const service = new ChatServiceImpl(null, {
+      composerDraftStore: draftStore,
+      composerDraftOwner: () => "owner",
+      trustedAttachmentPaths: new Set([image]),
+    })
+    const value = {
+      draft: "notes",
+      attachments: [{ id: "image", name: "image.png", path: image, mime: "image/png", size: 5 }],
+      contextMentions: [],
+      command: null,
+      draftSelection: { start: 5, end: 5 },
+      dismissedTriggerKey: null,
+    } as const
+    const request = {
+      owner: "owner",
+      key: "new",
+      value: { ...value, attachments: [...value.attachments], contextMentions: [] },
+    }
+    await service.saveComposerDraft(request)
+    const agentPath = path.join(root, "prepared-agent.png")
+    await writeFile(agentPath, "internal")
+    await draftStore.save({
+      ...request,
+      value: {
+        ...request.value,
+        attachments: [{ ...request.value.attachments[0]!, agentPath }],
+      },
+    })
+    const bridge = createBridgeAgent()
+    const restarted = new ChatServiceImpl(bridge.agent, {
+      composerDraftStore: new ComposerDraftStore(root),
+      composerDraftOwner: () => "owner",
+    })
+    assert.ok((await restarted.getAttachmentPreview({ path: image, mime: "image/png" })).dataUrl)
+    await assert.rejects(() => restarted.getAttachmentPreview({ path: agentPath, mime: "image/png" }))
+    await assert.rejects(() => restarted.openLocalPath({ path: agentPath }))
+    assert.ok((await new ComposerDraftStore(root).retentionState()).paths.includes(agentPath))
+    const restored = (await restarted.getComposerDrafts("owner")).new!
+    assert.equal(restored.attachments[0]!.agentPath, undefined)
+    await restarted.sendMessage({
+      scope: testTeamScope,
+      sessionId: "restored-draft",
+      text: "inspect",
+      attachments: restored.attachments,
+    })
+    assert.equal(bridge.promptStreaming.mock.calls.length, 1)
+    await restarted.saveComposerDraft({ ...request, key: "constructor" })
+    await restarted.saveComposerDraft({ ...request, key: "toString", value: null })
+    await assert.rejects(() =>
+      restarted.saveComposerDraft({
+        ...request,
+        value: { ...request.value, attachments: [{ ...request.value.attachments[0]!, path: untrusted }] },
+      }),
+    )
+    await assert.rejects(() => restarted.getComposerDrafts("other"))
+    await assert.rejects(() => restarted.saveComposerDraft({ ...request, owner: "other" }))
+    const other = new ChatServiceImpl(null, { composerDraftStore: draftStore, composerDraftOwner: () => "other" })
+    await assert.rejects(() => other.getAttachmentPreview({ path: image, mime: "image/png" }))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("draft save rejects a stale owner after persistence completes", async () => {
+  const { ComposerDraftStore } = await import("./composer-drafts.ts")
+  const root = await mkdtemp(path.join(os.tmpdir(), "wanta-draft-owner-"))
+  try {
+    const store = new ComposerDraftStore(root)
+    let owner = "first"
+    let finish!: () => void
+    const save = vi.spyOn(store, "save").mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        }),
+    )
+    const service = new ChatServiceImpl(null, { composerDraftStore: store, composerDraftOwner: () => owner })
+    const pending = service.saveComposerDraft({ owner, key: "new", value: null })
+    const rejected = assert.rejects(pending, /Draft account changed/)
+    await waitForCondition(() => save.mock.calls.length === 1)
+    owner = "second"
+    finish()
+    await rejected
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("ordinary dependency scripts auto-reply without a user-facing permission card", async () => {
+  const bridge = createBridgeAgent()
+  const service = new ChatServiceImpl(bridge.agent)
+  const events = captureServiceEvents(service)
+  service.startEventBridge()
+  await service.sendMessage({ scope: testTeamScope, sessionId: "session-1", text: "Check the PDF" })
+  const commands = [
+    'PROC=/work/task\npython3 -m venv "$PROC/.wanta-python" && "$PROC/.wanta-python/bin/python" -m pip install -q pypdf && "$PROC/.wanta-python/bin/python" - <<\'PY\'\nfrom pypdf import PdfReader\nprint(42)\nPY',
+    "ROOT=/work/task\npnpm --dir \"$ROOT\" add lodash && node <<'JS'\nconsole.log(42)\nJS",
+  ]
+  for (const [index, command] of commands.entries()) {
+    bridge.emit({
+      type: "permission.v2.asked",
+      properties: {
+        id: `dependency-${index}`,
+        sessionID: "session-1",
+        action: "bash",
+        resources: [command],
+        metadata: { command },
+      },
+    })
+  }
+  await waitForCondition(() => bridge.answerPermission.mock.calls.length === commands.length)
+  expect(bridge.answerPermission.mock.calls).toEqual([
+    ["session-1", "dependency-0", "once"],
+    ["session-1", "dependency-1", "once"],
+  ])
+  expect(events.some((event) => event.event === "permissionAsked")).toBe(false)
+  expect(bridge.promptStreaming).toHaveBeenCalledTimes(1)
+  service.dispose()
 })

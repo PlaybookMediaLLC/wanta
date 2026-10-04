@@ -4,7 +4,8 @@ import type { BusyAction, MemberSearchState } from "./team-management-model.ts"
 import * as React from "react"
 import { toast } from "sonner"
 import { teamErrorMessage } from "./team-errors.ts"
-import { errorMessage, uniqueStrings } from "./team-management-model.ts"
+import { isRemovableTeamMember } from "./team-management-model.ts"
+import { errorMessage, resolveMemberInput, uniqueStrings } from "./team-management-model.ts"
 import { useAppI18n } from "@/i18n"
 import { invalidateTeamDetailsResource } from "@/lib/team-details-resource"
 import { canChangeTeamMemberRole } from "@/lib/team-permissions"
@@ -21,6 +22,8 @@ interface TeamMemberActionsOptions {
   activeAccountId: string | undefined
   actorRole: TeamRole | null
   canManage: boolean
+  memberLimitReached?: boolean
+  memberLimitLoading?: boolean
   memberInput: string
   memberSearch: MemberSearchState
   reloadDetails: () => Promise<void>
@@ -43,6 +46,8 @@ export function useTeamMemberActions({
   canManage,
   memberInput,
   memberSearch,
+  memberLimitReached = false,
+  memberLimitLoading = false,
   reloadDetails,
   resetMemberSearch,
   selectedTeam,
@@ -52,6 +57,8 @@ export function useTeamMemberActions({
   setBusyAction,
 }: TeamMemberActionsOptions) {
   const { t } = useAppI18n()
+  const [addition, setAddition] = React.useState<{ context: string; userId: string } | null>(null)
+  const addingRef = React.useRef(false)
   const actionSequenceRef = React.useRef(0)
   const actionContextKey = `${activeAccountId ?? "anonymous"}\u0000${selectedTeam?.id ?? "none"}`
   const actionContextKeyRef = React.useRef(actionContextKey)
@@ -86,25 +93,27 @@ export function useTeamMemberActions({
   const addMember = React.useCallback(
     async (event: React.FormEvent) => {
       event.preventDefault()
-      if (!selectedTeam || !canManage) return
+      if (!selectedTeam || !canManage || addingRef.current) return
 
-      const currentSearchUserId = selectedSearchUserId
-      if (memberSearch.items.length > 0 && !currentSearchUserId) {
+      if (memberLimitLoading) return
+      if (memberLimitReached) {
+        setAddMemberError(t("teams.addMemberLimitExceeded"))
+        return
+      }
+      const userId = resolveMemberInput(memberInput, memberSearch, selectedSearchUserId)
+      if (!userId) {
         setAddMemberError(t("teams.addMemberSelectRequired"))
         return
       }
-      const userId = memberSearch.items.length > 0 ? currentSearchUserId : memberInput.trim()
-      if (!userId) {
-        setAddMemberError(t("teams.userIdRequired"))
-        return
-      }
+      addingRef.current = true
 
       const operation = beginOperation("add")
       setAddMemberError(null)
       try {
         await addTeamMember({ teamId: selectedTeam.id, userId })
-        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id)
+        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id, { preserveUserSummaries: true })
         if (!operationIsCurrent(operation)) return
+        setAddition({ context: actionContextKey, userId })
         toast.success(t("teams.addMemberSuccess"))
         resetMemberSearch()
         setAddMemberOpen(false)
@@ -120,6 +129,7 @@ export function useTeamMemberActions({
               : teamErrorMessage(error, t),
         )
       } finally {
+        addingRef.current = false
         finishOperation(operation)
       }
     },
@@ -129,7 +139,10 @@ export function useTeamMemberActions({
       canManage,
       finishOperation,
       memberInput,
-      memberSearch.items.length,
+      memberSearch,
+      memberLimitReached,
+      memberLimitLoading,
+      actionContextKey,
       operationIsCurrent,
       reloadDetails,
       resetMemberSearch,
@@ -143,11 +156,11 @@ export function useTeamMemberActions({
 
   const removeMember = React.useCallback(
     async (member: TeamMember) => {
-      if (!selectedTeam || !canManage) return
+      if (!selectedTeam || !canManage || !isRemovableTeamMember(member)) return
       const operation = beginOperation(`remove:${member.user_id}`)
       try {
         await removeTeamMember({ teamId: selectedTeam.id, userId: member.user_id })
-        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id)
+        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id, { preserveUserSummaries: true })
         if (!operationIsCurrent(operation)) return
         toast.success(t("teams.removeMemberSuccess"))
         await reloadDetails()
@@ -177,7 +190,7 @@ export function useTeamMemberActions({
       const operation = beginOperation(`updateMemberRole:${member.user_id}`)
       try {
         await updateTeamMemberRole({ role, teamId: selectedTeam.id, userId: member.user_id })
-        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id)
+        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id, { preserveUserSummaries: true })
         if (!operationIsCurrent(operation)) return
         toast.success(t("teams.updateMemberRoleSuccess"))
         await reloadDetails()
@@ -210,7 +223,7 @@ export function useTeamMemberActions({
       try {
         const input = { teamId: selectedTeam.id, userIds: normalizedUserIds }
         await (disabled ? disableTeamMembers(input) : enableTeamMembers(input))
-        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id)
+        invalidateTeamDetailsResource(activeAccountId, selectedTeam.id, { preserveUserSummaries: true })
         if (!operationIsCurrent(operation)) return
         toast.success(disabled ? t("teams.disableMembersSuccess") : t("teams.enableMembersSuccess"))
         await reloadDetails()
@@ -235,6 +248,8 @@ export function useTeamMemberActions({
 
   return {
     addMember,
+    addedMemberUserId: addition?.context === actionContextKey ? addition.userId : null,
+    dismissAddition: () => setAddition(null),
     disableMembers,
     enableMembers,
     removeMember,

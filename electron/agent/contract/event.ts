@@ -9,6 +9,7 @@ import type {
   MessagePartRemovedEvent,
   MessageReasoningDeltaEvent,
   MessageStartedEvent,
+  PermissionModeUpdatedEvent,
   QuestionResolvedEvent,
   ToolCallResultEvent,
   ToolCallStartedEvent,
@@ -20,8 +21,8 @@ import { z } from "zod"
 // Normalized agent event contract (BYOA phase 0).
 //
 // AgentEvent is the single outbound channel of every AgentAdapter: each adapter
-// translates its native protocol (OpenCode SSE, Claude Agent SDK messages, ACP
-// session/update notifications, ...) into this discriminated union. The variants
+// translates its protocol (OpenCode SSE or ACP session/update notifications)
+// into this discriminated union. The variants
 // were promoted from the former ChatEmit union in event-translator.ts, so the
 // chat event bridge consumes them unchanged; payload types stay shared with the
 // IPC contract in electron/chat/common.ts on purpose (the UI vocabulary is the
@@ -69,6 +70,7 @@ export type AgentEvent =
   | { event: "questionRejected"; data: QuestionResolvedEvent }
   | { event: "permissionAsked"; data: { sessionId: string; request: ChatPermissionRequest } }
   | { event: "permissionReplied"; data: { sessionId: string; requestId: string } }
+  | { event: "permissionModeUpdated"; data: PermissionModeUpdatedEvent }
   | { event: "messageCompleted"; data: MessageCompletedEvent }
   | { event: "usageUpdated"; data: UsageUpdatedEvent }
   | { event: "messagePartRemoved"; data: MessagePartRemovedEvent }
@@ -148,6 +150,15 @@ export const permissionRequestSchema = z.object({
   action: z.string(),
   resources: z.array(z.string()),
   save: z.array(z.string()).optional(),
+  nativeOptions: z
+    .array(
+      z.object({
+        optionId: z.string(),
+        name: z.string(),
+        kind: z.enum(["allow_once", "allow_always", "reject_once", "reject_always"]),
+      }),
+    )
+    .optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
   wanta: z
     .object({
@@ -159,6 +170,8 @@ export const permissionRequestSchema = z.object({
 })
 
 const messageStartedSchema = z.object({
+  parentMessageId: z.string().optional(),
+  runId: z.string().optional(),
   sessionId: z.string(),
   messageId: z.string(),
   role: chatRoleSchema,
@@ -168,6 +181,7 @@ const messageStartedSchema = z.object({
 })
 
 const messageDeltaSchema = z.object({
+  runId: z.string().optional(),
   sessionId: z.string(),
   messageId: z.string(),
   partId: z.string(),
@@ -177,6 +191,7 @@ const messageDeltaSchema = z.object({
 })
 
 const messageReasoningDeltaSchema = z.object({
+  runId: z.string().optional(),
   sessionId: z.string(),
   messageId: z.string(),
   partId: z.string(),
@@ -185,6 +200,7 @@ const messageReasoningDeltaSchema = z.object({
 })
 
 const messageAttachmentSchema = z.object({
+  runId: z.string().optional(),
   sessionId: z.string(),
   messageId: z.string(),
   partId: z.string(),
@@ -192,6 +208,7 @@ const messageAttachmentSchema = z.object({
 })
 
 const assistantActivitySchema = z.object({
+  runId: z.string().optional(),
   sessionId: z.string(),
   messageId: z.string().optional(),
   phase: z.enum(["thinking", "finalizing", "retrying", "compacting", "resuming"]),
@@ -202,6 +219,7 @@ const assistantActivitySchema = z.object({
 })
 
 const toolCallStartedSchema = z.object({
+  runId: z.string().optional(),
   sessionId: z.string(),
   messageId: z.string(),
   partId: z.string(),
@@ -215,6 +233,7 @@ const toolCallStartedSchema = z.object({
 })
 
 const toolCallResultSchema = z.object({
+  runId: z.string().optional(),
   sessionId: z.string(),
   messageId: z.string(),
   partId: z.string(),
@@ -246,7 +265,14 @@ const permissionResolvedSchema = z.object({
   requestId: z.string(),
 })
 
+const permissionModeUpdatedSchema = z.object({
+  sessionId: z.string(),
+  permissionMode: z.enum(["default", "read_only", "accept_edits", "plan", "auto", "full_access"]),
+})
+
 const messageCompletedSchema = z.object({
+  outcome: z.literal("cancelled").optional(),
+  runId: z.string().optional(),
   sessionId: z.string(),
 })
 
@@ -311,6 +337,7 @@ export const agentEventSchema: z.ZodType<AgentEvent> = z.discriminatedUnion("eve
     data: z.object({ sessionId: z.string(), request: permissionRequestSchema }),
   }),
   z.object({ event: z.literal("permissionReplied"), data: permissionResolvedSchema }),
+  z.object({ event: z.literal("permissionModeUpdated"), data: permissionModeUpdatedSchema }),
   z.object({ event: z.literal("messageCompleted"), data: messageCompletedSchema }),
   z.object({ event: z.literal("usageUpdated"), data: usageUpdatedSchema }),
   z.object({ event: z.literal("messagePartRemoved"), data: messagePartRemovedSchema }),

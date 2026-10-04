@@ -5,6 +5,7 @@ import type { ModelCatalog, ModelChoice } from "../../../electron/models/common.
 import type { ContextUsageInfo } from "./context-usage.ts"
 
 import { Mic } from "lucide-react"
+import { AGENT_PROFILES } from "../../../electron/agent/contract/profile.ts"
 import { AgentConfigurationPicker } from "./AgentConfigurationPicker.tsx"
 import { AgentModePicker } from "./AgentModePicker.tsx"
 import { ComposerContextUsageIndicator } from "./ComposerContextUsageIndicator.tsx"
@@ -15,6 +16,9 @@ import { useT } from "@/i18n/i18n"
 const NO_EXTERNAL_AGENTS: ExternalAgentRuntimeStatus[] = []
 
 interface ComposerModeControlsProps {
+  agentConfigurationDisabled?: boolean
+  agentCatalogLoading?: boolean
+  agentCatalogError?: boolean
   agentCatalog?: ExternalAgentCatalog
   agentEffortId?: string
   agentEffortSelectionEnabled?: boolean
@@ -48,7 +52,10 @@ interface ComposerModeControlsProps {
 }
 
 export function ComposerModeControls({
+  agentConfigurationDisabled = false,
   agentCatalog,
+  agentCatalogLoading,
+  agentCatalogError,
   agentEffortId,
   agentEffortSelectionEnabled = false,
   agentKind = "opencode",
@@ -80,6 +87,7 @@ export function ComposerModeControls({
   onStartVoice,
 }: ComposerModeControlsProps) {
   const t = useT()
+  const nativePermissions = AGENT_PROFILES[agentKind].auth.kind === "agent-cli"
   // A single-mode agent has nothing to choose; hide the picker entirely.
   const permissionModePickerVisible = !permissionModes || permissionModes.length >= 2
 
@@ -92,10 +100,11 @@ export function ComposerModeControls({
       {permissionModePickerVisible ? (
         <PermissionModePicker
           disabled={composerDisabled}
+          nativePermissions={nativePermissions}
           modes={permissionModes}
           value={permissionMode}
           onSelect={(mode) => {
-            if (mode === "full_access") {
+            if (mode === "full_access" && !nativePermissions) {
               onRequestFullAccessPermissionMode()
             } else {
               onSelectPermissionMode(mode)
@@ -105,12 +114,14 @@ export function ComposerModeControls({
       ) : null}
       <AgentConfigurationPicker
         agentCatalog={agentCatalog}
+        agentCatalogLoading={agentCatalogLoading}
+        agentCatalogError={agentCatalogError}
         agentEffortId={agentEffortId}
         agentEffortSelectionEnabled={agentEffortSelectionEnabled}
         agentKind={agentKind}
         agentModelId={agentModelId}
         agentModelSelectionEnabled={agentModelSelectionEnabled}
-        composerDisabled={composerDisabled}
+        composerDisabled={agentConfigurationDisabled}
         externalAgents={externalAgents}
         modelCatalog={modelCatalog}
         modelRequired={modelRequired}

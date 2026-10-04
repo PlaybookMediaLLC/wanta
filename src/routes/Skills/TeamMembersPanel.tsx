@@ -1,26 +1,31 @@
 import type { EditableTeamMemberRole, Team, TeamMember, TeamRole } from "../../../electron/teams/common.ts"
 import type { BusyAction, MemberView } from "./team-management-model.ts"
-import type { TeamMemberConnectionAccessData } from "./TeamMemberConnectionAccessDialog.tsx"
 
 import { PlusIcon, RefreshCwIcon, UsersIcon } from "lucide-react"
 import * as React from "react"
+import { toast } from "sonner"
+import { countOccupiedTeamSeats } from "./team-management-model.ts"
 import { MembersTable } from "./TeamMembersTable.tsx"
 import { CachedAvatarImage } from "@/components/CachedAvatarImage"
+import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { teamAvatarStyle, teamInitials } from "@/hooks/useTeamWorkspace"
 import { useAppI18n } from "@/i18n"
+import { writeClipboardText } from "@/lib/clipboard"
 import { cn } from "@/lib/utils"
 
 export { AddMemberDialog, CreateTeamDialog, TeamProfileSettingsPanel } from "./TeamMemberDialogs.tsx"
 
 export function TeamMemberAccessButton({
+  showAvatars = true,
   canManage,
   members,
   membersComplete,
   membersLoading,
   onOpen,
 }: {
+  showAvatars?: boolean
   canManage: boolean
   members: MemberView[]
   membersComplete: boolean
@@ -32,8 +37,8 @@ export function TeamMemberAccessButton({
   const countLabel = membersLoading
     ? t("teams.memberCountLoading")
     : membersComplete
-      ? t("teams.memberCountCompact", { count: members.length })
-      : t("teams.memberVisibleCountCompact", { count: members.length })
+      ? t("teams.memberCountCompact", { count: countOccupiedTeamSeats(members) })
+      : t("teams.memberCountUnavailable")
 
   return (
     <button
@@ -42,7 +47,7 @@ export function TeamMemberAccessButton({
       aria-label={t("teams.memberAccessAriaLabel", { count: countLabel, label })}
       onClick={onOpen}
     >
-      {membersLoading ? (
+      {!showAvatars ? null : membersLoading ? (
         <MemberAvatarStackSkeleton />
       ) : members.length > 0 ? (
         <MemberAvatarStack members={members} />
@@ -92,39 +97,39 @@ function MemberAvatarStackSkeleton() {
 }
 
 export function TeamDetailPanel({
+  inline = false,
   actorRole,
   actorUserId,
   busyAction,
   canManage,
-  connectionAccess,
   members,
   membersComplete,
   membersError,
   membersForbidden,
   membersLoading,
+  membersRefreshing = false,
   onAddMember,
   onDisableMembers,
   onEnableMembers,
-  onOpenMemberConnectionAccess,
   onRemoveMember,
   onRetryMembers,
   onUpdateMemberRole,
   team,
 }: {
+  inline?: boolean
   actorRole: TeamRole | null
   actorUserId: string | undefined
   busyAction: BusyAction | null
   canManage: boolean
-  connectionAccess: TeamMemberConnectionAccessData
   members: MemberView[]
   membersComplete: boolean
   membersError: string | null
   membersForbidden: boolean
   membersLoading: boolean
+  membersRefreshing?: boolean
   onAddMember: () => void
   onDisableMembers: (userIds: string[]) => void
   onEnableMembers: (userIds: string[]) => void
-  onOpenMemberConnectionAccess: (member: MemberView) => void
   onRemoveMember: (member: TeamMember) => Promise<void>
   onRetryMembers: () => void
   onUpdateMemberRole: (member: TeamMember, role: EditableTeamMemberRole) => Promise<void>
@@ -143,13 +148,14 @@ export function TeamDetailPanel({
   const compactMemberCountLabel = membersLoading
     ? t("teams.memberCountLoading")
     : membersComplete
-      ? t("teams.memberCountCompact", { count: members.length })
-      : t("teams.memberVisibleCountCompact", { count: members.length })
+      ? t("teams.memberCountCompact", { count: countOccupiedTeamSeats(members) })
+      : t("teams.memberCountUnavailable")
   const permissionModeLabel = canManage ? t("teams.canManage") : t("teams.readOnly")
 
   return (
     <div className="grid min-w-0 gap-3">
       <Panel
+        plain={inline}
         title={t("teams.memberManagement")}
         description={
           <span className="oo-text-caption-compact truncate text-muted-foreground">
@@ -157,7 +163,7 @@ export function TeamDetailPanel({
           </span>
         }
         action={
-          canManage ? (
+          canManage && !inline ? (
             <Button type="button" size="sm" disabled={busyAction === "add"} onClick={onAddMember}>
               <PlusIcon className="size-3.5" />
               {t("teams.addMember")}
@@ -166,25 +172,28 @@ export function TeamDetailPanel({
         }
       >
         <>
-          {membersLoading ? (
+          {membersLoading && !membersRefreshing ? (
             <MemberRowsSkeleton canManage={canManage} />
-          ) : membersError && !membersForbidden ? (
-            <MemberLoadError onRetry={onRetryMembers} />
+          ) : membersError && !membersForbidden && members.length === 0 ? (
+            <MemberLoadError error={membersError} onRetry={onRetryMembers} />
+          ) : membersForbidden && members.length === 0 ? (
+            <MemberAccessWarning hasMembers={false} error={membersError} onRetry={onRetryMembers} />
           ) : members.length === 0 ? (
             <EmptyBlock>{t("teams.emptyMembersDescription")}</EmptyBlock>
           ) : (
             <>
-              {membersForbidden ? <MemberAccessWarning onRetry={onRetryMembers} /> : null}
+              {membersError && !membersForbidden ? (
+                <MemberLoadError error={membersError} onRetry={onRetryMembers} />
+              ) : null}
+              {membersForbidden ? <MemberAccessWarning error={membersError} onRetry={onRetryMembers} /> : null}
               <MembersTable
                 actorRole={actorRole}
                 actorUserId={actorUserId}
                 busyAction={busyAction}
                 canManage={canManage}
-                connectionAccess={connectionAccess}
                 members={members}
                 onDisableMembers={onDisableMembers}
                 onEnableMembers={onEnableMembers}
-                onOpenMemberConnectionAccess={onOpenMemberConnectionAccess}
                 onRemoveMember={onRemoveMember}
                 onUpdateMemberRole={onUpdateMemberRole}
               />
@@ -196,11 +205,22 @@ export function TeamDetailPanel({
   )
 }
 
-function MemberAccessWarning({ onRetry }: { onRetry: () => void }) {
+function MemberAccessWarning({
+  error,
+  onRetry,
+  hasMembers = true,
+}: {
+  error: string | null
+  onRetry: () => void
+  hasMembers?: boolean
+}) {
   const { t } = useAppI18n()
   return (
     <div className="mx-3 mt-3 flex items-start justify-between gap-3 rounded-md border border-[var(--oo-warning-border)] bg-[var(--oo-warning-surface)] px-3 py-2">
-      <div className="oo-text-caption min-w-0">{t("teams.membersForbiddenPartial")}</div>
+      <div className="oo-text-caption min-w-0">
+        {t(hasMembers ? "teams.membersForbiddenPartial" : "teams.membersForbiddenEmpty")}
+        {error ? <MemberDiagnostics error={error} /> : null}
+      </div>
       <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={onRetry}>
         <RefreshCwIcon className="size-3.5" />
         {t("teams.retry")}
@@ -209,11 +229,12 @@ function MemberAccessWarning({ onRetry }: { onRetry: () => void }) {
   )
 }
 
-function MemberLoadError({ onRetry }: { onRetry: () => void }) {
+function MemberLoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
   const { t } = useAppI18n()
   return (
     <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-4 py-8 text-center">
       <div className="oo-text-body text-muted-foreground">{t("teams.membersLoadFailedDescription")}</div>
+      <MemberDiagnostics error={error} />
       <Button type="button" variant="outline" size="sm" onClick={onRetry}>
         <RefreshCwIcon className="size-3.5" />
         {t("teams.retry")}
@@ -223,19 +244,28 @@ function MemberLoadError({ onRetry }: { onRetry: () => void }) {
 }
 
 export function Panel({
+  plain = false,
   action,
   children,
   description,
   title,
 }: {
+  plain?: boolean
   action?: React.ReactNode
   children: React.ReactNode
   description?: React.ReactNode
   title: React.ReactNode
 }) {
   return (
-    <section className="min-w-0 overflow-hidden rounded-md border border-[var(--oo-divider)] bg-background">
-      <div className="flex min-h-14 items-center justify-between gap-3 border-b border-[var(--oo-divider)] px-3 py-2">
+    <section
+      className={cn("min-w-0 overflow-hidden bg-background", !plain && "rounded-md border border-[var(--oo-divider)]")}
+    >
+      <div
+        className={cn(
+          "flex min-h-14 items-center justify-between gap-3 border-b border-[var(--oo-divider)] py-2",
+          !plain && "px-3",
+        )}
+      >
         <div className="min-w-0">
           <h2 className="oo-text-title truncate text-foreground">{title}</h2>
           {description ? <div className="oo-text-caption mt-0.5 min-w-0">{description}</div> : null}
@@ -340,5 +370,70 @@ export function ErrorBlock({ error, onRetry }: { error: string; onRetry: () => v
         {t("teams.retry")}
       </Button>
     </div>
+  )
+}
+
+export function TeamMemberAdditionNotice({
+  userId,
+  failed,
+  onRetry,
+  onDismiss,
+}: {
+  userId: string | null
+  failed: boolean
+  onRetry: () => void
+  onDismiss: () => void
+}) {
+  const { t } = useAppI18n()
+  if (!userId) return null
+  return (
+    <Alert role="status">
+      <AlertTitle>{t("teams.addMemberSuccess")}</AlertTitle>
+      <AlertDescription>
+        <p className="break-all">{t("teams.addMemberConfirmed", { userId })}</p>
+        {failed ? <p>{t("teams.addMemberRefreshFailed")}</p> : null}
+        <div className="flex gap-2">
+          {failed ? (
+            <Button type="button" variant="outline" size="sm" onClick={onRetry}>
+              {t("teams.retry")}
+            </Button>
+          ) : null}
+          <Button type="button" variant="ghost" size="sm" onClick={onDismiss}>
+            {t("common.close")}
+          </Button>
+        </div>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+function MemberDiagnostics({ error }: { error: string }) {
+  const { t } = useAppI18n()
+  return (
+    <div className="w-full max-w-2xl min-w-0 text-left">
+      <details className="rounded-md border border-border p-3 text-sm">
+        <summary className="cursor-pointer text-muted-foreground">{t("teams.memberDiagnosticsDetails")}</summary>
+        <pre className="mt-2 max-h-60 overflow-auto text-xs break-all whitespace-pre-wrap select-text">{error}</pre>
+      </details>
+      <CopyMemberDiagnosticsButton error={error} />
+    </div>
+  )
+}
+
+function CopyMemberDiagnosticsButton({ error }: { error: string }) {
+  const { t } = useAppI18n()
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      onClick={async () => {
+        const copied = await writeClipboardText(error)
+        if (copied) toast.success(t("error.copied"))
+        else toast.error(t("error.copyFailed"))
+      }}
+    >
+      {t("teams.copyMemberDiagnostics")}
+    </Button>
   )
 }

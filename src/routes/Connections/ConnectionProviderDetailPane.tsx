@@ -1,6 +1,6 @@
 import type {
   ConnectionAppSummary,
-  ConnectionAuthType,
+  ConnectionCredentialAuthType,
   ConnectionProviderDetail,
   ConnectionProviderSummary,
   ConnectionSummary,
@@ -21,19 +21,22 @@ import {
   getProviderAccountValue,
   getProviderCatalogLabel,
   getEmptyState,
+  getProviderMarketplaceApp,
   getProviderDescription,
   getProviderStatusTone,
   isConnected,
   isDirectlyAvailableProvider,
+  shouldShowProviderUpdatedAt,
 } from "./connection-route-model.ts"
 import { AuthTypeToggleGroup, ConnectionAccountsList } from "./ConnectionAccountsList.tsx"
 import { ProviderIcon } from "./ProviderIcon.tsx"
+import { ProviderPriceBadge } from "./ProviderPriceBadge.tsx"
 import { Loader } from "@/components/ai-elements/loader"
 import { ErrorNotice } from "@/components/ErrorNotice"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { isConnectionServicePollingTarget } from "@/hooks/connection-oauth-pending"
-import { useT } from "@/i18n/i18n"
+import { useI18n } from "@/i18n/i18n"
 import { cn } from "@/lib/utils"
 
 function ProviderStatusBadge({
@@ -43,7 +46,7 @@ function ProviderStatusBadge({
   canManageConnections: boolean
   provider: ConnectionProviderSummary
 }) {
-  const t = useT()
+  const { t } = useI18n()
   const tone = getProviderStatusTone(provider)
   return (
     <Badge
@@ -62,13 +65,28 @@ function ProviderStatusBadge({
   )
 }
 
-export function EmptyList({ summary, hasQuery }: { summary: ConnectionSummary | null; hasQuery: boolean }) {
-  const t = useT()
+export function EmptyList({
+  hasQuery,
+  onDiscover,
+  summary,
+}: {
+  hasQuery: boolean
+  onDiscover?: () => void
+  summary: ConnectionSummary | null
+}) {
+  const { t } = useI18n()
   const state = getEmptyState(summary, t)
   return (
     <section className="grid gap-1 rounded-lg border bg-muted/30 px-3 py-3">
       <div className="oo-text-label">{hasQuery ? t("connections.emptySearch") : state.title}</div>
       <div className="oo-text-caption oo-text-muted">{hasQuery ? t("connections.noMatch") : state.description}</div>
+      {onDiscover ? (
+        <div className="mt-2">
+          <Button type="button" variant="outline" size="sm" onClick={onDiscover}>
+            {t("connections.discoverConnections")}
+          </Button>
+        </div>
+      ) : null}
     </section>
   )
 }
@@ -110,7 +128,7 @@ export function ProviderDetail({
   onClose: () => void
   onConnect: (
     provider: ConnectionProviderSummary,
-    authType: Exclude<ConnectionAuthType, null>,
+    authType: ConnectionCredentialAuthType,
     appId?: string,
   ) => Promise<void>
   onDisconnect: (target: DisconnectTarget) => void
@@ -122,21 +140,31 @@ export function ProviderDetail({
   provider: ConnectionProviderSummary
   showCloseButton?: boolean
 }) {
-  const t = useT()
+  const { t, locale } = useI18n()
   const currentAuthType = getDefaultAuthType(provider)
   const accountValue = getProviderAccountValue(provider, t)
   const directlyAvailable = isDirectlyAvailableProvider(provider)
   const direct = provider.executionMode === "direct"
+  const marketplaceApp = getProviderMarketplaceApp(provider)
+  const marketplaceSelected = provider.appAuthType === "marketplace"
 
   return (
     <div className="grid min-w-0 gap-3">
       <section className="grid gap-3 border-b pb-3">
         <div className="flex min-w-0 items-start gap-3">
-          <ProviderIcon iconUrl={provider.iconUrl} displayName={provider.displayName} size="lg" />
+          <ProviderIcon
+            iconSprite={provider.iconSprite}
+            iconSpritePosition={provider.iconSpritePosition}
+            iconUrl={provider.iconUrl}
+            displayName={provider.displayName}
+            size="lg"
+          />
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
               <h2 className="oo-text-title truncate">{provider.displayName}</h2>
+              <ProviderPriceBadge provider={provider} />
               {direct ? <Badge variant="secondary">{t("connections.directMode")}</Badge> : null}
+              {marketplaceApp ? <Badge variant="secondary">{t("connections.marketplaceManaged")}</Badge> : null}
               <ProviderStatusBadge canManageConnections={canManageConnections} provider={provider} />
             </div>
             <p className="oo-text-caption oo-text-muted mt-1 break-words">{getProviderDescription(provider, t)}</p>
@@ -218,16 +246,26 @@ export function ProviderDetail({
             {directlyAvailable ? null : <DetailRow label={t("connections.account")} value={accountValue} />}
             <DetailRow
               label={t("connections.auth")}
-              value={provider.connectionMethodLabel ?? formatAuthTypes(provider.authTypes, t)}
+              value={
+                marketplaceSelected
+                  ? t("connections.marketplaceManaged")
+                  : (provider.connectionMethodLabel ?? formatAuthTypes(provider.authTypes, t))
+              }
             />
+            {marketplaceApp?.marketplace?.pricing === "metered" ? (
+              <DetailRow label={t("connections.marketplaceBilling")} value={t("connections.marketplaceMetered")} />
+            ) : null}
             {provider.runtimeVersion ? (
               <DetailRow label={t("connections.runtimeVersion")} value={provider.runtimeVersion} mono />
             ) : null}
             <DetailRow label={t("connections.category")} value={formatProviderCategoryLabels(provider, t)} />
             <DetailRow label={t("connections.service")} value={provider.service} mono />
-            {directlyAvailable ? null : (
-              <DetailRow label={t("connections.updatedAt")} value={formatDateTime(provider.connectedUpdatedAt, t)} />
-            )}
+            {shouldShowProviderUpdatedAt(provider) ? (
+              <DetailRow
+                label={t("connections.updatedAt")}
+                value={formatDateTime(provider.connectedUpdatedAt, t, locale)}
+              />
+            ) : null}
           </dl>
         )}
       </section>
@@ -236,7 +274,7 @@ export function ProviderDetail({
 }
 
 export function ReadOnlyConnectionNotice() {
-  const t = useT()
+  const { t } = useI18n()
   return (
     <section className="grid gap-1 rounded-lg border bg-muted/30 px-3 py-2.5">
       <div className="oo-text-label">{t("connections.readOnlyTitle")}</div>
@@ -245,8 +283,16 @@ export function ReadOnlyConnectionNotice() {
   )
 }
 
-export function ConnectionStateNotice({ status }: { status: "forbidden" | "unavailable" }) {
-  const t = useT()
+export function ConnectionStateNotice({ status }: { status: "loading" | "forbidden" | "unavailable" }) {
+  const { t } = useI18n()
+  if (status === "loading") {
+    return (
+      <div role="status" className="oo-text-caption oo-text-muted flex min-h-10 items-center gap-2 px-3 py-2">
+        <Loader size={16} />
+        {t("connections.stateLoadingDescription")}
+      </div>
+    )
+  }
   return (
     <section className="flex min-h-10 min-w-0 items-center gap-2 rounded-lg border border-dashed px-3 py-2">
       <AlertCircle className="oo-icon-muted size-4 shrink-0" />
@@ -266,7 +312,7 @@ function ConnectionAuthIntentNotice({
   authIntent: ConnectionAuthIntent
   provider: ConnectionProviderSummary
 }) {
-  const t = useT()
+  const { t } = useI18n()
   return (
     <div className="grid gap-1 rounded-md border border-[var(--oo-warning-border)] bg-[var(--oo-warning-surface)] px-3 py-2">
       <div className="flex min-w-0 items-center gap-2">
@@ -314,13 +360,13 @@ function ConnectionPanel({
   authIntent?: ConnectionAuthIntent | null
   busy: UseConnections["busy"]
   connections: UseConnections
-  currentAuthType: Exclude<ConnectionAuthType, null> | null
+  currentAuthType: ConnectionCredentialAuthType | null
   detail: ConnectionProviderDetail | null
   detailLoading: boolean
   onCancelPolling: () => void
   onConnect: (
     provider: ConnectionProviderSummary,
-    authType: Exclude<ConnectionAuthType, null>,
+    authType: ConnectionCredentialAuthType,
     appId?: string,
   ) => Promise<void>
   onDisconnect: (target: DisconnectTarget) => void
@@ -331,10 +377,8 @@ function ConnectionPanel({
   reopenPollingLabel?: string
   provider: ConnectionProviderSummary
 }) {
-  const t = useT()
-  const [selectedAuthType, setSelectedAuthType] = React.useState<Exclude<ConnectionAuthType, null> | null>(
-    currentAuthType,
-  )
+  const { t } = useI18n()
+  const [selectedAuthType, setSelectedAuthType] = React.useState<ConnectionCredentialAuthType | null>(currentAuthType)
   const authTypes = detail?.authTypes.length ? detail.authTypes : provider.authTypes
   const usableAuthTypes = authTypes.length > 0 ? authTypes : currentAuthType ? [currentAuthType] : []
   const configurableAuthTypes = isDirectlyAvailableProvider(provider)

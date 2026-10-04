@@ -18,7 +18,8 @@ export interface SessionInfo {
   scope?: SessionScope
   projectId?: string
   permissionMode?: SessionPermissionMode
-  knowledgeBaseIds?: string[]
+  /** This task was started from the team knowledge library. */
+  knowledgeMode?: boolean
   pinnedAt?: number
   archivedAt?: number
 }
@@ -124,11 +125,6 @@ export interface SetSessionAgentSelectionRequest {
   effortId?: string | null
 }
 
-export interface SetSessionKnowledgeBasesRequest {
-  id: string
-  knowledgeBaseIds: string[]
-}
-
 export interface SessionsChangedEvent {
   activity?: {
     sessionId: string
@@ -143,6 +139,7 @@ export interface CreateSessionRequest {
   title?: string
   /** Agent that will drive the session; defaults to the built-in kernel. */
   agentKind?: AgentKind
+  knowledgeMode?: boolean
 }
 
 export interface BatchSessionRequest {
@@ -187,7 +184,6 @@ export const SessionService = serviceName("session-service") as ServiceName<{
     createProject(req: CreateProjectRequest): Promise<SessionProject>
     assignSessionProject(req: AssignSessionProjectRequest): Promise<void>
     setPermissionMode(req: SetSessionPermissionModeRequest): Promise<void>
-    setKnowledgeBases(req: SetSessionKnowledgeBasesRequest): Promise<void>
     renameProject(req: { id: string; name: string }): Promise<void>
     pinProject(req: { id: string; pinned: boolean }): Promise<void>
     archiveProject(id: string): Promise<void>

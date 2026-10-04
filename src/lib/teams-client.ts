@@ -1,13 +1,13 @@
 import type { ConnectionAppSummary } from "../../electron/connections/common.ts"
 import type {
   CreateTeamRequest,
+  ServiceAccount,
   EditableTeamMemberRole,
   Team,
   TeamAppAccess,
   TeamMember,
   TeamMemberRequest,
   TeamOverview,
-  TeamProviderOption,
   TeamUserSearchResult,
   TeamUserSummary,
   UpdateTeamMembersStatusRequest,
@@ -17,9 +17,10 @@ import type {
 } from "../../electron/teams/common.ts"
 
 import { normalizeApp } from "../../electron/connections/summary.ts"
-import { getConnectionApps, getConnectionProviders } from "@/lib/connections-client"
+import { getConnectionApps } from "@/lib/connections-client"
 import { apiBaseUrl, teamControlBaseUrl } from "@/lib/domain"
 import { oomolFetch } from "@/lib/oomol-http"
+import { reportRendererHandledError } from "@/lib/renderer-diagnostics"
 import { sortSystemCreatedTeamFirst } from "@/lib/team-overview"
 
 // 团队面板/管理 UI 的全部网络读写在渲染层直接发起：原先这些是渲染业务驱动、却由主进程
@@ -28,20 +29,6 @@ import { sortSystemCreatedTeamFirst } from "@/lib/team-overview"
 
 interface TeamsEnvelope {
   teams?: unknown
-}
-
-interface TeamMembersEnvelope {
-  members?: unknown
-}
-
-interface RawConnectorApp {
-  service?: unknown
-  status?: unknown
-}
-
-interface RawConnectorProvider {
-  displayName?: unknown
-  service?: unknown
 }
 
 interface RequestOptions extends RequestInit {
@@ -128,6 +115,7 @@ function normalizeTeam(value: unknown): Team | undefined {
     name,
     avatar: normalizeAvatarUrl(value["avatar"]),
     creator_user_id: creatorUserId,
+    ...(value["status"] === "normal" || value["status"] === "paused" ? { status: value["status"] } : {}),
     ...(role === "creator" || role === "admin" || role === "member" ? { role } : {}),
     ...(typeof systemCreated === "boolean" ? { system_created: systemCreated } : {}),
     ...(typeof writable === "boolean" ? { writable } : {}),
@@ -151,25 +139,63 @@ function normalizeTeamMember(value: unknown): TeamMember | undefined {
   }
   const userId = asString(value["user_id"])
   const role = value["role"]
-  if (!userId || (role !== "creator" && role !== "admin" && role !== "member")) {
+  if (!userId || (role !== "creator" && role !== "admin" && role !== "member" && role !== "guest")) {
+    return undefined
+  }
+  if (value["user_type"] !== undefined && value["user_type"] !== "user" && value["user_type"] !== "service-account")
+    return undefined
+  if (value["name"] !== undefined && typeof value["name"] !== "string") return undefined
+  if (value["disable"] !== undefined && typeof value["disable"] !== "boolean") {
     return undefined
   }
   return {
     user_id: userId,
     role,
+    ...(value["user_type"] === "user" || value["user_type"] === "service-account"
+      ? { user_type: value["user_type"] }
+      : {}),
+    ...(typeof value["name"] === "string" ? { name: value["name"] } : {}),
     ...(typeof value["disable"] === "boolean" ? { disable: value["disable"] } : {}),
   }
 }
 
+class TeamMembersValidationError extends Error {}
+
+function responseValueType(value: unknown): string {
+  if (value === undefined) return "missing"
+  if (value === null) return "null"
+  return Array.isArray(value) ? "array" : typeof value
+}
+
 function normalizeTeamMembers(value: unknown): TeamMember[] {
   if (!Array.isArray(value)) {
-    throw new Error("Team members response is invalid.")
+    throw new TeamMembersValidationError(
+      `Team members response is invalid. Expected members array; received ${responseValueType(value)}.`,
+    )
   }
-  const members = value.map(normalizeTeamMember)
-  if (members.some((member) => !member)) {
-    throw new Error("Team members response contains an invalid member.")
-  }
-  return members as TeamMember[]
+  return value.map((value, index) => {
+    const member = normalizeTeamMember(value)
+    if (member) return member
+    const reason = !isPlainObject(value)
+      ? `expected object; received ${responseValueType(value)}`
+      : !asString(value["user_id"])
+        ? `user_id must be a non-empty string; received ${responseValueType(value["user_id"])}`
+        : value["role"] !== "creator" &&
+            value["role"] !== "admin" &&
+            value["role"] !== "member" &&
+            value["role"] !== "guest"
+          ? "role must be creator, admin, member, or guest"
+          : value["user_type"] !== undefined &&
+              value["user_type"] !== "user" &&
+              value["user_type"] !== "service-account"
+            ? "user_type must be user or service-account when provided"
+            : value["name"] !== undefined && typeof value["name"] !== "string"
+              ? "name must be a string when provided"
+              : `disable must be a boolean when provided; received ${responseValueType(value["disable"])}`
+    throw new TeamMembersValidationError(
+      `Team members response contains an invalid member. members[${index}]: ${reason}.`,
+    )
+  })
 }
 
 function normalizeUserSummaryMap(value: unknown): Record<string, TeamUserSummary> {
@@ -213,27 +239,6 @@ function normalizeUserSearchResults(value: unknown): TeamUserSearchResult[] {
     return []
   }
   return value.map(normalizeUserSearchResult).filter((item): item is TeamUserSearchResult => Boolean(item))
-}
-
-function normalizeProviderOptions(apps: RawConnectorApp[], providers: RawConnectorProvider[]): TeamProviderOption[] {
-  const providerLabelByService = new Map(
-    providers
-      .map((provider) => {
-        const service = asString(provider.service)
-        return service ? ([service, asString(provider.displayName) ?? service] as const) : undefined
-      })
-      .filter((item): item is readonly [string, string] => Boolean(item)),
-  )
-  const connectedServices = new Set<string>()
-  for (const app of apps) {
-    const service = asString(app.service)
-    if (service && app.status !== "disconnected") {
-      connectedServices.add(service)
-    }
-  }
-  return Array.from(connectedServices)
-    .map((service) => ({ service, label: providerLabelByService.get(service) ?? service }))
-    .sort((left, right) => left.label.localeCompare(right.label))
 }
 
 function normalizeAppAccess(value: unknown): TeamAppAccess {
@@ -366,7 +371,7 @@ export async function createTeam(req: CreateTeamRequest): Promise<Team> {
   const team = normalizeTeam(
     await requestApiJson("/v1/teams", {
       method: "POST",
-      body: JSON.stringify({ org_name: teamName, ...(req.avatar?.trim() ? { avatar: req.avatar.trim() } : {}) }),
+      body: JSON.stringify({ team_name: teamName, ...(req.avatar?.trim() ? { avatar: req.avatar.trim() } : {}) }),
     }),
   )
   if (!team) {
@@ -384,7 +389,7 @@ export async function updateTeam(req: UpdateTeamRequest): Promise<Team> {
   const team = normalizeTeam(
     await requestApiJson(`/v1/teams/${encodePath(teamId)}`, {
       method: "PUT",
-      body: JSON.stringify({ org_name: teamName, avatar: req.avatar.trim() }),
+      body: JSON.stringify({ team_name: teamName, avatar: req.avatar.trim() }),
     }),
   )
   if (!team) {
@@ -411,8 +416,70 @@ export async function uploadTeamAvatar(teamId: string, file: File): Promise<Uplo
 
 export async function listTeamMembers(teamId: string): Promise<TeamMember[]> {
   const id = requireIdentifier(teamId, "Team id")
-  const result = (await requestTeamControlJson(`/v1/teams/${encodePath(id)}/members`)) as TeamMembersEnvelope
-  return normalizeTeamMembers(result.members)
+  const path = `/v1/teams/${encodePath(id)}/members`
+  const startedAt = Date.now()
+  let status: number | undefined
+  let requestId: string | undefined
+  let stage: "request" | "response_body" | "validation" = "request"
+  try {
+    const result = await requestTeamControlJson(path, {
+      onResponse: (response) => {
+        status = response.status
+        stage = "response_body"
+        const value = response.headers.get("x-request-id") ?? response.headers.get("request-id")
+        if (value && /^[a-zA-Z0-9._:-]{1,128}$/.test(value)) requestId = value
+      },
+    })
+    stage = "validation"
+    if (!isPlainObject(result)) {
+      throw new TeamMembersValidationError(
+        `Team members response is invalid. Expected JSON object; received ${responseValueType(result)}.`,
+      )
+    }
+    return normalizeTeamMembers(result["members"])
+  } catch (cause) {
+    const interrupted = cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError")
+    const category = interrupted
+      ? "timeout_or_cancelled"
+      : cause instanceof TeamMembersValidationError
+        ? "invalid_response"
+        : cause instanceof TeamRequestError
+          ? "http_error"
+          : status !== undefined
+            ? "response_read_error"
+            : "network_error"
+    // Only generated explanations are shared; raw bodies and exception messages may contain credentials or personal data.
+    const reason =
+      cause instanceof TeamMembersValidationError
+        ? cause.message
+        : interrupted
+          ? cause.name === "TimeoutError"
+            ? `Request exceeded the ${teamRequestTimeoutMs} ms deadline.`
+            : "Request was cancelled before completion."
+          : category === "http_error"
+            ? `Server returned HTTP ${status}. Use the request ID and timestamp to check server logs.`
+            : category === "response_read_error"
+              ? "Response headers arrived, but reading the response body failed."
+              : "No HTTP response was available. The browser cannot distinguish DNS, TLS, proxy, CORS, or connection failures here."
+    const error = Object.assign(
+      new Error(
+        [
+          "Team members read failed",
+          `reason=${reason}`,
+          `stage=${stage}`,
+          `GET ${teamControlBaseUrl}${path}`,
+          `time=${new Date(startedAt).toISOString()}`,
+          `status=${status ?? "unavailable"}; category=${category}; elapsedMs=${Date.now() - startedAt}`,
+          `requestId=${requestId ?? "unavailable"}`,
+          `platform=${globalThis.wanta?.platform ?? "unknown"}`,
+          `version=${globalThis.wanta?.version ?? "unknown"}; commit=${globalThis.wanta?.appCommit ?? "unknown"}`,
+        ].join("\n"),
+      ),
+      { status },
+    )
+    reportRendererHandledError("team-members", "Member list request failed", error.message)
+    throw error
+  }
 }
 
 export async function listUserSummaries(userIds: string[]): Promise<Record<string, TeamUserSummary>> {
@@ -564,21 +631,6 @@ export async function updateTeamAppAccess(
   return updated
 }
 
-export async function listTeamProviderOptions(teamName: string): Promise<TeamProviderOption[]> {
-  const normalized = teamName.trim()
-  if (!normalized) {
-    return []
-  }
-  const [apps, providers] = await Promise.all([
-    getConnectionApps({ manageable: true, teamName: normalized }),
-    getConnectionProviders(),
-  ])
-  return normalizeProviderOptions(
-    Array.isArray(apps.data) ? apps.data : [],
-    Array.isArray(providers.data) ? providers.data : [],
-  )
-}
-
 export async function listTeamConnectionApps(
   teamName: string,
   options: { forceRefresh?: boolean } = {},
@@ -590,4 +642,27 @@ export async function listTeamConnectionApps(
     .map(normalizeApp)
     .filter((app): app is ConnectionAppSummary => Boolean(app))
     .sort((left, right) => left.service.localeCompare(right.service) || left.id.localeCompare(right.id))
+}
+
+export async function listServiceAccounts(): Promise<ServiceAccount[]> {
+  const result = await requestApiJson("/v1/service-accounts")
+  if (!isPlainObject(result) || !Array.isArray(result["service_accounts"])) {
+    throw new Error("Service accounts response is invalid.")
+  }
+  return result["service_accounts"].map((value, index) => {
+    if (!isPlainObject(value))
+      throw new Error(`Service accounts response contains an invalid account at index ${index}.`)
+    const { id, name, creator_user_id, status, created_at, updated_at } = value
+    if (
+      typeof id !== "string" ||
+      typeof name !== "string" ||
+      typeof creator_user_id !== "string" ||
+      typeof status !== "string" ||
+      typeof created_at !== "string" ||
+      typeof updated_at !== "string"
+    ) {
+      throw new Error(`Service accounts response contains an invalid account at index ${index}.`)
+    }
+    return { id, name, creator_user_id, status, created_at, updated_at }
+  })
 }

@@ -35,6 +35,8 @@ export interface PromptAgentInput {
   teamName?: string
   /** Per-turn system prompt tail composed by the chat layer. */
   system?: string
+  /** Host-owned restricted diagnostic turn; adapters must isolate native scope and capabilities. */
+  diagnostic?: boolean
   /** Managed output directories assigned by the chat layer for this turn. */
   artifactDir?: string
   /** Host-selected project cwd. Kept separate from artifact placement. */
@@ -64,6 +66,10 @@ export interface PermissionResponseAgentInput {
   sessionId: string
   requestId: string
   reply: ChatPermissionReply
+  /** Exact native permission option selected by the user. */
+  optionId?: string
+  /** Advisory rejection explanation, forwarded by runtimes with native support. */
+  message?: string
 }
 
 export type QuestionResponseOutcome = { kind: "answered"; answers: string[][] } | { kind: "rejected" }
@@ -90,7 +96,14 @@ export interface SetEffortAgentInput {
   effortId?: string
 }
 
+/** Start an agent-owned authentication method advertised during ACP initialize. */
+export interface AuthenticateAgentInput {
+  type: "authenticate"
+  methodId: string
+}
+
 export type AgentInput =
+  | AuthenticateAgentInput
   | PromptAgentInput
   | CancelAgentInput
   | PermissionResponseAgentInput
@@ -105,6 +118,8 @@ export interface AgentSendOptions {
    * must treat an already-aborted signal as "do nothing".
    */
   signal?: AbortSignal
+  /** Called once when a queued prompt reaches the native runtime boundary. */
+  onDispatch?: () => void
 }
 
 const agentModeSchema: z.ZodType<WantaAgentMode> = z.enum(["build", "plan"])
@@ -134,6 +149,7 @@ const promptInputSchema = z.object({
   reasoningLevel: reasoningLevelSchema.optional(),
   teamName: z.string().optional(),
   system: z.string().optional(),
+  diagnostic: z.boolean().optional(),
   artifactDir: z.string().optional(),
   workingDirectory: z.string().optional(),
   additionalDirectories: z.array(z.string().min(1)).optional(),
@@ -157,6 +173,8 @@ const permissionResponseInputSchema = z.object({
   sessionId: z.string().min(1),
   requestId: z.string().min(1),
   reply: permissionReplySchema,
+  optionId: z.string().optional(),
+  message: z.string().optional(),
 })
 
 const questionOutcomeSchema: z.ZodType<QuestionResponseOutcome> = z.discriminatedUnion("kind", [
@@ -183,8 +201,14 @@ const setEffortInputSchema = z.object({
   effortId: z.string().min(1).optional(),
 })
 
+const authenticateInputSchema = z.object({
+  type: z.literal("authenticate"),
+  methodId: z.string().min(1),
+})
+
 /** Compile-time check: schema union and AgentInput must stay in lockstep. */
 export const agentInputSchema: z.ZodType<AgentInput> = z.discriminatedUnion("type", [
+  authenticateInputSchema,
   promptInputSchema,
   cancelInputSchema,
   permissionResponseInputSchema,

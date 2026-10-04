@@ -26,7 +26,7 @@ export type PublicSkillInstallState =
   | "installable"
   | "name-conflict"
   | "unavailable"
-export type PublicPackageCatalogStatus = "idle" | "load-error" | "loading" | "loading-more" | "refreshing"
+export type PublicPackageCatalogStatus = "idle" | "ready" | "load-error" | "loading" | "loading-more" | "refreshing"
 export type ManagedSkillGroupById = ReadonlyMap<string, ManagedSkillGroup>
 export type SkillVersionCheckByKey = ReadonlyMap<string, SkillVersionReport["skills"][number]>
 export type TeamSkillRuntimeState =
@@ -175,7 +175,7 @@ export function publicPackageCatalogReducer(
           : appendUniquePublicPackages([], action.catalog.items),
         next: action.catalog.next,
         selectedId: action.append ? state.selectedId : null,
-        status: "idle",
+        status: "ready",
       }
     case "load-error":
       if (action.requestId !== state.requestId) {
@@ -603,7 +603,7 @@ export function getPublicPackageInstallState(
 
   const skillStates = pkg.skills.map((skill) => getPublicSkillInstallState(groupById, pkg, skill.name))
 
-  if (skillStates.length > 0 && skillStates.every((state) => state === "installed")) {
+  if (skillStates.every((state) => state === "installed")) {
     return "installed"
   }
 
@@ -679,11 +679,12 @@ export function getPublicPackageMaintainerLine(pkg: PublicSkillPackage, t: TFunc
 }
 
 export function getPublicPackageMetaLine(pkg: PublicSkillPackage, t: TFunction): string {
+  const maintainerLine = getPublicPackageMaintainerLine(pkg, t)
   return (
     joinSkillMeta([
-      getPublicPackageMaintainerLine(pkg, t),
+      maintainerLine,
       pkg.downloadCount === undefined ? undefined : t("skills.discoverDownloads", { count: pkg.downloadCount }),
-    ]) ?? getPublicPackageMaintainerLine(pkg, t)
+    ]) ?? maintainerLine
   )
 }
 
