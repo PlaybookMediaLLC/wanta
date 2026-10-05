@@ -41,12 +41,13 @@ import {
   IMAGE_UNDERSTANDING_BUILTIN_MODEL_ID,
   isBuiltinModelId,
   resolveBuiltinModel,
-  resolveExecutionBuiltinModelId,
 } from "../models/builtin.ts"
+import { buildArtifactSystem } from "./artifact-system.ts"
 import { planAttachmentInputs } from "./attachment-input.ts"
 import { buildOpencodeConfig, customProviderId, WANTA_MODEL_ID, WANTA_PROVIDER_ID } from "./config.ts"
 import { ensureDirectCliCommandBin } from "./direct-cli-bin.ts"
 import { normalizeMessage, normalizePermissionRequest, normalizeQuestionRequest } from "./event-translator.ts"
+import { resolveExternalOoOperation } from "./external/oo-capability-contract.ts"
 import { isImageUrlContentSchemaMismatch, understandAttachedImages } from "./image-understanding.ts"
 import { ManagedTurnDirectories } from "./managed-turn-directories.ts"
 import { normalizeWantaAgentMode } from "./mode.ts"
@@ -58,7 +59,6 @@ import { managedPythonEnvironmentPath, managedPythonExecutable } from "./python-
 import { opencodeReasoningVariant } from "./reasoning.ts"
 import { generateSessionTitle as generateTitle } from "./session-title-generator.ts"
 import { OpencodeSidecar } from "./sidecar.ts"
-import { ensureWikiGraphCommandBin } from "./wikigraph-bin.ts"
 import { ensureAgentWorkspace } from "./workspace.ts"
 
 export type { GeneratedSessionTitle } from "./session-title-generator.ts"
@@ -74,11 +74,8 @@ export interface AgentManagerOptions {
   opencodeBinPath: string
   /** The oo binary is resolved and injected only when a Link runtime is configured. */
   ooBinPath?: string
-  /** Electron-as-Node entrypoint that scopes and redacts Agent-side oo business calls. */
-  ooGuardCliPath?: string
-  /** Wanta-owned WikiGraph CLI entrypoint used by the sidecar PATH `wg` shim. */
-  wikiGraphCliPath?: string
-  wikiGraphStateDir?: string
+  /** Electron-as-Node entrypoint that scopes and redacts built-in OpenCode oo business calls. */
+  opencodeOoGuardCliPath?: string
   listOpenConnectorAuthorizedServices?: (signal?: AbortSignal) => Promise<string[]>
   /** 内置 skill 源目录（resources/skills 或打包 Resources/skills）；启动时拷进 .opencode/skill/。 */
   bundledSkillsDir?: string
@@ -122,15 +119,6 @@ function normalizeTeamName(teamName: string | undefined): string | undefined {
 function requireOoBinPath(ooBinPath: string | undefined): string {
   if (!ooBinPath) throw new Error("The Link runtime requires the oo binary path.")
   return ooBinPath
-}
-
-function normalizeKnowledgeBaseIds(ids: readonly string[]): string[] {
-  return [...new Set(ids.map((id) => id.trim()).filter(Boolean))]
-}
-
-function sameStringArray(left: readonly string[] | undefined, right: readonly string[]): boolean {
-  if (!left) return right.length === 0
-  return left.length === right.length && left.every((item, index) => item === right[index])
 }
 
 function sessionTitleRequestProfile(
@@ -484,12 +472,16 @@ function executableCommandSubstitutions(command: string): string[] {
   return substitutions
 }
 
-function shellExecutesConnectorBusinessCommand(command: string, depth = 0): boolean {
+function managedOoOutputNeedsPersistedRedaction(args: readonly string[]): boolean {
+  return isConnectorBusinessCommand(args) || resolveExternalOoOperation(args)?.id === "file.upload"
+}
+
+function shellExecutesSensitiveManagedOoCommand(command: string, depth = 0): boolean {
   if (depth >= maxConnectorShellDepth) return false
   const executableCommand = shellWithoutComments(command)
   if (
     executableCommandSubstitutions(executableCommand).some((body) =>
-      shellExecutesConnectorBusinessCommand(body, depth + 1),
+      shellExecutesSensitiveManagedOoCommand(body, depth + 1),
     )
   ) {
     return true
@@ -498,20 +490,20 @@ function shellExecutesConnectorBusinessCommand(command: string, depth = 0): bool
     const parsed = shellWords(text)
     if (!parsed?.length) return false
     const words = effectiveShellCommandWords(parsed)
-    if (isOoCommandWord(words[0])) return isConnectorBusinessCommand(words.slice(1))
+    if (isOoCommandWord(words[0])) return managedOoOutputNeedsPersistedRedaction(words.slice(1))
     const nested = nestedShellCommand(words)
-    return nested ? shellExecutesConnectorBusinessCommand(nested, depth + 1) : false
+    return nested ? shellExecutesSensitiveManagedOoCommand(nested, depth + 1) : false
   })
 }
 
-export function isPersistedConnectorToolPart(part: { state?: { input?: unknown }; tool?: unknown }): boolean {
+export function isPersistedSensitiveOoToolPart(part: { state?: { input?: unknown }; tool?: unknown }): boolean {
   if (typeof part.tool !== "string") return false
   if (persistedConnectorToolNames.has(part.tool)) return true
   if (part.tool !== "bash" && part.tool !== "shell") return false
   const input = part.state?.input
   if (!input || typeof input !== "object") return false
   const command = (input as { command?: unknown }).command
-  return typeof command === "string" && shellExecutesConnectorBusinessCommand(command)
+  return typeof command === "string" && shellExecutesSensitiveManagedOoCommand(command)
 }
 
 /** Agent 内核管理器：编排 OpenCode sidecar + 非编码 agent + 自定义连接器工具。electron-free，便于 headless 测试。 */
@@ -532,7 +524,6 @@ export class AgentManager {
   private teamScopePath: string | undefined
   private teamUpdateChain: Promise<void> = Promise.resolve()
   private sessionTeamNames = new Map<string, string>()
-  private sessionKnowledgeBaseIds = new Map<string, string[]>()
   private authorizedServicesCache = new Map<string, { loadedAt: number; services: string[] }>()
   private authorizedServicesLoadControllers = new Map<string, AbortController>()
   private authorizedServicesLoads = new Map<string, Promise<string[]>>()
@@ -608,58 +599,6 @@ export class AgentManager {
     })
   }
 
-  /** 记录本轮选中的知识库；提示词按 OpenCode sessionID 注入对应 archive URI。 */
-  public async setSessionKnowledgeBaseIds(sessionId: string, knowledgeBaseIds: readonly string[]): Promise<void> {
-    const normalizedSessionId = sessionId.trim()
-    if (!normalizedSessionId) throw new Error("Session id is required")
-    const normalizedIds = normalizeKnowledgeBaseIds(knowledgeBaseIds)
-    await this.queueTeamUpdate(async () => {
-      if (sameStringArray(this.sessionKnowledgeBaseIds.get(normalizedSessionId), normalizedIds)) return
-      if (normalizedIds.length > 0) this.sessionKnowledgeBaseIds.set(normalizedSessionId, normalizedIds)
-      else this.sessionKnowledgeBaseIds.delete(normalizedSessionId)
-      await this.writeTeamScope(this.teamName)
-    })
-  }
-
-  public async clearSessionKnowledgeBaseIds(sessionId: string): Promise<void> {
-    const normalizedSessionId = sessionId.trim()
-    if (!normalizedSessionId) return
-    await this.queueTeamUpdate(async () => {
-      if (!this.sessionKnowledgeBaseIds.delete(normalizedSessionId)) return
-      await this.writeTeamScope(this.teamName)
-    })
-  }
-
-  /** task 子会话使用独立 sessionID，必须显式继承父会话选中的知识库。 */
-  public async inheritSessionKnowledgeBaseIds(parentSessionId: string, childSessionId: string): Promise<void> {
-    const normalizedParentId = parentSessionId.trim()
-    const normalizedChildId = childSessionId.trim()
-    if (!normalizedParentId || !normalizedChildId || normalizedParentId === normalizedChildId) return
-    await this.queueTeamUpdate(async () => {
-      const parentIds = this.sessionKnowledgeBaseIds.get(normalizedParentId) ?? []
-      if (sameStringArray(this.sessionKnowledgeBaseIds.get(normalizedChildId), parentIds)) return
-      if (parentIds.length > 0) this.sessionKnowledgeBaseIds.set(normalizedChildId, [...parentIds])
-      else this.sessionKnowledgeBaseIds.delete(normalizedChildId)
-      await this.writeTeamScope(this.teamName)
-    })
-  }
-
-  public async removeKnowledgeBaseAccess(knowledgeBaseId: string): Promise<void> {
-    const normalizedId = knowledgeBaseId.trim()
-    if (!normalizedId) return
-    await this.queueTeamUpdate(async () => {
-      let changed = false
-      for (const [sessionId, ids] of this.sessionKnowledgeBaseIds) {
-        const next = ids.filter((id) => id !== normalizedId)
-        if (next.length === ids.length) continue
-        changed = true
-        if (next.length > 0) this.sessionKnowledgeBaseIds.set(sessionId, next)
-        else this.sessionKnowledgeBaseIds.delete(sessionId)
-      }
-      if (changed) await this.writeTeamScope(this.teamName)
-    })
-  }
-
   private async queueTeamUpdate(update: () => Promise<void>): Promise<void> {
     const task = this.teamUpdateChain.then(update, update)
     this.teamUpdateChain = task.catch((error: unknown) => {
@@ -672,16 +611,16 @@ export class AgentManager {
     this.disposed = false
     await this.prepareWorkspace()
     await this.startSidecar()
-    void this.scrubPersistedConnectorOutputs().catch((error: unknown) => {
-      console.warn("[wanta] failed to scrub persisted connector outputs:", error)
-      logDiagnostic("agent", "persisted connector output scrub failed", { error }, "warn")
+    void this.scrubPersistedSensitiveOoOutputs().catch((error: unknown) => {
+      console.warn("[wanta] failed to scrub persisted sensitive OO outputs:", error)
+      logDiagnostic("agent", "persisted sensitive OO output scrub failed", { error }, "warn")
     })
   }
 
-  /** One-time defense for tool outputs saved before the managed oo guard existed. */
-  private async scrubPersistedConnectorOutputs(): Promise<void> {
+  /** One-time defense for tool outputs saved before live per-turn redaction. */
+  private async scrubPersistedSensitiveOoOutputs(): Promise<void> {
     if (!this.sidecar || this.disposed) return
-    const markerPath = path.join(this.options.rootDir, ".connector-output-redaction-v1")
+    const markerPath = path.join(this.options.rootDir, ".sensitive-oo-output-redaction-v2")
     try {
       await readFile(markerPath, "utf8")
       return
@@ -690,33 +629,41 @@ export class AgentManager {
     }
 
     const sessionsResult = await this.client.session.list({ limit: 10_000, roots: false })
-    assertOpencodeSuccess(sessionsResult, "session.list for connector output scrub")
+    assertOpencodeSuccess(sessionsResult, "session.list for sensitive OO output scrub")
     let redactedPartCount = 0
     for (const session of sessionsResult.data ?? []) {
       if (this.disposed) return
-      const messagesResult = await this.client.session.messages({ sessionID: session.id, limit: 10_000 })
-      assertOpencodeSuccess(messagesResult, "session.messages for connector output scrub")
-      for (const message of messagesResult.data ?? []) {
-        for (const part of message.parts) {
-          if (part.type !== "tool" || part.state.status !== "completed") continue
-          if (!isPersistedConnectorToolPart(part)) continue
-          const output = redactConnectorOutput(part.state.output)
-          if (output === part.state.output) continue
-          const updatedPart: OpencodePart = { ...part, state: { ...part.state, output } }
-          const updateResult = await this.client.part.update({
-            sessionID: part.sessionID,
-            messageID: part.messageID,
-            partID: part.id,
-            part: updatedPart,
-          })
-          assertOpencodeSuccess(updateResult, "part.update for connector output scrub")
-          redactedPartCount += 1
-        }
-      }
+      redactedPartCount += await this.scrubSessionSensitiveOoOutputs(session.id)
     }
     if (this.disposed) return
-    await atomicWriteText(markerPath, JSON.stringify({ redactedPartCount, version: 1 }))
-    logDiagnostic("agent", "persisted connector output scrub completed", { redactedPartCount })
+    await atomicWriteText(markerPath, JSON.stringify({ redactedPartCount, version: 2 }))
+    logDiagnostic("agent", "persisted sensitive OO output scrub completed", { redactedPartCount })
+  }
+
+  /** Redact signed upload URLs and connector secrets after the active turn has consumed them. */
+  public async scrubSessionSensitiveOoOutputs(sessionId: string): Promise<number> {
+    if (!this.sidecar || this.disposed) return 0
+    const messagesResult = await this.client.session.messages({ sessionID: sessionId, limit: 10_000 })
+    assertOpencodeSuccess(messagesResult, "session.messages for sensitive OO output scrub")
+    let redactedPartCount = 0
+    for (const message of messagesResult.data ?? []) {
+      for (const part of message.parts) {
+        if (part.type !== "tool" || part.state.status !== "completed") continue
+        if (!isPersistedSensitiveOoToolPart(part)) continue
+        const output = redactConnectorOutput(part.state.output)
+        if (output === part.state.output) continue
+        const updatedPart: OpencodePart = { ...part, state: { ...part.state, output } }
+        const updateResult = await this.client.part.update({
+          sessionID: part.sessionID,
+          messageID: part.messageID,
+          partID: part.id,
+          part: updatedPart,
+        })
+        assertOpencodeSuccess(updateResult, "part.update for sensitive OO output scrub")
+        redactedPartCount += 1
+      }
+    }
+    return redactedPartCount
   }
 
   private async prepareWorkspace(): Promise<void> {
@@ -739,13 +686,11 @@ export class AgentManager {
       modelAccess,
       opencodeBinPath,
       ooBinPath,
-      ooGuardCliPath,
+      opencodeOoGuardCliPath,
       rootDir,
       disableServerAuth,
       customModels,
       defaultModel,
-      wikiGraphCliPath,
-      wikiGraphStateDir,
       larkCliBinPath,
       larkCliConfigDir,
       wecomCliBinPath,
@@ -771,19 +716,11 @@ export class AgentManager {
       wecomCliBinPath,
     })
     let managedOoBinPath = ooBinPath
-    if (linkRuntime && ooBinPath && ooGuardCliPath) {
+    if (linkRuntime && ooBinPath && opencodeOoGuardCliPath) {
       managedOoBinPath = await ensureOoGuardCommandBin({
         binDir: commandBinDir,
         nodeBin: process.execPath,
-        ooGuardCliPath,
-      })
-    }
-    if (wikiGraphCliPath && wikiGraphStateDir) {
-      await ensureWikiGraphCommandBin({
-        binDir: commandBinDir,
-        nodeBin: process.execPath,
-        stateDir: wikiGraphStateDir,
-        wikiGraphCliPath,
+        ooGuardCliPath: opencodeOoGuardCliPath,
       })
     }
     const commandPath = `${commandBinDir}${path.delimiter}${baseCommandPath}`
@@ -1207,8 +1144,17 @@ export class AgentManager {
       .filter((request) => requestedSessionIds.has(request.sessionId))
   }
 
-  public async answerPermission(_sessionId: string, requestId: string, reply: ChatPermissionReply): Promise<void> {
-    const result = await this.client.permission.reply({ requestID: requestId, reply })
+  public async answerPermission(
+    _sessionId: string,
+    requestId: string,
+    reply: ChatPermissionReply,
+    message?: string,
+  ): Promise<void> {
+    const result = await this.client.permission.reply({
+      requestID: requestId,
+      reply,
+      ...(message !== undefined ? { message } : {}),
+    })
     assertOpencodeSuccess(result, "permission.reply")
   }
 
@@ -1438,7 +1384,6 @@ export class AgentManager {
     }
     const content = JSON.stringify({
       teamName: teamName ?? "",
-      sessionKnowledgeBaseIds: Object.fromEntries(this.sessionKnowledgeBaseIds),
       sessionTeams: Object.fromEntries(this.sessionTeamNames),
     })
     await atomicWriteText(this.teamScopePath, content)
@@ -1499,7 +1444,7 @@ export class AgentManager {
     if (!effectiveChoice || effectiveChoice.kind === "builtin") {
       const modelID =
         effectiveChoice && isBuiltinModelId(effectiveChoice.id) ? effectiveChoice.id : DEFAULT_BUILTIN_MODEL_ID
-      return resolveBuiltinModel(resolveExecutionBuiltinModelId(modelID)).runtime
+      return resolveBuiltinModel(modelID).runtime
     }
     const model = this.options.customModels?.find((item) => item.id === effectiveChoice.id)
     if (!model) {
@@ -1527,7 +1472,7 @@ export class AgentManager {
     }
     const modelID =
       effectiveChoice && isBuiltinModelId(effectiveChoice.id) ? effectiveChoice.id : DEFAULT_BUILTIN_MODEL_ID
-    const model = resolveBuiltinModel(resolveExecutionBuiltinModelId(modelID))
+    const model = resolveBuiltinModel(modelID)
     return model.capabilities.reasoningVariants?.includes(variant) ? variant : undefined
   }
 
@@ -1543,7 +1488,7 @@ export class AgentManager {
     }
     const modelID =
       effectiveChoice && isBuiltinModelId(effectiveChoice.id) ? effectiveChoice.id : DEFAULT_BUILTIN_MODEL_ID
-    const capabilities = resolveBuiltinModel(resolveExecutionBuiltinModelId(modelID)).capabilities
+    const capabilities = resolveBuiltinModel(modelID).capabilities
     return { images: capabilities.supportsImages, pdf: capabilities.supportsPdf }
   }
 
@@ -1718,44 +1663,7 @@ function sleep(ms: number): Promise<void> {
   })
 }
 
-export function buildArtifactSystem(artifactDir: string | undefined, outputProjectRoot?: string): string | undefined {
-  if (!artifactDir) {
-    return undefined
-  }
-  const projectPublication = outputProjectRoot
-    ? [
-        `- This turn belongs to a folder project. Wanta will publish final deliverables from this managed directory into the visible project directory: ${outputProjectRoot}`,
-        "- Use descriptive user-facing file and directory names. Preserve any project-relative output layout explicitly requested by the user inside this managed directory; Wanta will reproduce that layout in the project.",
-        "- Do not write a second copy directly into the project directory. Wanta performs the checked, collision-safe publication after the turn completes.",
-        "- In the final response, refer to deliverables by their user-facing names or requested project-relative locations. Do not present the managed artifact path as the final project location.",
-      ]
-    : []
-  return [
-    "Artifact output contract for this turn:",
-    `- Use this exact directory for files you create, convert, export, download, or modify as user-facing deliverables: ${artifactDir}`,
-    "- Do not create files just because this artifact directory is provided.",
-    ...projectPublication,
-    "- For edits to an existing local project, modify the requested project files in place; even when this artifact directory is inside the project, use it only for exported deliverables, generated assets, converted files, reports, or packaged outputs.",
-    "- Wanta indexes the directory recursively and determines the artifact type from the actual files. Do not create a manifest or describe files that do not exist.",
-    "- Treat HTML reports, images, PDFs, charts, spreadsheets, presentations, archives, and documents as user-facing deliverables.",
-    "- Keep HTML reports usable in a resizable preview viewport. Include a standard viewport meta tag, avoid overflow:hidden on html/body unless the user explicitly requests a fixed non-scrollable canvas, and make fixed-size content responsive or leave the document scrollable.",
-    "- For image sets, save every final image in display order with stable padded names such as 001.jpg and 002.jpg.",
-    "- Image preview and artifact persistence are separate outputs, and both are required for every final generated image whenever the source can be materialized. Preserve a useful inline preview whenever an image provider or tool returns a viewable image, even when that preview is remote, data-backed, or temporary.",
-    "- Persist every final generated image into this directory. If a tool returns only a remote, data-backed, or temporary preview, keep the preview reference intact so Wanta can materialize the same image during turn finalization. Do not describe it as a saved local file until persistence succeeds.",
-    "- When a generated image has both a successfully saved local path and a matching remote or temporary preview, use the local path for the inline Markdown image. Keep the remote reference only as recovery metadata; do not make it the primary preview.",
-    "- When the final deliverable is one to four image files and inline viewing helps the user, include Markdown image references in the final response using their absolute local paths, for example ![short title](</absolute/path/image.png>).",
-    "- On Windows, use drive-letter paths such as C:/Users/name/output.png or C:\\Users\\name\\output.png without an extra leading slash. Never emit /C:/Users/... as a local Markdown image destination.",
-    "- If only a provider-backed image preview is available, keep that preview visible in the final response instead of omitting it. Wanta will materialize supported preview sources and independently report persistence failures.",
-    "- When there are many images, such as crawled or downloaded image sets, do not inline every image in the final response. Summarize the set and rely on the artifact browser.",
-    "- Do not reuse output folders from earlier turns or other chats.",
-    "- If you reuse a script from an earlier turn, copy or update it before running and replace every embedded output path with this turn's artifact directory. Never run a prior-turn script while it still targets an earlier output directory.",
-    "- Do not write deliverables to Desktop, Downloads, the OpenCode workspace, or prior output directories unless the user explicitly requested that exact destination.",
-    outputProjectRoot
-      ? "- When you finish, summarize the deliverable contents and names in prose; Wanta will surface the checked final project locations after publication."
-      : "- When you finish, summarize the deliverable contents and report generated file paths in prose or inline code, not fenced code blocks; fenced blocks are only for code or multi-line text.",
-    "- Do not open generated files with system commands unless the user explicitly asks you to open them externally; the app is responsible for surfacing artifacts in the UI.",
-  ].join("\n")
-}
+export { buildArtifactSystem } from "./artifact-system.ts"
 
 function buildProcessSystem(processDir: string | undefined): string | undefined {
   if (!processDir) {
@@ -1770,6 +1678,7 @@ function buildProcessSystem(processDir: string | undefined): string | undefined 
   return [
     "Intermediate process file contract for this turn:",
     `- Use this exact directory for temporary scripts, raw service responses, debug logs, scratch data, and other implementation files that help you complete the task but are not the user-facing deliverable: ${processDir}`,
+    "- Create a fresh, uniquely named subdirectory for temporary resources such as browser profiles. Avoid making optional cleanup of old resources or broad process termination a prerequisite for the task. Keep necessary cleanup separate from generation and validation; ordinary commands may still be combined.",
     "- Do not put final deliverables in this process directory.",
     "- Do not put process files in the artifact directory unless the user explicitly asked for source code or scripts as the deliverable.",
     "- When a task needs third-party Python modules, create and use this task-private virtual environment instead of the system Python:",
@@ -1777,7 +1686,7 @@ function buildProcessSystem(processDir: string | undefined): string | undefined 
     `  - Install direct requirements for temporary work with: ${JSON.stringify(pythonExecutable)} -m pip install <package ...>`,
     "  - Creating this exact environment and immediately installing through its exact interpreter may be separate commands or one `&&` chain; harmless file-descriptor redirection does not change the task boundary.",
     "  - Direct requirements with no explicit source override are normally approved automatically regardless of package popularity. Ordinary extras and version constraints are accepted. Other flags are accepted only when they preserve this exact Python executable and virtual-environment target without changing the package source, requirements input, or installation destination; do not add a version constraint unless the task needs one.",
-    "  - Do not use pip or pip3 directly, --user, --break-system-packages, sudo, alternative indexes, local paths, URLs, or requirements files.",
+    "  - Prefer the supplied interpreter over bare pip or pip3. User/system installation, destination overrides, alternative indexes, local/URL sources, and external requirements inputs retain permission boundaries.",
     "- When a task needs third-party Node.js modules only for temporary processing, install direct packages with no explicit source override in this process directory using an explicit target such as `cd <process-directory> && npm install <package ...>`. Package popularity does not affect approval, and package runners may be used when they are the shortest reliable path. Do not use global installation, custom registries, Git/URL/local sources, or user config.",
     "- Prefer short, descriptive filenames such as create_presentation.js, transform_data.py, raw-input.json, or render-log.txt.",
     "- Do not mention process files in the final response unless the user asks for implementation details, debugging details, or source files.",

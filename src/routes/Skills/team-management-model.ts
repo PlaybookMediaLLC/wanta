@@ -1,16 +1,16 @@
 import type {
   Team,
-  TeamAppAccess,
+  ServiceAccount,
   TeamMember,
-  TeamProviderOption,
   TeamRole,
   TeamUserSearchResult,
   TeamUserSummary,
 } from "../../../electron/teams/common.ts"
 import type { RuntimeSkillRemoveTarget } from "./skill-route-model.ts"
 
+import { isGuestTeamServiceAccount } from "../../lib/team-permissions.ts"
+
 export { teamCanManage, teamRole } from "../../lib/team-permissions.ts"
-import { parseProviderGrants } from "./team-provider-access.ts"
 
 export type BusyAction =
   | "add"
@@ -26,7 +26,6 @@ export type BusyAction =
   | `removeSkill:${string}`
   | `updateMemberRole:${string}`
 export type LoadStatus = "idle" | "loading" | "ready" | "error"
-export type ProviderAccessMode = "create" | "edit"
 
 export interface LoadState<T> {
   data: T
@@ -57,21 +56,6 @@ export interface MemberView extends TeamMember {
   displayName: string
   fallback: string
   secondaryLabel: string
-}
-
-export interface ProviderGrantView {
-  allProviders: boolean
-  member: MemberView | null
-  providers: TeamProviderOption[]
-  userId: string
-}
-
-export interface ProviderAccessForm {
-  allProviders: boolean
-  mode: ProviderAccessMode
-  open: boolean
-  providers: string[]
-  userId: string
 }
 
 export interface MemberSearchState {
@@ -107,14 +91,6 @@ export const minimumMemberSearchLength = 2
 
 const teamNamePattern = /^[A-Za-z0-9._'-]+$/
 
-export const initialProviderAccessForm: ProviderAccessForm = {
-  allProviders: false,
-  mode: "create",
-  open: false,
-  providers: [],
-  userId: "",
-}
-
 export function loadState<T>(data: T): LoadState<T> {
   return { data, error: null, errorStatus: null, status: "idle" }
 }
@@ -148,17 +124,6 @@ export function isConflictError(error: unknown): boolean {
 
 export function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values))
-}
-
-export function filterTeamProviderOptions(options: readonly TeamProviderOption[], query: string): TeamProviderOption[] {
-  const normalizedQuery = query.trim().toLowerCase()
-  if (!normalizedQuery) {
-    return [...options]
-  }
-  return options.filter(
-    (option) =>
-      option.label.toLowerCase().includes(normalizedQuery) || option.service.toLowerCase().includes(normalizedQuery),
-  )
 }
 
 export function teamSkillPackageKey(packageName: string): string {
@@ -232,12 +197,22 @@ export function teamNameValidation(name: string): "empty" | "invalid" | "too-lon
   return "valid"
 }
 
-export function buildMemberViews(members: TeamMember[], summaries: Record<string, TeamUserSummary>): MemberView[] {
+export function buildMemberViews(
+  members: TeamMember[],
+  summaries: Record<string, TeamUserSummary>,
+  serviceAccounts: ServiceAccount[] = [],
+): MemberView[] {
+  const serviceAccountById = new Map(serviceAccounts.map((account) => [account.id, account]))
   return members.map((member) => {
     const summary = summaries[member.user_id]
-    const displayName = summary ? summary.nickname || summary.username || member.user_id : member.user_id
+    const serviceAccount = member.user_type === "service-account" ? serviceAccountById.get(member.user_id) : undefined
+    const displayName =
+      serviceAccount?.name ??
+      member.name ??
+      (summary ? summary.nickname || summary.username || member.user_id : member.user_id)
     return {
       ...member,
+      ...(serviceAccount ? { name: serviceAccount.name } : {}),
       avatar: summary?.url ?? "",
       displayName,
       fallback: userFallback(displayName),
@@ -252,12 +227,14 @@ export function buildTeamMemberViews({
   members,
   team,
   summaries,
+  serviceAccounts = [],
 }: {
   account?: AccountSummaryLike
   accountRole?: TeamRole | null
   members: TeamMember[]
   team: Team | null
   summaries: Record<string, TeamUserSummary>
+  serviceAccounts?: ServiceAccount[]
 }): MemberView[] {
   const nextMembers = [...members]
   const fallbackSummaries: Record<string, TeamUserSummary> = { ...summaries }
@@ -291,43 +268,19 @@ export function buildTeamMemberViews({
     upsertMember(account.id, accountRole ?? team.role ?? "member")
   }
 
-  return buildMemberViews(nextMembers, fallbackSummaries)
+  return buildMemberViews(nextMembers, fallbackSummaries, serviceAccounts)
 }
 
-export function buildGrantViews(
-  appAccess: TeamAppAccess | null,
-  members: MemberView[],
-  providerOptions: TeamProviderOption[],
-): { error: string | null; grants: ProviderGrantView[] } {
-  if (!appAccess) {
-    return { error: null, grants: [] }
-  }
-
-  const parsed = parseProviderGrants(appAccess)
-  if (!parsed.ok) {
-    return { error: parsed.error.message, grants: [] }
-  }
-
-  const labelByService = new Map(providerOptions.map((provider) => [provider.service, provider.label]))
-  const memberByUserId = new Map(members.map((member) => [member.user_id, member]))
-  return {
-    error: null,
-    grants: parsed.grants.map((grant) => ({
-      allProviders: grant.allProviders,
-      member: memberByUserId.get(grant.userId) ?? null,
-      providers: grant.providers.map((service) => ({ service, label: labelByService.get(service) ?? service })),
-      userId: grant.userId,
-    })),
-  }
+/** Search results may use opaque IDs; unverified direct input must be a complete UUID. */
+export function resolveMemberInput(input: string, search: MemberSearchState, selectedId: string | null): string | null {
+  const query = input.trim()
+  if (search.loading || search.query !== query) return null
+  if (search.items.length) return search.items.find((user) => user.userId === selectedId)?.userId ?? null
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(query) ? query : null
 }
 
-export function providerOptionsWithSelected(
-  options: TeamProviderOption[],
-  selectedProviders: string[],
-): TeamProviderOption[] {
-  const seen = new Set(options.map((option) => option.service))
-  const unknown = selectedProviders
-    .filter((service) => !seen.has(service))
-    .map((service) => ({ service, label: service }))
-  return [...options, ...unknown].sort((left, right) => left.label.localeCompare(right.label))
+export { countOccupiedTeamSeats } from "@/lib/team-permissions"
+
+export function isRemovableTeamMember(member: TeamMember): boolean {
+  return member.role !== "creator" && !isGuestTeamServiceAccount(member)
 }

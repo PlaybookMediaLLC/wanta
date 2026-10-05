@@ -9,10 +9,10 @@ import {
   getTeamAppAccessSnapshot,
   isTeamMemberLimitError,
   listCreatedTeams,
+  listServiceAccounts,
   listMyTeams,
   listTeamConnectionApps,
   listTeamMembers,
-  listTeamProviderOptions,
   listUserSummaries,
   removeTeamMember,
   TeamRequestError,
@@ -27,25 +27,6 @@ describe("teams-client", () => {
   afterEach(() => {
     clearConnectorCache()
     vi.unstubAllGlobals()
-  })
-
-  it("reuses connector apps and provider reads for team options", async () => {
-    const fetchMock = vi.fn<typeof fetch>(async (input) => {
-      const url = String(input)
-      if (url.endsWith("/v1/connections")) {
-        return Response.json({ data: [{ service: "gmail", status: "active" }] })
-      }
-      if (url.endsWith("/v1/providers")) {
-        return Response.json({ data: [{ displayName: "Gmail", service: "gmail" }] })
-      }
-      throw new Error(`Unexpected URL: ${url}`)
-    })
-    vi.stubGlobal("fetch", fetchMock)
-
-    await listTeamProviderOptions("acme")
-    await listTeamProviderOptions("acme")
-
-    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   it("returns normalized Connection Apps in the requested team scope", async () => {
@@ -92,7 +73,7 @@ describe("teams-client", () => {
     const [url, init] = fetchMock.mock.calls[0] ?? []
     expect(String(url)).toContain("/v1/teams")
     expect(init?.method).toBe("POST")
-    expect(JSON.parse(String(init?.body))).toEqual({ org_name: "acme" })
+    expect(JSON.parse(String(init?.body))).toEqual({ team_name: "acme" })
   })
 
   it("updates team names and avatars through the console API team endpoint", async () => {
@@ -115,7 +96,7 @@ describe("teams-client", () => {
     expect(init?.method).toBe("PUT")
     expect(JSON.parse(String(init?.body))).toEqual({
       avatar: "https://img.example/avatar.png",
-      org_name: "acme",
+      team_name: "acme",
     })
   })
 
@@ -373,5 +354,188 @@ describe("teams-client", () => {
     expect(String(enableUrl)).toContain("/v1/teams/team-1/members/enable")
     expect(enableInit?.method).toBe("PUT")
     expect(JSON.parse(String(enableInit?.body))).toEqual({ user_ids: ["member-2"] })
+  })
+})
+
+describe("member read diagnostics", () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it("retains status and request ID without exposing response bodies", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json(
+          { message: "private-person@example.com secret-token" },
+          { status: 503, headers: { "x-request-id": "member-request-123" } },
+        ),
+      ),
+    )
+    const error = await listTeamMembers("team-1").catch((cause: unknown) => cause)
+    expect(error).toMatchObject({ status: 503 })
+    expect((error as Error).message).toContain("category=http_error")
+    expect((error as Error).message).toContain("requestId=member-request-123")
+    expect((error as Error).message).toContain("GET https://")
+    expect((error as Error).message).not.toContain("private-person")
+    expect((error as Error).message).not.toContain("secret-token")
+  })
+})
+
+describe("member failure explanations", () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it.each([null, "private-status", 0, {}, []])(
+    "rejects malformed disable values without exposing them",
+    async (disable) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => Response.json({ members: [{ user_id: "private-id", role: "member", disable }] })),
+      )
+      const error = (await listTeamMembers("team-1").catch((cause: unknown) => cause)) as Error
+      expect(error.message).toContain("members[0]: disable must be a boolean when provided")
+      expect(error.message).toContain("category=invalid_response")
+      expect(error.message).not.toContain("private-")
+    },
+  )
+
+  it.each([500, 403, 0])("retains HTTP %s when reading its response body fails", async (status) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        status,
+        ok: false,
+        headers: new Headers({ "x-request-id": "failed-body" }),
+        text: async () => {
+          throw new TypeError("private-error")
+        },
+      })),
+    )
+    const error = (await listTeamMembers("team-1").catch((cause: unknown) => cause)) as Error
+    expect(error).toMatchObject({ status })
+    expect(error.message).toContain(`status=${status}`)
+    expect(error.message).toContain("category=response_read_error")
+    expect(error.message).toContain("stage=response_body")
+    expect(error.message).toContain("requestId=failed-body")
+    expect(error.message).not.toContain("private-error")
+  })
+
+  it.each([
+    [{ members: null }, "Expected members array; received null"],
+    [
+      { members: [{ user_id: "private-id", role: "private-role" }] },
+      "members[0]: role must be creator, admin, member, or guest",
+    ],
+    [{ members: [{ role: "member" }] }, "members[0]: user_id must be a non-empty string; received missing"],
+    ["<html>private-response</html>", "Expected JSON object; received string"],
+  ])("explains invalid response structure without including member values", async (payload, reason) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json(payload)),
+    )
+    const error = (await listTeamMembers("team-1").catch((cause: unknown) => cause)) as Error
+    expect(error.message).toContain(reason)
+    expect(error.message).toContain("category=invalid_response")
+    expect(error.message).toContain("stage=validation")
+    expect(error.message).not.toContain("private-")
+  })
+
+  it.each([
+    [new DOMException("private-token", "TimeoutError"), "timeout_or_cancelled", "20000 ms deadline"],
+    [new DOMException("private-token", "AbortError"), "timeout_or_cancelled", "cancelled"],
+    [new TypeError("private-token"), "response_read_error", "reading the response body failed"],
+  ])("distinguishes response body failures from invalid member data", async (failure, category, reason) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ "x-request-id": "body-failure" }),
+        text: async () => {
+          throw failure
+        },
+      })),
+    )
+    const error = (await listTeamMembers("team-1").catch((cause: unknown) => cause)) as Error
+    expect(error.message).toContain(`category=${category}`)
+    expect(error.message).toContain(reason)
+    expect(error.message).toContain("stage=response_body")
+    expect(error.message).toContain("requestId=body-failure")
+    expect(error.message).not.toContain("private-token")
+  })
+
+  it("reports unavailable network evidence without guessing a root cause", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("private-token")
+      }),
+    )
+    const error = (await listTeamMembers("team-1").catch((cause: unknown) => cause)) as Error
+    expect(error.message).toContain("category=network_error")
+    expect(error.message).toContain("stage=request")
+    expect(error.message).toContain("status=unavailable")
+    expect(error.message).toContain("cannot distinguish DNS, TLS, proxy, CORS, or connection failures")
+    expect(error.message).not.toContain("private-token")
+  })
+})
+
+describe("Console team member contract", () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it("reads guest and service-account members from relation-control without dropping their identity", async () => {
+    const members = [
+      { user_id: "creator", role: "creator", user_type: "user", disable: false },
+      { user_id: "guest-account", role: "guest", user_type: "service-account", name: "guest", disable: false },
+      { user_id: "automation", role: "member", user_type: "service-account", name: "Automation" },
+    ]
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({ members }))
+    vi.stubGlobal("fetch", fetchMock)
+    await expect(listTeamMembers("team-1")).resolves.toEqual(members)
+    expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(
+      /^https:\/\/relation-control\.[^/]+\/v1\/teams\/team-1\/members$/,
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    [{ role: "owner" }, "role must be creator, admin, member, or guest"],
+    [{ user_type: "robot" }, "user_type must be user or service-account"],
+    [{ name: 123 }, "name must be a string"],
+  ])("rejects malformed members without inventing a compatible role", async (override, reason) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ members: [{ user_id: "id", role: "guest", ...override }] })),
+    )
+    await expect(listTeamMembers("team-1")).rejects.toThrow(reason)
+  })
+})
+
+describe("service-account response validation", () => {
+  afterEach(() => vi.unstubAllGlobals())
+  const valid = {
+    id: "sa-test",
+    name: "guest",
+    creator_user_id: "creator",
+    status: "normal",
+    created_at: "2026-09-16T00:00:00Z",
+    updated_at: "2026-09-16T00:00:00Z",
+  }
+  it("returns complete service-account records", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ service_accounts: [valid] })),
+    )
+    await expect(listServiceAccounts()).resolves.toEqual([valid])
+  })
+  it.each([
+    null,
+    [],
+    "account",
+    ...Object.keys(valid).map((key) => ({ ...valid, [key]: null })),
+    ...Object.keys(valid).map((key) => ({ ...valid, [key]: undefined })),
+  ])("rejects invalid entries before they reach member rendering: %j", async (invalid) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ service_accounts: [valid, invalid] })),
+    )
+    await expect(listServiceAccounts()).rejects.toThrow("invalid account at index 1")
   })
 })

@@ -4,6 +4,7 @@ import type { ExternalAgentKind } from "../agent/contract/profile.ts"
 import type { ChatEmit } from "../agent/event-translator.ts"
 import type { ExternalAgentAdapter } from "../agent/external/adapter-base.ts"
 import type { ExternalAgentRuntimeStatus } from "../agent/external/probe.ts"
+import type { ExternalAgentCatalog } from "../agent/external/status.ts"
 import type { HostQuestionBroker } from "../agent/host-question-broker.ts"
 import type { ManagedTurnDirectories } from "../agent/managed-turn-directories.ts"
 import type { OpencodeAgentAdapter } from "../agent/opencode-adapter.ts"
@@ -13,11 +14,13 @@ import type { RuntimeCapabilities } from "../runtime/common.ts"
 import type { SessionProjectStore } from "../session/project-store.ts"
 import type { ArtifactBundleStore, ArtifactBundles } from "./artifact-bundles.ts"
 import type { AuthorizationOverlayStore } from "./authorization.ts"
+import type { BugReportEvidencePack, ParsedBugReportCommand } from "./bug-report.ts"
 import type {
   AgentRuntimeStatus,
   AgentPermissionMode,
   ArtifactBundle,
   ArtifactBundlesRequest,
+  AuthenticateExternalAgentRequest,
   AnswerPermissionRequest,
   AnswerQuestionRequest,
   AttachmentPreviewRequest,
@@ -28,6 +31,7 @@ import type {
   ChatMessage,
   ChatPermissionRequest,
   ChatQuestionRequest,
+  ChatTurnOutcomeKind,
   ChatRunWorkspace,
   ChatSessionSnapshot,
   ChatService,
@@ -61,8 +65,12 @@ import type {
   TurnOutputRecord,
   TurnOutputsRequest,
 } from "./common.ts"
+import type { ComposerDraftRequest, ComposerDraftRecord } from "./common.ts"
+import type { ComposerDraftStore } from "./composer-drafts.ts"
 import type { SessionGeneration } from "./generation-registry.ts"
+import type { CreateArtifactResourceUrl } from "./previews.ts"
 import type { StoppedGenerationStore } from "./stopped-generations.ts"
+import type { TurnCompletionEvidence, TurnPermissionRejection } from "./turn-completion.ts"
 import type { StoredTurnOutputRecord, TurnOutputRecords, TurnOutputStore } from "./turn-outputs.ts"
 import type { UserAttachmentStore } from "./user-attachments.ts"
 import type { IConnectionService } from "@oomol/connection"
@@ -88,10 +96,13 @@ import { applyAuthorizationOverlays } from "./authorization.ts"
 import {
   BUG_REPORT_FILE_NAME,
   bugReportModelLabel,
+  bugReportModelLabelForExternal,
   buildBugReportSystemPrompt,
   parseBugReportCommand,
+  writeBugReportEvidencePack,
 } from "./bug-report.ts"
 import { ChatService as ChatServiceName } from "./common.ts"
+import { normalizeComposerDraft } from "./composer-drafts.ts"
 import {
   buildContextMentionsSystem as buildContextMentionsSystemPrompt,
   buildExternalPermissionModeSystem,
@@ -104,12 +115,14 @@ import {
 } from "./context-system.ts"
 import { normalizeChatError } from "./error.ts"
 import { GenerationRegistry } from "./generation-registry.ts"
+import { assertKnowledgeSelection, buildKnowledgeSystem } from "./knowledge-context.ts"
 import {
   evaluateLocalAccessRequest,
   localAccessGrantForRequest,
   localAccessPromptReason,
 } from "./local-access-policy.ts"
 import { directoryArtifacts, fileArtifact, localArtifactItem, readArtifactPack } from "./local-artifacts.ts"
+import { MessageRunRegistry } from "./message-run-registry.ts"
 import { OutputPersistence } from "./output-persistence.ts"
 import { PermissionDiagnostics } from "./permission-diagnostics.ts"
 import { permissionCommand } from "./permission-request.ts"
@@ -119,7 +132,9 @@ import { detectResponseLanguage } from "./response-language.ts"
 import { applyStoppedGenerations } from "./stopped-generations.ts"
 import { ChatStreamEventBuffer } from "./stream-event-buffer.ts"
 import { SubagentSessions } from "./subagent-sessions.ts"
+import { ToolStartDiagnostics } from "./tool-start-diagnostics.ts"
 import { TrustedLocalAccess } from "./trusted-local-access.ts"
+import { completionFailureMessage, inspectTurnCompletion, permissionRejectionMessage } from "./turn-completion.ts"
 import { resolveChatTurnExecution } from "./turn-execution.ts"
 import {
   generationNoticeKindForInactivity,
@@ -198,6 +213,13 @@ function ensureExternalHttpUrl(rawUrl: string): string {
   return url.toString()
 }
 
+function attachmentsForAgentTurn(
+  bugReport: ParsedBugReportCommand | null,
+  attachments: ChatAttachment[] | undefined,
+): ChatAttachment[] | undefined {
+  return bugReport ? undefined : attachments ? [...attachments] : undefined
+}
+
 function createErrorPartId(): string {
   return `agent-error-${Date.now()}-${crypto.randomUUID()}`
 }
@@ -255,7 +277,7 @@ function metadataString(value: unknown): string | undefined {
 
 function taskChildSessionId(data: ToolCallStartedEvent | ToolCallResultEvent): string | undefined {
   // Task fan-out is a kernel mechanism: the child ids live in the kernel's
-  // session space and feed kernel-only knowledge-scope APIs. External adapter
+  // session space. External adapter
   // events flow through the same pipeline, so they must never claim a pair.
   if (data.tool !== "task" || externalAgentKindForSessionId(data.sessionId)) {
     return undefined
@@ -273,11 +295,9 @@ function taskChildSessionId(data: ToolCallStartedEvent | ToolCallResultEvent): s
 interface ChatServiceDeps {
   browserAvailable?: () => boolean
   hostQuestions?: HostQuestionBroker
+  cancelHostOperations?: (sessionId: string) => void
   managedTurnDirectories?: ManagedTurnDirectories
-  createArtifactResourceUrl?: (item: { mime: string; modifiedAt: number; path: string; size: number }) => {
-    expiresAt: number
-    url: string
-  }
+  createArtifactResourceUrl?: CreateArtifactResourceUrl
   createSpreadsheetPreview?: (path: string, mime: string, size: number) => Promise<LocalArtifactPreviewResult>
   createArtifactThumbnail?: (path: string) => Promise<LocalArtifactThumbnailResult>
   artifactBundleStore?: ArtifactBundleStore
@@ -286,6 +306,8 @@ interface ChatServiceDeps {
   stoppedGenerationStore?: StoppedGenerationStore
   trustedAttachmentPaths?: Iterable<string> & Pick<Set<string>, "clear" | "delete"> & { readonly revision?: number }
   turnOutputStore?: TurnOutputStore
+  composerDraftStore?: ComposerDraftStore
+  composerDraftOwner?: () => string
   userAttachmentStore?: UserAttachmentStore
   bugReportRuntime?: {
     appCommit: string
@@ -303,6 +325,14 @@ interface ChatServiceDeps {
     sessionId: string,
     patch: { modelId?: string | null; effortId?: string | null },
   ) => Promise<void> | void
+  /** Keep the guarded external OOCLI scope limited to currently running turns. */
+  onExternalTurnScopeChanged?: (input: {
+    active: boolean
+    cwdRoots?: readonly string[]
+    diagnostic?: boolean
+    sessionId: string
+    teamName?: string
+  }) => Promise<void> | void
   /** 正常完成且产物已收尾后通知主进程 attention 域；停止和错误路径不触发。 */
   onSessionCompleted?: (input: { teamId: string; runId: string; sessionId: string }) => Promise<void> | void
 }
@@ -337,6 +367,8 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   private readonly userStops = new UserStopTracker()
   private emittedMessageErrors = new Map<string, Set<string>>()
   private readonly generations = new GenerationRegistry()
+  private readonly messageRuns = new MessageRunRegistry()
+  private readonly stoppingGenerations = new Map<string, Promise<void>>()
   private readonly activeRuns = new ActiveRunRegistry(({ ended, run, sessionId }) => {
     this.sendBestEffort(this.send.bind(this) as (event: string, data: unknown) => Promise<void>, "activeRunUpdated", {
       ...ended,
@@ -347,6 +379,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   private readonly turnOutputs: TurnOutputRegistry
   private activeAssistantMessages = new Map<string, string>()
   private activeToolParts = new Map<string, Set<string>>()
+  private readonly toolStartDiagnostics = new ToolStartDiagnostics()
   private internalMessageIds = new Set<string>()
   private compactingSessions = new Set<string>()
   private connectionFailedSessions = new Set<string>()
@@ -430,6 +463,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     this.turnOutputs.clear()
     this.activeAssistantMessages.clear()
     this.activeToolParts.clear()
+    this.toolStartDiagnostics.reset()
     this.connectionFailedSessions.clear()
     this.trustedAccess.clear()
     this.subagentSessions.clear()
@@ -438,6 +472,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     this.outputPersistence.reset()
     this.desiredWorkspaceTeamName = undefined
     this.startedMessages.clear()
+    this.messageRuns.clear()
     this.internalMessageIds.clear()
     this.compactingSessions.clear()
     this.completionChecks.clear()
@@ -474,17 +509,29 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   }
 
   public async getExternalAgents(): Promise<ExternalAgentRuntimeStatus[]> {
-    const statuses = await Promise.all(
-      [...this.externalAgents.values()].map(async (adapter) => {
+    return Promise.all(
+      [...this.externalAgents.entries()].map(async ([kind, adapter]) => {
         try {
           return await adapter.runtimeStatus()
         } catch (error) {
-          logDiagnostic("chat-service", "external agent probe failed", { error, kind: adapter.kind }, "warn")
-          return null
+          logDiagnostic("chat-service", "external agent probe failed", { error, kind }, "warn")
+          return {
+            kind,
+            displayName: adapter.profile.displayName,
+            binary: { status: "error", message: errorMessage(error) },
+            login: { status: "unknown" },
+            loginHint: adapter.profile.auth.kind === "agent-cli" ? adapter.profile.auth.loginCommand : "",
+          } satisfies ExternalAgentRuntimeStatus
         }
       }),
     )
-    return statuses.filter((status): status is ExternalAgentRuntimeStatus => Boolean(status))
+  }
+
+  public async authenticateExternalAgent(req: AuthenticateExternalAgentRequest): Promise<ExternalAgentRuntimeStatus> {
+    const adapter = this.externalAgents.get(req.kind)
+    if (!adapter) throw new Error("This agent is not available.")
+    await adapter.send({ type: "authenticate", methodId: req.methodId })
+    return adapter.runtimeStatus()
   }
 
   public async setExternalSessionModel(req: SetExternalSessionModelRequest): Promise<void> {
@@ -610,6 +657,15 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     return this.externalAdapterFor(sessionId).sessionSelection(sessionId)
   }
 
+  public async previewExternalAgentCatalog(req: {
+    kind: ExternalAgentKind
+    modelId?: string
+  }): Promise<ExternalAgentCatalog | undefined> {
+    const adapter = this.externalAgents.get(req.kind)
+    if (!adapter) throw new Error("External agent is not configured")
+    return adapter.previewCatalog(req.modelId)
+  }
+
   public async warmExternalAgent(kind: ExternalAgentKind): Promise<void> {
     await this.externalAgents.get(kind)?.warmCatalog()
   }
@@ -671,6 +727,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
 
   /** 会话永久删除后释放运行态索引，并删除授权/停止 overlay。 */
   public async forgetSession(sessionId: string): Promise<void> {
+    this.messageRuns.forgetSession(sessionId)
     this.deletedExternalSelectionSessions.add(sessionId)
     this.generations.get(sessionId)?.controller.abort()
     const selectionMutationsSettled = this.settleExternalSelectionMutations(sessionId)
@@ -679,6 +736,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     this.clearSessionGeneration(sessionId)
     this.activeAssistantMessages.delete(sessionId)
     this.activeToolParts.delete(sessionId)
+    this.toolStartDiagnostics.clear(sessionId)
     this.connectionFailedSessions.delete(sessionId)
     this.userStops.delete(sessionId)
     this.emittedMessageErrors.delete(sessionId)
@@ -718,9 +776,43 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
 
   /** Run one normalized agent event through the bridge pipeline (filtering, folding, watchdogs, broadcast). */
   private processAgentEvent(emit: (event: string, data: unknown) => Promise<void>, translated: ChatEmit): void {
+    if (translated.event === "permissionModeUpdated") {
+      this.setSessionPermissionModeValue(translated.data.sessionId, translated.data.permissionMode)
+      void Promise.resolve(
+        this.deps.onPermissionModeChanged?.(translated.data.sessionId, translated.data.permissionMode),
+      ).catch((error: unknown) => {
+        logDiagnostic(
+          "chat-service",
+          "failed to persist native permission mode update",
+          { error, sessionId: translated.data.sessionId },
+          "warn",
+        )
+      })
+      this.sendBestEffort(emit, translated.event, translated.data, { sessionId: translated.data.sessionId })
+      return
+    }
     if (translated.event === "usageUpdated") {
       // Already folded into the adapter transcript; the usage meter reads it
       // off messages on reload, mirroring the kernel history path.
+      return
+    }
+    if (translated.event === "messageCompleted" && translated.data.outcome === "cancelled") {
+      const sessionId = translated.data.sessionId
+      const generation = this.generations.get(sessionId)
+      if (generation) {
+        generation.cancellationSettled = true
+        // An explicit stop already owns its cleanup. After a timeout this
+        // acknowledgement resumes the same cleanup without cancelling again.
+        if (!generation.controller.signal.aborted || generation.cancellationRequested) {
+          void this.stopSessionGeneration(sessionId, {
+            abortAgent: false,
+            reason: "user",
+            throwOnAbortFailure: false,
+          }).catch((error: unknown) =>
+            logDiagnostic("chat-service", "failed to settle cancelled turn", { error, sessionId }, "warn"),
+          )
+        }
+      }
       return
     }
     const sourceSessionId = translated.data.sessionId
@@ -736,32 +828,8 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
             .find((sessionId) => this.userStops.consumeAbort(sessionId, translated.data.message))
         : undefined
     if (translated.event === "agentError" && userStoppedSessionId) {
-      const sessionId = generationSessionId ?? userStoppedSessionId
-      const messageId = this.activeAssistantMessages.get(sessionId)
-      const partIds = [...(this.activeToolParts.get(sessionId) ?? [])]
-      const stoppedAt = Date.now()
-      if (messageId) {
-        void this.rememberStoppedGeneration(sessionId, messageId, partIds, stoppedAt).catch((error: unknown) => {
-          console.warn("[wanta] failed to record stopped generation", error)
-        })
-      }
-      void this.finalizeTurnOutput(sessionId, messageId)
-        .catch((error: unknown) => {
-          console.warn("[wanta] failed to finalize stopped turn output", error)
-        })
-        .finally(() => {
-          this.clearSessionGeneration(sessionId)
-          this.activeAssistantMessages.delete(sessionId)
-          this.activeToolParts.delete(sessionId)
-          this.activeRuns.delete(sessionId)
-          this.emitSessionActivity(sessionId)
-          this.sendBestEffort(
-            emit,
-            "generationStopped",
-            { sessionId, ...(messageId ? { messageId, partIds, stoppedAt } : {}) },
-            { sessionId },
-          )
-        })
+      // stopSessionGeneration owns cancellation finalization. An abort echo must
+      // never start a second async cleanup that can outlive the stopped turn.
       return
     }
     if (this.userStops.shouldSuppressEvent(translated)) {
@@ -780,10 +848,6 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     ) {
       return
     }
-    const activitySessionId = generationSessionId ?? sourceSessionId
-    if (activitySessionId) {
-      this.generations.clearAcknowledgementWatchdog(activitySessionId)
-    }
     if (translated.event === "messageStarted") {
       if (translated.data.internal === true) {
         this.rememberInternalMessage(translated.data.sessionId, translated.data.messageId)
@@ -791,12 +855,6 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       }
       if (translated.data.role === "user" && this.compactingSessions.has(translated.data.sessionId)) {
         this.rememberInternalMessage(translated.data.sessionId, translated.data.messageId)
-        return
-      }
-      if (translated.data.role === "assistant") {
-        this.compactingSessions.delete(translated.data.sessionId)
-      }
-      if (!this.rememberMessageStarted(translated)) {
         return
       }
     }
@@ -807,6 +865,55 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       (translated.event === "messageDelta" && translated.data.synthetic === true)
     ) {
       return
+    }
+    // Resolve message ownership before watchdogs, active-run mutation, tool
+    // diagnostics or child-session registration can observe this event.
+    const progressGeneration = generationSessionId ? this.generations.get(generationSessionId) : undefined
+    if ("messageId" in translated.data && translated.data.messageId) {
+      if (
+        !this.messageRuns.isCurrent(sourceSessionId!, translated.data.messageId, progressGeneration?.id, {
+          ...(translated.event === "messageStarted" && translated.data.role === "assistant"
+            ? {
+                parentMessageId:
+                  translated.data.parentMessageId &&
+                  !this.isInternalMessage(sourceSessionId!, translated.data.parentMessageId)
+                    ? translated.data.parentMessageId
+                    : undefined,
+              }
+            : {}),
+          ...(sourceSessionId === generationSessionId ? { userMessageId: progressGeneration?.userMessageId } : {}),
+        })
+      )
+        return
+    }
+    const activitySessionId = generationSessionId ?? sourceSessionId
+    if (activitySessionId) {
+      this.generations.clearAcknowledgementWatchdog(activitySessionId)
+      const generation = this.generations.get(activitySessionId)
+      if (generation) generation.acknowledged = true
+    }
+    if (translated.event === "messageStarted") {
+      if (!this.rememberMessageStarted(translated)) return
+      if (translated.data.role === "assistant") this.compactingSessions.delete(translated.data.sessionId)
+    }
+    // New progress invalidates an earlier idle signal, including a history read
+    // already in flight. Ownership was checked above before touching this turn.
+    if (
+      progressGeneration &&
+      generationSessionId &&
+      (translated.event === "messageDelta" ||
+        translated.event === "messageReasoningDelta" ||
+        translated.event === "toolCallStarted" ||
+        translated.event === "permissionAsked" ||
+        translated.event === "questionAsked" ||
+        (translated.event === "messageStarted" &&
+          translated.data.role === "assistant" &&
+          translated.data.completedAt === undefined) ||
+        (translated.event === "assistantActivity" && translated.data.phase !== "finalizing"))
+    ) {
+      progressGeneration.completionObserved = false
+      progressGeneration.completionRevision = (progressGeneration.completionRevision ?? 0) + 1
+      this.clearCompletionRetry(`${generationSessionId}\0${progressGeneration.id}`)
     }
     if (translated.event === "assistantActivity" && translated.data.phase === "compacting") {
       this.compactingSessions.add(translated.data.sessionId)
@@ -827,6 +934,14 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       this.rememberPendingPermissionRequest(translated.data.request)
     }
     this.activeRuns.applyEvent(displayed)
+    if (
+      displayedSessionId &&
+      (translated.event === "permissionReplied" ||
+        translated.event === "questionReplied" ||
+        translated.event === "questionRejected")
+    ) {
+      this.scheduleGenerationInactivityWatchdogAfterReply(displayedSessionId)
+    }
     if (translated.event === "messageStarted" && translated.data.role === "assistant") {
       this.activeAssistantMessages.set(translated.data.sessionId, translated.data.messageId)
       this.activeToolParts.set(translated.data.sessionId, new Set())
@@ -848,14 +963,29 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         activeToolPartIds: [...partIds],
         phase: "tool_running",
       })
+      if (
+        this.toolStartDiagnostics.first(
+          translated.data.sessionId,
+          this.generations.get(translated.data.sessionId)?.id,
+          translated.data.callId,
+        )
+      ) {
+        logDiagnostic(
+          "chat-turn",
+          "tool started",
+          {
+            adapter: this.agentAdapterForDiagnostic(translated.data.sessionId),
+            callId: translated.data.callId,
+            generationId: this.generations.get(translated.data.sessionId)?.id,
+            sessionId: translated.data.sessionId,
+            tool: translated.data.tool,
+          },
+          "info",
+        )
+      }
       const childSessionId = taskChildSessionId(translated.data)
       if (childSessionId) {
         this.subagentSessions.remember(translated.data.sessionId, childSessionId)
-        void this.agent
-          ?.inheritSessionKnowledgeBaseIds(translated.data.sessionId, childSessionId)
-          .catch((error: unknown) => {
-            console.warn("[wanta] failed to inherit task subagent knowledge scope:", error)
-          })
       }
     }
     if (translated.event === "toolCallResult") {
@@ -869,12 +999,24 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         activeToolPartIds: partIds ? [...partIds] : [],
         phase: partIds && partIds.size > 0 ? "tool_running" : "thinking",
       })
+      logDiagnostic(
+        "chat-turn",
+        "tool finished",
+        {
+          adapter: this.agentAdapterForDiagnostic(translated.data.sessionId),
+          callId: translated.data.callId,
+          failureKind: translated.data.failureKind,
+          generationId: this.generations.get(translated.data.sessionId)?.id,
+          sessionId: translated.data.sessionId,
+          status: translated.data.status,
+          tool: translated.data.tool,
+          userImpact: translated.data.userImpact,
+        },
+        translated.data.status === "completed" ? "info" : "warn",
+      )
       const childSessionId = taskChildSessionId(translated.data)
       if (childSessionId) {
         this.subagentSessions.forget(translated.data.sessionId, childSessionId)
-        void this.agent?.clearSessionKnowledgeBaseIds(childSessionId).catch((error: unknown) => {
-          console.warn("[wanta] failed to clear task subagent knowledge scope:", error)
-        })
       }
       if (translated.data.authorization) {
         void this.rememberAuthorizationOverlay(
@@ -885,6 +1027,10 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         ).catch((error: unknown) => {
           console.warn("[wanta] failed to record authorization overlay", error)
         })
+      }
+      const generation = this.generations.get(translated.data.sessionId)
+      if (generation?.completionObserved) {
+        void this.completeSessionGeneration(emit, translated.data.sessionId, generation)
       }
     }
     if (translated.event === "agentError" && translated.data.sessionId) {
@@ -901,7 +1047,10 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       this.clearInternalMessages(sessionId)
       this.compactingSessions.delete(sessionId)
       const generation = this.generations.get(sessionId)
-      if (generation) void this.completeSessionGeneration(emit, sessionId, generation)
+      if (generation) {
+        generation.completionObserved = true
+        void this.completeSessionGeneration(emit, sessionId, generation)
+      }
       return
     }
     if (sourceSessionId) {
@@ -913,11 +1062,19 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         this.scheduleGenerationInactivityWatchdog(generationSessionId)
       }
     }
-    if ((displayed.event === "messageDelta" || displayed.event === "messageReasoningDelta") && this.streamEventBuffer) {
-      this.eventMetrics.record(`stream-input:${displayed.event}`)
-      this.streamEventBuffer.enqueue(displayed)
+    // Capture the owner before IPC buffering; never look it up again at flush time.
+    const progressEvent =
+      progressGeneration && ("messageId" in displayed.data || displayed.event === "assistantActivity")
+        ? ({ ...displayed, data: { ...displayed.data, runId: progressGeneration.id } } as ChatEmit)
+        : displayed
+    if (
+      (progressEvent.event === "messageDelta" || progressEvent.event === "messageReasoningDelta") &&
+      this.streamEventBuffer
+    ) {
+      this.eventMetrics.record(`stream-input:${progressEvent.event}`)
+      this.streamEventBuffer.enqueue(progressEvent)
     } else {
-      this.sendBestEffort(emit, displayed.event, displayed.data, { sessionId: displayedSessionId })
+      this.sendBestEffort(emit, progressEvent.event, progressEvent.data, { sessionId: displayedSessionId })
     }
   }
 
@@ -987,6 +1144,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     sessionId: string,
     message: string,
     messageId?: string,
+    runId?: string,
   ): void {
     if (!this.rememberMessageError(sessionId, message)) {
       return
@@ -998,10 +1156,15 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         logDiagnostic("chat-service", "failed to expire OOMOL session after chat 401", { error }, "warn")
       })
     }
-    this.sendBestEffort(emit, "messageError", payload, {
-      messageId,
-      sessionId,
-    })
+    this.sendBestEffort(
+      emit,
+      "messageError",
+      { ...payload, ...(runId ? { runId } : {}) },
+      {
+        messageId,
+        sessionId,
+      },
+    )
   }
 
   private sendBestEffort(
@@ -1121,13 +1284,21 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     emit: (event: string, data: unknown) => Promise<void>,
     request: ChatPermissionRequest,
   ): boolean {
+    // Native agents own every local approval, including host-tool transport prompts.
+    // Link authorization is enforced at the capability entry point, not here.
+    if (externalAgentKindForSessionId(request.sessionId) !== undefined) return false
     const displaySessionId = this.subagentSessions.displaySessionId(request.sessionId)
     const projectRoot = this.trustedAccess.projectRoot(request.sessionId)
     const activeGenerationId = this.generations.get(displaySessionId)?.id
-    const taskProcessRoot = activeGenerationId ? this.turnOutputs.get(activeGenerationId)?.processRoot : undefined
-    // Keyed off the session id's kind, so a malformed external id still fails
-    // closed (prompt) instead of falling through to the kernel's defaults.
-    const isExternalSession = externalAgentKindForSessionId(request.sessionId) !== undefined
+    const activeTurn = activeGenerationId ? this.turnOutputs.get(activeGenerationId) : undefined
+    const taskProcessRoot = activeTurn?.processRoot
+    const diagnosticRoots =
+      activeTurn?.diagnosticTurn && activeTurn.processRoot && activeTurn.artifactRoot
+        ? {
+            artifactRoot: activeTurn.artifactRoot,
+            processRoot: activeTurn.diagnosticEvidenceRoot ?? activeTurn.processRoot,
+          }
+        : undefined
     const decision = evaluateLocalAccessRequest(request, {
       activeGenerationId,
       linkRuntime: this.activeLinkRuntime,
@@ -1135,15 +1306,14 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       sessionGrants: this.permissions.sessionGrants(request.sessionId),
       ...(taskProcessRoot ? { taskProcessRoot } : {}),
       ...(projectRoot ? { trustedProjectRoot: projectRoot } : {}),
-      ...(isExternalSession ? { isExternalSession } : {}),
+      ...(diagnosticRoots ? { diagnosticRoots } : {}),
     })
-    // External sessions answer through their own adapter; only a session with
-    // no backend at all falls through to the manual card.
+    // A session without a backend falls through to the manual card.
     if (!this.chatBackendFor(request.sessionId)) {
       return false
     }
     if (decision.type === "prompt") {
-      const promptReason = localAccessPromptReason(request)
+      const promptReason = localAccessPromptReason(request, projectRoot ? { trustedProjectRoot: projectRoot } : {})
       this.permissionDiagnostics.recordPrompt(promptReason, `${request.sessionId}:${request.id}`)
       request.wanta = { ...request.wanta, promptReason }
       logDiagnostic(
@@ -1183,9 +1353,31 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         )
       }
     }
-    void this.answerAutomaticPermission(request, decision.type === "deny" ? "reject" : "once")
+    const rejection: TurnPermissionRejection | undefined =
+      decision.type === "deny" ? { source: "policy", reason: decision.reason, ...request.tool } : undefined
+    void this.trackPermissionReply(request, rejection, () =>
+      this.answerAutomaticPermission(
+        request,
+        decision.type === "deny" ? "reject" : "once",
+        rejection && permissionRejectionMessage(rejection),
+      ),
+    )
       .then(() => {
         if (decision.type === "allow") this.rememberTrustedPermissionResources(request.sessionId, request)
+        logDiagnostic(
+          "chat-turn",
+          "permission automatically replied",
+          {
+            adapter: this.agentAdapterForDiagnostic(displaySessionId),
+            decision: decision.type,
+            reason: decision.reason,
+            generationId: activeGenerationId,
+            permissionKind: decision.kind,
+            requestId: request.id,
+            sessionId: displaySessionId,
+          },
+          "info",
+        )
         this.sendBestEffort(
           emit,
           "permissionReplied",
@@ -1204,7 +1396,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
           {
             action: request.action,
             error,
-            reason: decision.type === "allow" ? decision.reason : "openconnector_denied",
+            reason: decision.reason,
             sessionId: request.sessionId,
           },
           "warn",
@@ -1235,7 +1427,34 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     return true
   }
 
-  private async answerAutomaticPermission(request: ChatPermissionRequest, reply: "once" | "reject"): Promise<void> {
+  private async trackPermissionReply(
+    request: ChatPermissionRequest,
+    rejection: TurnPermissionRejection | undefined,
+    send: () => Promise<void>,
+  ): Promise<void> {
+    const sessionId = this.subagentSessions.displaySessionId(request.sessionId)
+    const generation = this.generations.get(sessionId)
+    if (generation) {
+      generation.permissionReplies = (generation.permissionReplies ?? 0) + 1
+      if (rejection) (generation.permissionRejections ??= []).push(rejection)
+    }
+    try {
+      await send()
+    } catch (error) {
+      if (generation && rejection) {
+        generation.permissionRejections = generation.permissionRejections?.filter((item) => item !== rejection)
+      }
+      throw error
+    } finally {
+      if (generation) generation.permissionReplies = Math.max(0, (generation.permissionReplies ?? 1) - 1)
+    }
+  }
+
+  private async answerAutomaticPermission(
+    request: ChatPermissionRequest,
+    reply: "once" | "reject",
+    message?: string,
+  ): Promise<void> {
     const backend = this.chatBackendFor(request.sessionId)
     if (!backend) throw new Error("Agent not configured")
     let lastError: unknown
@@ -1246,6 +1465,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
           sessionId: request.sessionId,
           requestId: request.id,
           reply,
+          ...(message !== undefined ? { message } : {}),
         })
         this.permissionDiagnostics.recordAutomaticReply(attempt === 1 ? "first_attempt" : "retry_succeeded")
         return
@@ -1327,7 +1547,25 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         roots.add(active.outputProjectRoot)
       }
     }
-    const [artifactBundles, turnOutputs] = await Promise.all([this.readArtifactBundles(), this.readTurnOutputs()])
+    const [artifactBundles, turnOutputs, userAttachments] = await Promise.all([
+      this.readArtifactBundles(),
+      this.readTurnOutputs(),
+      this.deps.userAttachmentStore?.read(),
+    ])
+    // Persisted public attachments remain readable before their message history is mounted.
+    // Only the original snapshots are restored; internal agent representations are not roots.
+    for (const draftPath of (await this.deps.composerDraftStore
+      ?.paths(this.deps.composerDraftOwner?.() ?? "local", { includeAgentPaths: false })
+      .catch((error: unknown) => {
+        logDiagnostic("chat-service", "failed to read draft attachment roots", { error }, "warn")
+        return []
+      })) ?? [])
+      roots.add(draftPath)
+    for (const records of userAttachments?.values() ?? []) {
+      for (const record of records.values()) {
+        for (const attachment of record.attachments) roots.add(attachment.path)
+      }
+    }
     for (const records of artifactBundles.values()) {
       for (const bundle of records.values()) {
         roots.add(bundle.rootPath)
@@ -1336,6 +1574,9 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     }
     for (const records of turnOutputs.values()) {
       for (const record of records.values()) {
+        if (record.artifactProcessRoot) {
+          roots.add(record.artifactProcessRoot)
+        }
         if (record.processRoot) {
           roots.add(record.processRoot)
         }
@@ -1362,8 +1603,8 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     return this.trustedAccess.isPathInRoots(filePath, roots)
   }
 
-  private async assertTrustedLocalPath(filePath: string): Promise<void> {
-    await this.trustedAccess.assertPath(filePath)
+  private async assertTrustedLocalPath(filePath: string): Promise<string> {
+    return this.trustedAccess.assertPath(filePath)
   }
 
   private async assertTrustedAttachments(attachments: readonly ChatAttachment[] | undefined): Promise<void> {
@@ -1383,6 +1624,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
 
   private beginSessionGeneration(sessionId: string, userMessageId: string): SessionGeneration {
     const { generation, previous } = this.generations.begin(sessionId, userMessageId)
+    this.toolStartDiagnostics.begin(sessionId, generation.id)
     this.removeGenerationPermissionGrants(sessionId, previous?.id)
     return generation
   }
@@ -1394,7 +1636,64 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     this.connectionFailedSessions.delete(req.sessionId)
     this.clearMessageErrorSignatures(req.sessionId)
     this.emitSessionActivity(req.sessionId)
+    logDiagnostic(
+      "chat-turn",
+      "turn started",
+      {
+        adapter: this.agentAdapterForDiagnostic(req.sessionId),
+        generationId: generation.id,
+        sessionId: req.sessionId,
+        workspaceKind: req.scope.kind,
+      },
+      "info",
+    )
     return generation
+  }
+
+  /** Keep diagnostics joinable without recording user prompts, tool payloads, or tool output. */
+  private agentAdapterForDiagnostic(sessionId: string): string {
+    return externalAgentKindForSessionId(sessionId) ?? "opencode"
+  }
+
+  private logTurnOutcome(
+    sessionId: string,
+    kind: ChatTurnOutcomeKind,
+    options: { generationId?: string; messageId?: string; reason?: string } = {},
+  ): void {
+    logDiagnostic(
+      "chat-turn",
+      "turn outcome",
+      {
+        adapter: this.agentAdapterForDiagnostic(sessionId),
+        generationId: options.generationId,
+        kind,
+        messageId: options.messageId,
+        reason: options.reason,
+        sessionId,
+      },
+      kind === "completed" || kind === "cancelled" ? "info" : "warn",
+    )
+  }
+
+  private emitTurnOutcome(
+    emit: (event: string, data: unknown) => Promise<void>,
+    sessionId: string,
+    kind: ChatTurnOutcomeKind,
+    options: { generationId?: string; messageId?: string; reason?: string } = {},
+  ): void {
+    this.logTurnOutcome(sessionId, kind, options)
+    this.sendBestEffort(
+      emit,
+      "turnOutcome",
+      {
+        sessionId,
+        kind,
+        ...(options.generationId ? { runId: options.generationId } : {}),
+        ...(options.messageId ? { messageId: options.messageId } : {}),
+        ...(options.reason ? { reason: options.reason } : {}),
+      },
+      { messageId: options.messageId, sessionId },
+    )
   }
 
   /** session.idle 不带 message/generation id；用本轮用户消息核对历史，避免旧 idle 结束刚重试的新轮次。 */
@@ -1403,30 +1702,47 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     sessionId: string,
     generation: SessionGeneration,
   ): Promise<void> {
+    if (!generation.completionObserved || !this.canCompleteGeneration(sessionId, generation)) return
+    if (this.activeRuns.blockingPhase(sessionId) || generation.permissionReplies) return
     const completionKey = `${sessionId}\0${generation.id}`
     if (this.completionChecks.has(completionKey)) return
     this.clearCompletionRetry(completionKey, false)
     this.completionChecks.add(completionKey)
+    const revision = generation.completionRevision ?? 0
+    const stillIdle = () =>
+      this.canCompleteGeneration(sessionId, generation) &&
+      generation.completionObserved &&
+      (generation.completionRevision ?? 0) === revision &&
+      !this.activeRuns.blockingPhase(sessionId) &&
+      !generation.permissionReplies
     try {
-      if (!(await this.currentTurnIsComplete(sessionId, generation))) {
-        this.scheduleCompletionRetry(emit, sessionId, generation)
+      const evidence = await this.completedTurnAssistant(sessionId, generation)
+      if (!stillIdle()) return
+      if (evidence.kind !== "completed") {
+        // An old idle must not time out a long-running tool with no deltas.
+        // Its result (or a new idle) resumes verification; the tool watchdog
+        // continues to provide non-terminal inactivity notices in the meantime.
+        if (this.activeToolParts.get(sessionId)?.size) return
+        this.scheduleCompletionRetry(emit, sessionId, generation, evidence)
         return
       }
-      if (!this.isCurrentGeneration(sessionId, generation.id)) return
       this.clearCompletionRetry(completionKey)
-      const messageId = this.activeAssistantMessages.get(sessionId)
+      const completedAssistant = evidence.assistant
+      const messageId = completedAssistant.id
       const completedRun = this.activeRuns.get(sessionId)
       this.generations.clearInactivityWatchdog(sessionId)
       await this.finalizeTurnOutput(sessionId, messageId).catch((error: unknown) => {
         console.warn("[wanta] failed to finalize turn output", error)
       })
-      if (!this.isCurrentGeneration(sessionId, generation.id)) return
+      if (!stillIdle()) return
       this.clearSessionGeneration(sessionId, generation.id)
+      this.turnOutputs.clearPending(sessionId)
       this.activeAssistantMessages.delete(sessionId)
       this.activeToolParts.delete(sessionId)
       this.activeRuns.delete(sessionId, generation.id)
       this.emitSessionActivity(sessionId)
-      this.sendBestEffort(emit, "messageCompleted", { sessionId }, { sessionId })
+      this.emitTurnOutcome(emit, sessionId, "completed", { generationId: generation.id, messageId })
+      this.sendBestEffort(emit, "messageCompleted", { sessionId, runId: generation.id }, { sessionId })
       if (completedRun?.workspace.kind === "team") {
         void Promise.resolve(
           this.deps.onSessionCompleted?.({
@@ -1440,58 +1756,78 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       }
     } finally {
       this.completionChecks.delete(completionKey)
+      // A newer idle can arrive while an invalidated check is awaiting history.
+      if (
+        generation.completionObserved &&
+        (generation.completionRevision ?? 0) !== revision &&
+        this.canCompleteGeneration(sessionId, generation)
+      ) {
+        void this.completeSessionGeneration(emit, sessionId, generation)
+      }
     }
   }
 
-  private async currentTurnIsComplete(sessionId: string, generation: SessionGeneration): Promise<boolean> {
+  private canCompleteGeneration(sessionId: string, generation: SessionGeneration): boolean {
+    // Keep the dispatch signal aborted: replacing it could resume cancelled setup.
+    // A failed cancel may still be followed by a verified normal runtime completion.
+    return (
+      this.isCurrentGeneration(sessionId, generation.id) &&
+      !this.stoppingGenerations.has(generation.id) &&
+      (!generation.controller.signal.aborted || generation.cancellationFailed === true)
+    )
+  }
+
+  private async completedTurnAssistant(
+    sessionId: string,
+    generation: SessionGeneration,
+  ): Promise<TurnCompletionEvidence> {
     const backend = this.chatBackendFor(sessionId)
-    if (!backend) return false
+    if (!backend) return { kind: "history_unavailable" }
     const messages = await withTimeout(backend.getMessages(sessionId), 1_000, "idle history verification").catch(
       () => null,
     )
-    if (!messages || messages.length === 0) return false
-    const userIndex = messages.findIndex(
-      (message) => message.id === generation.userMessageId && message.role === "user",
-    )
-    const assistantId = this.activeAssistantMessages.get(sessionId)
-    const activeAssistant = assistantId
-      ? messages.find((message) => message.id === assistantId && message.role === "assistant")
-      : undefined
-    const assistant =
-      activeAssistant ??
-      (userIndex >= 0 ? messages.slice(userIndex + 1).find((message) => message.role === "assistant") : undefined)
-    if (!assistant) return false
-    const finishReason = assistant.finishReason?.trim().toLowerCase().replaceAll("_", "-")
-    // A completed tool-call message is only one step in the agent loop. Some
-    // runtimes briefly emit session.idle after a rejected or failed tool; do
-    // not turn that transient boundary into a completed user turn before the
-    // agent produces a terminal response.
-    if (["tool-calls", "tool-use"].includes(finishReason ?? "")) return false
-    return Boolean(finishReason || assistant.completedAt !== undefined)
+    if (!messages) return { kind: "history_unavailable" }
+    return inspectTurnCompletion(messages, generation.userMessageId, generation.permissionRejections)
   }
 
   private scheduleCompletionRetry(
     emit: (event: string, data: unknown) => Promise<void>,
     sessionId: string,
     generation: SessionGeneration,
+    evidence: Exclude<TurnCompletionEvidence, { kind: "completed" }>,
   ): void {
-    if (!this.isCurrentGeneration(sessionId, generation.id)) return
+    if (!this.canCompleteGeneration(sessionId, generation)) return
     const completionKey = `${sessionId}\0${generation.id}`
     if (this.completionRetryTimers.has(completionKey)) return
     const attempt = this.completionRetryAttempts.get(completionKey) ?? 0
-    if (attempt >= completionRetryMaxAttempts) {
+    if (evidence.kind !== "tools_running" && attempt >= completionRetryMaxAttempts) {
       this.clearCompletionRetry(completionKey)
-      void this.interruptSessionGeneration(
-        emit,
-        sessionId,
-        "runtime_error",
-        "Unable to verify that the completed response was saved. Please retry the request.",
-        { abortAgent: false },
+      logDiagnostic(
+        "chat-turn",
+        "completion verification failed",
+        {
+          sessionId,
+          generationId: generation.id,
+          evidence: evidence.kind,
+          attempts: attempt,
+          ...(evidence.kind === "permission_blocked"
+            ? { rejectionSource: evidence.rejection.source, rejectionReason: evidence.rejection.reason }
+            : {}),
+        },
+        "warn",
       )
+      void this.interruptSessionGeneration(emit, sessionId, "runtime_error", completionFailureMessage(evidence), {
+        abortAgent: false,
+      })
       return
     }
-    const delay = Math.min(completionRetryInitialDelayMs * 2 ** Math.min(attempt, 6), completionRetryMaxDelayMs)
-    this.completionRetryAttempts.set(completionKey, attempt + 1)
+    // History can expose a running tool whose start event was missed. Poll
+    // for recovery without spending the failure budget.
+    const delay =
+      evidence.kind === "tools_running"
+        ? completionRetryMaxDelayMs
+        : Math.min(completionRetryInitialDelayMs * 2 ** Math.min(attempt, 6), completionRetryMaxDelayMs)
+    this.completionRetryAttempts.set(completionKey, evidence.kind === "tools_running" ? 0 : attempt + 1)
     const timer = setTimeout(() => {
       this.completionRetryTimers.delete(completionKey)
       if (this.isCurrentGeneration(sessionId, generation.id)) {
@@ -1529,19 +1865,22 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     this.clearInternalMessages(sessionId)
     this.compactingSessions.delete(sessionId)
     if (generation) this.clearCompletionRetry(`${sessionId}\0${generation.id}`)
+    this.toolStartDiagnostics.clear(sessionId, generation?.id)
     this.generations.clear(sessionId, generationId)
-    const childSessionIds = this.subagentSessions.childSessionIds(sessionId)
+    if (externalAgentKindForSessionId(sessionId)) {
+      void Promise.resolve(this.deps.onExternalTurnScopeChanged?.({ active: false, sessionId })).catch(
+        (error: unknown) => {
+          console.warn("[wanta] failed to clear external OOCLI turn scope", error)
+        },
+      )
+    }
     this.subagentSessions.forgetAll(sessionId)
     this.forgetSessionPendingPermissionRequests(sessionId)
     this.removeGenerationPermissionGrants(sessionId, generation?.id)
     this.activeRuns.delete(sessionId, generationId)
     const agent = this.agent
     if (agent) {
-      void Promise.all([
-        agent.clearSessionTeamName(sessionId),
-        agent.clearSessionKnowledgeBaseIds(sessionId),
-        ...childSessionIds.map((childSessionId) => agent.clearSessionKnowledgeBaseIds(childSessionId)),
-      ]).catch((error: unknown) => {
+      void agent.clearSessionTeamName(sessionId).catch((error: unknown) => {
         console.warn("[wanta] failed to clear session agent scope:", error)
       })
     }
@@ -1644,12 +1983,15 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   ): Promise<void> {
     const messageId = this.activeAssistantMessages.get(sessionId)
     const partIds = [...(this.activeToolParts.get(sessionId) ?? [])]
+    const generationId = this.generations.get(sessionId)?.id
     const interruptedAt = Date.now()
     await this.stopSessionGeneration(sessionId, {
       abortAgent: options.abortAgent,
       reason: "system",
       throwOnAbortFailure: false,
     })
+    const outcomeKind = reason === "runtime_error" ? "failed" : "interrupted"
+    this.emitTurnOutcome(emit, sessionId, outcomeKind, { generationId, messageId, reason })
     this.sendBestEffort(
       emit,
       "generationInterrupted",
@@ -1658,12 +2000,13 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         ...(messageId ? { messageId } : {}),
         ...(partIds.length > 0 ? { partIds } : {}),
         interruptedAt,
+        ...(generationId ? { runId: generationId } : {}),
         reason,
         message,
       },
       { messageId, sessionId },
     )
-    this.emitMessageError(emit, sessionId, message, messageId)
+    this.emitMessageError(emit, sessionId, message, messageId, generationId)
   }
 
   private generationWatchdogSessionId(sessionId: string): string | null {
@@ -1680,6 +2023,14 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   private scheduleGenerationInactivityWatchdogAfterReply(sessionId: string): void {
     const generationSessionId = this.generationWatchdogSessionId(sessionId)
     if (generationSessionId) {
+      const generation = this.generations.get(generationSessionId)
+      if (generation?.completionObserved) {
+        void this.completeSessionGeneration(
+          this.send.bind(this) as (event: string, data: unknown) => Promise<void>,
+          generationSessionId,
+          generation,
+        )
+      }
       this.scheduleGenerationInactivityWatchdog(generationSessionId)
     }
   }
@@ -1702,13 +2053,44 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     }
   }
 
-  private async stopSessionGeneration(sessionId: string, options: StopSessionGenerationOptions): Promise<void> {
+  private stopSessionGeneration(sessionId: string, options: StopSessionGenerationOptions): Promise<void> {
+    const generation = this.generations.get(sessionId)
+    const key = generation?.id ?? `session:${sessionId}`
+    const existing = this.stoppingGenerations.get(key)
+    if (existing) return existing
+    if (generation) generation.cancellationFailed = false
+    if (generation && options.reason === "user") generation.cancellationRequested = true
+    const stopping = Promise.resolve()
+      .then(() => this.performStopSessionGeneration(sessionId, generation, options))
+      .finally(() => {
+        if (this.stoppingGenerations.get(key) === stopping) this.stoppingGenerations.delete(key)
+        if (generation?.cancellationFailed && generation.completionObserved) {
+          // An idle event may have arrived while cancellation was still pending.
+          // Recheck history only after the stop operation releases its ownership.
+          void this.completeSessionGeneration(
+            this.send.bind(this) as (event: string, data: unknown) => Promise<void>,
+            sessionId,
+            generation,
+          )
+        }
+      })
+    this.stoppingGenerations.set(key, stopping)
+    generation?.controller.abort()
+    return stopping
+  }
+
+  private async performStopSessionGeneration(
+    sessionId: string,
+    generation: SessionGeneration | undefined,
+    options: StopSessionGenerationOptions,
+  ): Promise<void> {
+    if (this.generations.get(sessionId) !== generation) return
     const backend = this.chatBackendFor(sessionId)
     if (!backend) {
       return
     }
-    const generation = this.generations.get(sessionId)
-    generation?.controller.abort()
+    const generationId = generation?.id
+    this.deps.cancelHostOperations?.(sessionId)
     this.deps.hostQuestions?.cancelSession(sessionId)
     const messageId = this.activeAssistantMessages.get(sessionId)
     const partIds = [...(this.activeToolParts.get(sessionId) ?? [])]
@@ -1717,34 +2099,54 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       try {
         await backend.send({ type: "cancel", sessionId })
       } catch (error) {
-        if (options.throwOnAbortFailure && (messageId || !generation)) {
+        if (
+          !generation?.cancellationSettled &&
+          options.throwOnAbortFailure &&
+          (messageId || !generation || externalAgentKindForSessionId(sessionId))
+        ) {
+          if (generation && this.generations.get(sessionId) === generation) generation.cancellationFailed = true
           this.userStops.delete(sessionId)
           throw error
         }
         console.warn("[wanta] generation abort failed:", error)
       }
     }
+    if (this.generations.get(sessionId) !== generation) return
     if (options.reason === "user" && messageId) {
       await this.rememberStoppedGeneration(sessionId, messageId, partIds, stoppedAt).catch((error: unknown) => {
         console.warn("[wanta] failed to record stopped generation", error)
       })
     }
+    if (this.generations.get(sessionId) !== generation) return
     await this.finalizeTurnOutput(sessionId, messageId).catch((error: unknown) => {
       console.warn("[wanta] failed to finalize stopped turn output", error)
     })
+    if (this.generations.get(sessionId) !== generation) return
     this.clearSessionGeneration(sessionId, generation?.id)
     this.turnOutputs.clearPending(sessionId)
     this.turnOutputs.delete(sessionId, generation?.id)
     this.activeAssistantMessages.delete(sessionId)
     this.activeToolParts.delete(sessionId)
     if (options.reason === "user") {
-      await this.send("generationStopped", {
+      this.logTurnOutcome(sessionId, "cancelled", { generationId, messageId })
+      const outcome = this.send("turnOutcome", {
         sessionId,
+        ...(generationId ? { runId: generationId } : {}),
+        kind: "cancelled",
+        ...(messageId ? { messageId } : {}),
+      }).catch((error: unknown) => {
+        console.warn("[wanta] failed to emit turn outcome:", error)
+        logDiagnostic("chat-service", "failed to emit turn outcome", { error, sessionId }, "warn")
+      })
+      const stopped = this.send("generationStopped", {
+        sessionId,
+        ...(generationId ? { runId: generationId } : {}),
         ...(messageId ? { messageId, partIds, stoppedAt } : {}),
       }).catch((error: unknown) => {
         console.warn("[wanta] failed to emit generation stopped:", error)
         logDiagnostic("chat-service", "failed to emit generation stopped", { error, sessionId }, "warn")
       })
+      await Promise.all([outcome, stopped])
     }
   }
 
@@ -1787,9 +2189,11 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     if (!req.text.trim()) {
       throw new Error("Message text is empty.")
     }
+    const bugReport = parseBugReportCommand(req.text)
+    if (!bugReport) assertKnowledgeSelection(req.contextMentions, req.scope, this.activeLinkRuntime)
     const externalKind = externalAgentKindForSessionId(req.sessionId)
     if (externalKind) {
-      return this.sendExternalMessage(req, externalKind)
+      return this.sendExternalMessage(req, externalKind, bugReport)
     }
     if (isExternalSessionId(req.sessionId)) {
       throw new Error("Invalid or unsupported external agent session.")
@@ -1797,10 +2201,11 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     if (!this.agent) {
       throw new Error("Agent not configured (sign in first)")
     }
+    const turnAttachments = attachmentsForAgentTurn(bugReport, req.attachments)
+    await this.assertTrustedAttachments(turnAttachments)
     if (this.generations.has(req.sessionId)) {
       throw new Error("A generation is already active for this session.")
     }
-    await this.assertTrustedAttachments(req.attachments)
     this.setSessionPermissionModeValue(
       req.sessionId,
       req.permissionMode ?? this.sessionPermissionMode(req.sessionId),
@@ -1808,15 +2213,14 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     )
     const userMessageId = createOpencodeMessageId()
     const teamName = teamNameFromRequest(req)
-    const bugReport = parseBugReportCommand(req.text)
-    let generation: SessionGeneration | undefined
+    const generation = this.beginChatTurn(req, userMessageId)
     let artifactDir: string | undefined
     let processDir: string | undefined
     let attachmentsRecorded = false
     let submitted = false
     try {
-      if (req.attachments?.length) {
-        await this.deps.userAttachmentStore?.record(req.sessionId, userMessageId, req.attachments, req.text)
+      if (turnAttachments?.length) {
+        await this.deps.userAttachmentStore?.record(req.sessionId, userMessageId, turnAttachments, req.text)
         attachmentsRecorded = true
         this.managedUserMessageIds.add(userMessageId)
         const sessionMessageIds = this.managedUserMessageIdsBySession.get(req.sessionId) ?? new Set<string>()
@@ -1825,26 +2229,24 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         this.internalAttachmentPathsByMessage.set(
           userMessageId,
           new Set(
-            req.attachments
+            turnAttachments
               .map((attachment) => attachment.agentPath?.trim())
               .filter((value): value is string => Boolean(value)),
           ),
         )
       }
-      generation = this.beginChatTurn(req, userMessageId)
       const activeGeneration = generation
-      const knowledgeBaseIds = (req.contextMentions ?? []).flatMap((mention) =>
-        mention.kind === "knowledge" && mention.id.trim() ? [mention.id.trim()] : [],
-      )
-      await Promise.all([
-        this.agent.setSessionTeamName(req.sessionId, teamName),
-        this.agent.setSessionKnowledgeBaseIds(req.sessionId, knowledgeBaseIds),
-      ])
+      if (!this.isCurrentGeneration(req.sessionId, activeGeneration.id) || activeGeneration.controller.signal.aborted) {
+        if (attachmentsRecorded)
+          await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, turnAttachments)
+        return
+      }
+      await this.agent.setSessionTeamName(req.sessionId, teamName)
       if (!this.isCurrentGeneration(req.sessionId, activeGeneration.id) || activeGeneration.controller.signal.aborted) {
         this.clearSessionGeneration(req.sessionId, activeGeneration.id)
         await removeUnsubmittedTurnDirectories(artifactDir, processDir)
         if (attachmentsRecorded) {
-          await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, req.attachments)
+          await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, turnAttachments)
         }
         return
       }
@@ -1868,7 +2270,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         this.clearSessionGeneration(req.sessionId, activeGeneration.id)
         await removeUnsubmittedTurnDirectories(artifactDir, processDir)
         if (attachmentsRecorded) {
-          await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, req.attachments)
+          await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, turnAttachments)
         }
         return
       }
@@ -1898,27 +2300,46 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         ...(project.baseline ? { projectBaseline: project.baseline } : {}),
         ...(project.projectRoot ? { projectRoot: project.projectRoot } : {}),
         ...(artifactProjectRoot ? { outputProjectRoot: artifactProjectRoot } : {}),
+        ...(bugReport ? { diagnosticTurn: true } : {}),
       })
       const promptGeneration = activeGeneration
-      const bugReportSystem = bugReport
-        ? buildBugReportSystemPrompt({
-            ...(bugReport.note ? { note: bugReport.note } : {}),
-            runtime: {
-              agentMode: "build",
-              appCommit: this.deps.bugReportRuntime?.appCommit ?? "unknown",
-              appVersion: this.deps.bugReportRuntime?.appVersion ?? "unknown",
-              generatedAt: new Date().toISOString(),
-              model: bugReportModelLabel(req.model),
-              permissionMode: this.sessionPermissionMode(req.sessionId),
-              permissionDiagnostics: this.permissionDiagnostics.snapshot(),
-              platform: this.deps.bugReportRuntime?.platform ?? process.platform,
-            },
-            targetFilePath: path.join(artifactDir, BUG_REPORT_FILE_NAME),
-          })
+      const generatedAt = new Date().toISOString()
+      const evidencePack = bugReport
+        ? await this.materializeBugReportEvidence(req.sessionId, processDir, bugReport, generatedAt)
         : undefined
+      if (!this.isCurrentGeneration(req.sessionId, promptGeneration.id) || promptGeneration.controller.signal.aborted) {
+        this.turnOutputs.removePending(req.sessionId, artifactDir, processDir)
+        this.turnOutputs.delete(req.sessionId, promptGeneration.id)
+        this.clearSessionGeneration(req.sessionId, promptGeneration.id)
+        await removeUnsubmittedTurnDirectories(artifactDir, processDir)
+        if (attachmentsRecorded) {
+          await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, turnAttachments)
+        }
+        return
+      }
+      if (bugReport && evidencePack) {
+        const activeTurn = this.turnOutputs.get(promptGeneration.id)
+        if (activeTurn) {
+          this.turnOutputs.set(promptGeneration.id, {
+            ...activeTurn,
+            diagnosticEvidenceRoot: evidencePack.packDir,
+          })
+        }
+      }
+      const bugReportSystem = bugReport
+        ? this.buildBugReportTurnSystem(
+            bugReport,
+            artifactDir,
+            req,
+            bugReportModelLabel(req.model),
+            generatedAt,
+            evidencePack,
+          )
+        : undefined
+      const bugReportLanguageText = evidencePack?.userGoal ?? bugReport?.note
       // promptStreaming 的结果经 SSE 推送；RPC 只确认主进程已接收本轮发送，避免首条消息 UI 等到流式内容已累积后才切换。
-      this.rememberTrustedAttachments(req.sessionId, req.attachments)
-      this.discardTrustedAttachmentPaths(req.attachments)
+      this.rememberTrustedAttachments(req.sessionId, turnAttachments)
+      this.discardTrustedAttachmentPaths(turnAttachments)
       this.activeRuns.update(req.sessionId, { phase: "submitted" })
       submitted = true
       this.scheduleGenerationSubmitWatchdog(req.sessionId, promptGeneration.id)
@@ -1928,7 +2349,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
             type: "prompt",
             sessionId: req.sessionId,
             text: req.text,
-            attachments: req.attachments,
+            attachments: turnAttachments,
             artifactDir,
             outputProjectRoot: artifactProjectRoot,
             processDir,
@@ -1938,12 +2359,19 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
             teamName,
             reasoningLevel: req.reasoningLevel,
             system: mergeSystemPrompts(
-              buildTeamSkillsSystem(req.teamSkills),
-              buildContextMentionsSystemPrompt(req.contextMentions),
-              buildProjectContextSystem(req.projectContext),
-              buildPermissionModeSystem(req.permissionMode, this.deps.browserAvailable?.() ?? false),
-              bugReportSystem,
-              buildResponseLanguageSystem(req.appLocale, detectResponseLanguage(req.text)),
+              ...(bugReport
+                ? [bugReportSystem]
+                : [
+                    buildKnowledgeSystem(this.activeLinkRuntime, teamName),
+                    buildTeamSkillsSystem(req.teamSkills),
+                    buildContextMentionsSystemPrompt(req.contextMentions),
+                    buildProjectContextSystem(req.projectContext),
+                    buildPermissionModeSystem(req.permissionMode, this.deps.browserAvailable?.() ?? false),
+                  ]),
+              buildResponseLanguageSystem(
+                req.appLocale,
+                detectResponseLanguage(bugReport ? (bugReportLanguageText ?? "") : req.text),
+              ),
             ),
           },
           { signal: promptGeneration.controller.signal },
@@ -1952,6 +2380,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
           if (
             this.isCurrentGeneration(req.sessionId, promptGeneration.id) &&
             !promptGeneration.controller.signal.aborted &&
+            !promptGeneration.acknowledged &&
             !this.activeAssistantMessages.has(req.sessionId)
           ) {
             this.scheduleGenerationStartWatchdog(req.sessionId, promptGeneration.id)
@@ -1969,15 +2398,16 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
             return
           }
           const messageId = this.activeAssistantMessages.get(req.sessionId)
+          const emit = this.send.bind(this) as (event: string, data: unknown) => Promise<void>
+          this.emitTurnOutcome(emit, req.sessionId, "failed", {
+            generationId: promptGeneration.id,
+            messageId,
+            reason: "prompt_dispatch_failed",
+          })
           this.clearSessionGeneration(req.sessionId, promptGeneration.id)
           this.activeAssistantMessages.delete(req.sessionId)
           this.activeToolParts.delete(req.sessionId)
-          this.emitMessageError(
-            this.send.bind(this) as (event: string, data: unknown) => Promise<void>,
-            req.sessionId,
-            errorMessage(error),
-            messageId,
-          )
+          this.emitMessageError(emit, req.sessionId, errorMessage(error), messageId, promptGeneration.id)
         })
     } catch (error) {
       if (generation) {
@@ -1987,10 +2417,64 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       }
       await removeUnsubmittedTurnDirectories(artifactDir, processDir)
       if (attachmentsRecorded && !submitted) {
-        await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, req.attachments)
+        await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, turnAttachments)
       }
       throw error
     }
+  }
+
+  private async materializeBugReportEvidence(
+    sessionId: string,
+    processDir: string,
+    bugReport: ParsedBugReportCommand,
+    generatedAt: string,
+  ): Promise<BugReportEvidencePack | undefined> {
+    let messages: ChatMessage[] = []
+    let historyError: string | undefined
+    try {
+      messages = await this.getMessages(sessionId)
+    } catch (error) {
+      historyError = errorMessage(error)
+      logDiagnostic("chat-service", "failed to load bug-report history", { error, sessionId }, "warn")
+    }
+    try {
+      return await writeBugReportEvidencePack({
+        generatedAt,
+        messages,
+        processDir,
+        sessionId,
+        ...(bugReport.note ? { focusNote: bugReport.note } : {}),
+        ...(historyError ? { historyError } : {}),
+      })
+    } catch (error) {
+      logDiagnostic("chat-service", "failed to write bug-report evidence pack", { error, sessionId }, "warn")
+      return undefined
+    }
+  }
+
+  private buildBugReportTurnSystem(
+    bugReport: ParsedBugReportCommand,
+    artifactDir: string,
+    req: SendMessageRequest,
+    modelLabel: string,
+    generatedAt: string,
+    evidencePack: BugReportEvidencePack | undefined,
+  ): string {
+    return buildBugReportSystemPrompt({
+      ...(bugReport.note ? { note: bugReport.note } : {}),
+      ...(evidencePack ? { evidencePack } : {}),
+      runtime: {
+        agentMode: "build",
+        appCommit: this.deps.bugReportRuntime?.appCommit ?? "unknown",
+        appVersion: this.deps.bugReportRuntime?.appVersion ?? "unknown",
+        generatedAt,
+        model: modelLabel,
+        permissionMode: this.sessionPermissionMode(req.sessionId),
+        permissionDiagnostics: this.permissionDiagnostics.snapshot(),
+        platform: this.deps.bugReportRuntime?.platform ?? process.platform,
+      },
+      targetFilePath: path.join(artifactDir, BUG_REPORT_FILE_NAME),
+    })
   }
 
   /**
@@ -1998,12 +2482,17 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
    * model, and local permission enforcement; Wanta still owns product context
    * such as Link identity, selected skills, project context, and language.
    */
-  private async sendExternalMessage(req: SendMessageRequest, kind: ExternalAgentKind): Promise<void> {
+  private async sendExternalMessage(
+    req: SendMessageRequest,
+    kind: ExternalAgentKind,
+    bugReport: ParsedBugReportCommand | null,
+  ): Promise<void> {
     const adapter = this.externalAgents.get(kind)
     if (!adapter) {
       throw new Error("This agent is not available.")
     }
-    if (req.attachments?.length && !adapter.profile.inputs.attachments) {
+    const turnAttachments = attachmentsForAgentTurn(bugReport, req.attachments)
+    if (turnAttachments?.length && !adapter.profile.inputs.attachments) {
       throw new Error("Attachments are not supported for this agent yet.")
     }
     // Same trust boundary as the kernel path: attachment paths cross the IPC
@@ -2011,7 +2500,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     // recorded and handed to the agent. Asserted BEFORE the single-generation
     // check: the await would otherwise open a same-tick window where two sends
     // both pass the check and spawn duplicate generations.
-    await this.assertTrustedAttachments(req.attachments)
+    await this.assertTrustedAttachments(turnAttachments)
     if (this.generations.has(req.sessionId)) {
       throw new Error("A generation is already active for this session.")
     }
@@ -2029,6 +2518,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     const promptSelectionOwners: Partial<Record<"model" | "effort", number>> = {}
     let artifactDir: string | undefined
     let processDir: string | undefined
+    let attachmentsRecorded = false
     try {
       const teamName = teamNameFromRequest(req)
       const trustedProjectRoot = await this.resolveTrustedProjectRoot(req.projectContext)
@@ -2042,6 +2532,7 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       const directories = this.deps.managedTurnDirectories
       if (!directories) throw new Error("Managed turn directories are not configured.")
       const execution = resolveChatTurnExecution({
+        ...(bugReport ? { forcedMode: "build" } : {}),
         requestedMode: req.mode,
         ...(trustedProjectRoot ? { trustedProjectRoot } : {}),
       })
@@ -2055,16 +2546,42 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         },
       )
       if (!artifactDir || !processDir) throw new Error("Turn directory creation returned an empty path")
-      const additionalDirectories = [
-        directories.artifactSessionDir(req.sessionId, artifactProjectRoot),
-        directories.processSessionDir(req.sessionId),
-      ]
       if (!this.isCurrentGeneration(req.sessionId, generation.id) || generation.controller.signal.aborted) {
         this.clearSessionGeneration(req.sessionId, generation.id)
         await removeUnsubmittedTurnDirectories(artifactDir, processDir)
         return
       }
+      const generatedAt = new Date().toISOString()
+      const evidencePack = bugReport
+        ? await this.materializeBugReportEvidence(req.sessionId, processDir, bugReport, generatedAt)
+        : undefined
+      if (!this.isCurrentGeneration(req.sessionId, generation.id) || generation.controller.signal.aborted) {
+        this.clearSessionGeneration(req.sessionId, generation.id)
+        await removeUnsubmittedTurnDirectories(artifactDir, processDir)
+        return
+      }
+      const diagnosticWorkingDirectory = bugReport ? (evidencePack?.packDir ?? artifactDir) : undefined
+      const diagnosticScopeRoots = [diagnosticWorkingDirectory, artifactDir].filter((root): root is string =>
+        Boolean(root),
+      )
+      const additionalDirectories = bugReport
+        ? [artifactDir].filter((root) => root !== diagnosticWorkingDirectory)
+        : [
+            directories.artifactSessionDir(req.sessionId, artifactProjectRoot),
+            directories.processSessionDir(req.sessionId),
+          ]
       const project = await this.projectBaseline(req.projectContext)
+      await this.deps.onExternalTurnScopeChanged?.({
+        active: true,
+        sessionId: req.sessionId,
+        ...(bugReport ? { diagnostic: true } : {}),
+        ...(!bugReport && teamName ? { teamName } : {}),
+        cwdRoots: bugReport
+          ? [...new Set(diagnosticScopeRoots)]
+          : [artifactDir, processDir, artifactProjectRoot, project.projectRoot].filter((root): root is string =>
+              Boolean(root),
+            ),
+      })
       const artifactBaseline = await captureArtifactSessionBaseline(
         directories.artifactSessionDir(req.sessionId, artifactProjectRoot),
         artifactDir,
@@ -2083,16 +2600,25 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         ...(project.baseline ? { projectBaseline: project.baseline } : {}),
         ...(project.projectRoot ? { projectRoot: project.projectRoot } : {}),
         ...(artifactProjectRoot ? { outputProjectRoot: artifactProjectRoot } : {}),
+        ...(bugReport
+          ? {
+              diagnosticTurn: true,
+              diagnosticEvidenceRoot: diagnosticWorkingDirectory,
+            }
+          : {}),
       })
-      if (req.attachments?.length) {
+      if (turnAttachments?.length) {
         // Same display path as the kernel: the store record is what getMessages
         // folds back onto the synthesized user turn.
-        await this.deps.userAttachmentStore?.record(req.sessionId, userMessageId, req.attachments, req.text)
-        this.rememberTrustedAttachments(req.sessionId, req.attachments)
+        await this.deps.userAttachmentStore?.record(req.sessionId, userMessageId, turnAttachments, req.text)
+        attachmentsRecorded = true
+        this.rememberTrustedAttachments(req.sessionId, turnAttachments)
         // One-shot picker authorization is consumed on submit, kernel-style.
-        this.discardTrustedAttachmentPaths(req.attachments)
+        this.discardTrustedAttachmentPaths(turnAttachments)
       }
-      await this.projectPermissionMode(req.sessionId, this.sessionPermissionMode(req.sessionId))
+      if (!bugReport) {
+        await this.projectPermissionMode(req.sessionId, this.sessionPermissionMode(req.sessionId))
+      }
       if (req.agentModelId) {
         promptSelectionOwners.model = await this.runExternalSelectionMutation(req.sessionId, "model", async () => {
           previousSelection.modelId = adapter.sessionSelection(req.sessionId).modelId
@@ -2106,7 +2632,8 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         })
       }
       this.activeRuns.update(req.sessionId, { phase: "submitted" })
-      this.scheduleGenerationSubmitWatchdog(req.sessionId, generation.id)
+      const bugReportLanguageText = evidencePack?.userGoal ?? bugReport?.note
+      let dispatchAcknowledged = false
       void adapter
         .send(
           {
@@ -2114,62 +2641,105 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
             sessionId: req.sessionId,
             text: req.text,
             messageId: userMessageId,
-            ...(req.attachments?.length ? { attachments: req.attachments } : {}),
-            ...(artifactProjectRoot ? { workingDirectory: artifactProjectRoot } : {}),
+            ...(bugReport ? { diagnostic: true } : {}),
+            ...(turnAttachments?.length ? { attachments: turnAttachments } : {}),
+            ...(bugReport && diagnosticWorkingDirectory
+              ? { workingDirectory: diagnosticWorkingDirectory }
+              : artifactProjectRoot
+                ? { workingDirectory: artifactProjectRoot }
+                : {}),
             additionalDirectories,
-            ...(artifactProjectRoot ? { outputProjectRoot: artifactProjectRoot } : {}),
+            ...(!bugReport && artifactProjectRoot ? { outputProjectRoot: artifactProjectRoot } : {}),
             artifactDir,
-            processDir,
+            ...(!bugReport ? { processDir } : {}),
+            // BYOA owns its account, provider route, model catalog, and effort.
+            // Never forward Wanta/BYOK model selections into a local agent,
+            // even when an older renderer or stale draft includes them.
             ...(req.agentModelId ? { agentModelId: req.agentModelId } : {}),
             ...(req.agentEffortId ? { agentEffortId: req.agentEffortId } : {}),
-            ...(teamName ? { teamName } : {}),
+            ...(!bugReport && teamName ? { teamName } : {}),
+            ...(execution.mode ? { mode: execution.mode } : {}),
             system: mergeSystemPrompts(
-              buildLinkRuntimeSystem(this.activeLinkRuntime, teamName),
-              buildTeamSkillsSystem(req.teamSkills),
-              buildContextMentionsSystemPrompt(req.contextMentions),
-              buildProjectContextSystem(req.projectContext),
-              buildExternalPermissionModeSystem(req.permissionMode, this.deps.browserAvailable?.() ?? false),
-              buildResponseLanguageSystem(req.appLocale, detectResponseLanguage(req.text)),
+              ...(bugReport
+                ? [
+                    this.buildBugReportTurnSystem(
+                      bugReport,
+                      artifactDir,
+                      req,
+                      bugReportModelLabelForExternal(
+                        kind,
+                        req.agentModelId ?? adapter.sessionSelection(req.sessionId).modelId,
+                      ),
+                      generatedAt,
+                      evidencePack,
+                    ),
+                  ]
+                : [
+                    buildLinkRuntimeSystem(this.activeLinkRuntime, teamName),
+                    buildKnowledgeSystem(this.activeLinkRuntime, teamName),
+                    buildTeamSkillsSystem(req.teamSkills),
+                    buildContextMentionsSystemPrompt(req.contextMentions),
+                    buildProjectContextSystem(req.projectContext),
+                    buildExternalPermissionModeSystem(req.permissionMode, this.deps.browserAvailable?.() ?? false),
+                  ]),
+              buildResponseLanguageSystem(
+                req.appLocale,
+                detectResponseLanguage(bugReport ? (bugReportLanguageText ?? "") : req.text),
+              ),
             ),
           },
-          { signal: generation.controller.signal },
+          {
+            signal: generation.controller.signal,
+            onDispatch: () => {
+              if (dispatchAcknowledged) return
+              dispatchAcknowledged = true
+              if (!this.isCurrentGeneration(req.sessionId, generation.id) || generation.controller.signal.aborted)
+                return
+              this.scheduleGenerationSubmitWatchdog(req.sessionId, generation.id)
+            },
+          },
         )
         .then(() => {
-          if (
-            this.isCurrentGeneration(req.sessionId, generation.id) &&
-            !generation.controller.signal.aborted &&
-            !this.activeAssistantMessages.has(req.sessionId)
-          ) {
-            this.scheduleGenerationStartWatchdog(req.sessionId, generation.id)
-          }
+          if (!this.isCurrentGeneration(req.sessionId, generation.id) || generation.controller.signal.aborted) return
+          // External adapters resolve send() only after the native runtime has
+          // accepted session/prompt and emitted Wanta's user-turn echo. A slow
+          // model may legitimately take longer than OpenCode's 45s first-event
+          // deadline, so switch to the non-terminal inactivity notice instead
+          // of misclassifying TTFA as a missing runtime acknowledgement.
+          this.generations.clearAcknowledgementWatchdog(req.sessionId)
+          this.scheduleGenerationInactivityWatchdog(req.sessionId)
         })
         .catch(async (error: unknown) => {
           await this.rollbackPromptSelectionPersistence(req.sessionId, promptSelectionOwners, previousSelection)
           this.turnOutputs.removePending(req.sessionId, artifactDir, processDir)
           this.turnOutputs.delete(req.sessionId, generation.id)
           void removeUnsubmittedTurnDirectories(artifactDir, processDir)
-          if (req.attachments?.length) {
+          if (turnAttachments?.length) {
             // The prompt never reached the agent; a record without a user turn
             // would resurface as an orphaned attachment bubble on reload.
-            void this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, req.attachments)
+            void this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, turnAttachments)
           }
           if (!this.isCurrentGeneration(req.sessionId, generation.id) || generation.controller.signal.aborted) {
             this.clearSessionGeneration(req.sessionId, generation.id)
             return
           }
           const messageId = this.activeAssistantMessages.get(req.sessionId)
+          const emit = this.send.bind(this) as (event: string, data: unknown) => Promise<void>
+          this.emitTurnOutcome(emit, req.sessionId, "failed", {
+            generationId: generation.id,
+            messageId,
+            reason: "prompt_dispatch_failed",
+          })
           this.clearSessionGeneration(req.sessionId, generation.id)
           this.activeAssistantMessages.delete(req.sessionId)
           this.activeToolParts.delete(req.sessionId)
-          this.emitMessageError(
-            this.send.bind(this) as (event: string, data: unknown) => Promise<void>,
-            req.sessionId,
-            errorMessage(error),
-            messageId,
-          )
+          this.emitMessageError(emit, req.sessionId, errorMessage(error), messageId, generation.id)
         })
     } catch (error) {
       await this.rollbackPromptSelectionPersistence(req.sessionId, promptSelectionOwners, previousSelection)
+      if (attachmentsRecorded) {
+        await this.rollbackUnsubmittedUserAttachments(req.sessionId, userMessageId, turnAttachments)
+      }
       this.turnOutputs.removePending(req.sessionId, artifactDir, processDir)
       this.turnOutputs.delete(req.sessionId, generation.id)
       await removeUnsubmittedTurnDirectories(artifactDir, processDir)
@@ -2356,6 +2926,43 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
       sessionId,
     })
   }
+  public async getComposerDrafts(owner: string): Promise<Record<string, ComposerDraftRecord>> {
+    if (owner !== (this.deps.composerDraftOwner?.() ?? "local")) throw new Error("Draft account changed")
+    const drafts = (await this.deps.composerDraftStore?.read(owner)) ?? {}
+    if (owner !== (this.deps.composerDraftOwner?.() ?? "local")) throw new Error("Draft account changed")
+    for (const draft of Object.values(drafts)) {
+      for (const attachment of draft.attachments) {
+        // Prepared copies must be regenerated from the original after restoration.
+        delete attachment.agentPath
+        delete attachment.agentMime
+        delete attachment.agentName
+        delete attachment.agentSize
+      }
+    }
+    return drafts
+  }
+
+  public async saveComposerDraft(req: ComposerDraftRequest): Promise<void> {
+    if (req.owner !== (this.deps.composerDraftOwner?.() ?? "local")) throw new Error("Draft account changed")
+    if (!req.key || req.key.length > 1024) throw new Error("Invalid draft key")
+    if (req.value) {
+      req = { ...req, value: normalizeComposerDraft(req.value) }
+      const drafts = await this.deps.composerDraftStore?.read(req.owner)
+      const previous = drafts && Object.hasOwn(drafts, req.key) ? drafts[req.key] : undefined
+      const existing = new Set(previous?.attachments.flatMap((a) => [a.path, a.agentPath]) ?? [])
+      for (const attachment of req.value!.attachments) {
+        for (const filePath of [attachment.path, attachment.agentPath].filter((p): p is string => Boolean(p))) {
+          // Missing files already owned by this draft remain visible for recovery.
+          if (!existing.has(filePath)) await this.assertTrustedLocalPath(filePath)
+        }
+      }
+    }
+    if (req.owner !== (this.deps.composerDraftOwner?.() ?? "local")) throw new Error("Draft account changed")
+    await this.deps.composerDraftStore?.save(req)
+    if (req.owner !== (this.deps.composerDraftOwner?.() ?? "local")) throw new Error("Draft account changed")
+    this.invalidateTrustedLocalPathRoots()
+  }
+
   public async getAttachmentPreview(req: AttachmentPreviewRequest): Promise<AttachmentPreviewResult> {
     await this.assertTrustedLocalPath(req.path)
     return attachmentPreview(req, this.deps.createArtifactResourceUrl)
@@ -2390,8 +2997,13 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
   }
 
   public async getLocalArtifactPreview(req: LocalArtifactPreviewRequest): Promise<LocalArtifactPreviewResult> {
-    await this.assertTrustedLocalPath(req.path)
-    return localArtifactPreview(req, this.deps.createArtifactResourceUrl, this.deps.createSpreadsheetPreview)
+    const trustedFile = await this.trustedAccess.assertFile(req.path)
+    return localArtifactPreview(
+      { path: trustedFile.path },
+      this.deps.createArtifactResourceUrl,
+      this.deps.createSpreadsheetPreview,
+      trustedFile,
+    )
   }
 
   public async getLocalArtifactThumbnail(req: LocalArtifactThumbnailRequest): Promise<LocalArtifactThumbnailResult> {
@@ -2448,8 +3060,14 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
     if (!record || !file) {
       return { kind: "missing", path: req.path, mime: "application/octet-stream", additions: 0, deletions: 0 }
     }
-    if (file.role === "process" && (!record.processRoot || !isPathInside(record.processRoot, file.path))) {
-      return { kind: "missing", path: req.path, mime: file.mime, additions: 0, deletions: 0 }
+    if (file.role === "process") {
+      const insideManagedProcess = Boolean(record.processRoot && isPathInside(record.processRoot, file.path))
+      const insideManagedArtifacts = Boolean(
+        record.artifactProcessRoot && isPathInside(record.artifactProcessRoot, file.path),
+      )
+      if (!insideManagedProcess && !insideManagedArtifacts) {
+        return { kind: "missing", path: req.path, mime: file.mime, additions: 0, deletions: 0 }
+      }
     }
     if (file.role === "project_change" && (!record.projectRoot || !isPathInside(record.projectRoot, file.path))) {
       return { kind: "missing", path: req.path, mime: file.mime, additions: 0, deletions: 0 }
@@ -2678,23 +3296,38 @@ export class ChatServiceImpl extends ConnectionService<ChatService> implements I
         throw error
       }
     }
-    if (req.reply === "always") {
+    const sourceSessionId = request.sessionId
+    const isExternal = externalAgentKindForSessionId(sourceSessionId) !== undefined
+    const nativeOption =
+      req.optionId === undefined ? undefined : request.nativeOptions?.find((option) => option.optionId === req.optionId)
+    if (req.optionId !== undefined && (!isExternal || !nativeOption)) {
+      throw new Error("Unknown native permission option")
+    }
+    const reply = nativeOption
+      ? nativeOption.kind === "allow_once"
+        ? "once"
+        : nativeOption.kind === "allow_always"
+          ? "always"
+          : "reject"
+      : req.reply
+    // External grants remain in the native runtime. Only OpenCode uses host grants.
+    await this.trackPermissionReply(request, reply === "reject" ? { source: "user", ...request.tool } : undefined, () =>
+      backend.send({
+        type: "permission-response",
+        sessionId: sourceSessionId,
+        requestId: req.requestId,
+        reply,
+        ...(req.optionId !== undefined ? { optionId: req.optionId } : {}),
+        ...(reply === "reject" ? { message: permissionRejectionMessage({ source: "user" }) } : {}),
+      }),
+    )
+    if (!isExternal && reply === "always") {
       for (const sessionId of sessionIds) {
         this.addSessionPermissionGrant(sessionId, request)
       }
     }
-    const sourceSessionId = request.sessionId
-    // The reply is forwarded verbatim; how "always" maps onto the agent's own
-    // approval semantics is each adapter's business (the kernel adapter
-    // downgrades it because the grant lives Wanta-side, external agents
-    // persist it in their native rule system).
-    await backend.send({
-      type: "permission-response",
-      sessionId: sourceSessionId,
-      requestId: req.requestId,
-      reply: req.reply,
-    })
-    if (req.reply !== "reject" && request) {
+    // Host previews need approved paths even when the native agent owns grants.
+    if (reply !== "reject") {
       this.rememberTrustedPermissionResources(req.sessionId, request)
     }
     this.forgetPendingPermissionRequest(sourceSessionId, req.requestId)

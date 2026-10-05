@@ -14,6 +14,24 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+test("skill catalog caches are isolated by language and published skills use the dedicated endpoint", async () => {
+  const urls: URL[] = []
+  vi.stubGlobal("fetch", async (input: string | URL) => {
+    urls.push(new URL(String(input)))
+    return Response.json({ data: [], next: null })
+  })
+  await listPublicSkillPackages({ lang: "en" })
+  await listPublicSkillPackages({ lang: "zh-CN" })
+  await listPublicSkillPackages({ lang: "en" })
+  await listMyPublishedSkillPackages({ account: { id: "user", name: "User" }, lang: "zh-CN" })
+  assert.equal(urls.length, 3)
+  assert.deepEqual(
+    urls.map((url) => url.searchParams.get("lang")),
+    ["en", "zh-CN", "zh-CN"],
+  )
+  assert.equal(urls[2]?.pathname, "/v1/packages/-/my-skills")
+})
+
 test("public Skill lists share cached and in-flight requests", async () => {
   const fetchMock = vi.fn(async () => {
     return new Response(JSON.stringify({ data: [] }), {
@@ -58,13 +76,12 @@ test("cancellable public Skill consumers still share one underlying request", as
 test("my published Skill pages cap registry detail fanout at 20 packages", async () => {
   const packages = Array.from({ length: 25 }, (_, index) => ({
     name: `@acme/package-${index}`,
-    skills: [{ name: `skill-${index}` }],
     version: "1.0.0",
   }))
   let registryReads = 0
   const fetchMock = vi.fn<typeof fetch>(async (input) => {
     const url = new URL(String(input))
-    if (url.pathname === "/v1/packages/-/my") {
+    if (url.pathname === "/v1/packages/-/my-skills") {
       return Response.json({ data: packages })
     }
     if (url.pathname.startsWith("/-/oomol/package-info/")) {
@@ -144,18 +161,17 @@ test("exact public package lookups reuse the shared package detail cache", async
 test("searchPublicSkillPackages renders search results without per-package registry requests", async () => {
   const fetchMock = vi.fn(async (input: string | URL | Request) => {
     const url = String(input)
-    if (url.startsWith(`${searchBaseUrl}/v1/packages/-/skills-search`)) {
+    if (url.startsWith(`${searchBaseUrl}/v1/packages/-/skills-list`)) {
       return new Response(
         JSON.stringify({
           data: [
             {
               description: "Matched beta skill",
               icon: "assets/icon.svg",
-              name: "beta",
-              owner: "owner-id",
-              packageName: "@acme/demo",
-              packageVersion: "1.2.3",
-              title: "Beta",
+              name: "@acme/demo",
+              version: "1.2.3",
+              displayName: "Beta",
+              skills: [{ name: "beta", title: "Beta" }],
             },
           ],
         }),
@@ -179,25 +195,27 @@ test("searchPublicSkillPackages renders search results without per-package regis
   )
 
   const searchUrl = new URL(String(fetchMock.mock.calls[0]?.[0]))
-  assert.equal(searchUrl.searchParams.get("keywords"), "beta")
+  assert.equal(searchUrl.searchParams.get("text"), "beta")
+  assert.equal(searchUrl.searchParams.get("sort"), "relevance")
+  assert.equal(searchUrl.searchParams.has("keywords"), false)
   assert.equal(searchUrl.searchParams.get("size"), "100")
   assert.equal(fetchMock.mock.calls.length, 1)
 })
 
-test("searchPublicSkillPackages builds fallback package details from the search result", async () => {
+test("searchPublicSkillPackages preserves package versions and icons from the search result", async () => {
   const fetchMock = vi.fn(async (input: string | URL | Request) => {
     const url = String(input)
-    if (url.startsWith(`${searchBaseUrl}/v1/packages/-/skills-search`)) {
+    if (url.startsWith(`${searchBaseUrl}/v1/packages/-/skills-list`)) {
       return new Response(
         JSON.stringify({
           data: [
             {
               description: "Matched old skill",
               icon: "assets/search-icon.svg",
-              name: "old-skill",
-              packageName: "@acme/demo",
-              packageVersion: "1.0.0",
-              title: "Old Skill",
+              name: "@acme/demo",
+              version: "1.0.0",
+              displayName: "Old Skill",
+              skills: [{ name: "old-skill", title: "Old Skill" }],
               visibility: "public",
             },
           ],
@@ -219,4 +237,88 @@ test("searchPublicSkillPackages builds fallback package details from the search 
     `${packageAssetsBaseUrl}/packages/@acme/demo/1.0.0/files/package/assets/search-icon.svg`,
   )
   assert.equal(fetchMock.mock.calls.length, 1)
+})
+
+test("my published records with skill metadata skip all detail requests", async () => {
+  const fetchMock = vi.fn(async () =>
+    Response.json({
+      data: Array.from({ length: 20 }, (_, i) => ({
+        name: `@acme/skill-${i}`,
+        version: "2.0.0",
+        skills: [{ name: `skill-${i}` }],
+      })),
+    }),
+  )
+  vi.stubGlobal("fetch", fetchMock)
+  const result = await listMyPublishedSkillPackages({ account: { id: "a", name: "Alice" } })
+  assert.equal(result.items.length, 20)
+  assert.equal(fetchMock.mock.calls.length, 1)
+})
+
+test("failed supplemental details reject the page and are not cached as a successful empty list", async () => {
+  let failed = true
+  let listReads = 0
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input) => {
+      if (String(input).includes("/v1/packages/-/my-skills")) {
+        listReads++
+        return Response.json({ data: [{ name: "@acme/demo", version: "1.0.0" }] })
+      }
+      return failed
+        ? new Response("unavailable", { status: 503 })
+        : Response.json({
+            packageName: "@acme/demo",
+            packageVersion: "1.0.0",
+            skills: [{ name: "demo" }],
+          })
+    }),
+  )
+  const account = { id: "a", name: "Alice" }
+  await assert.rejects(listMyPublishedSkillPackages({ account }), /503/)
+  failed = false
+  const recovered = await listMyPublishedSkillPackages({ account })
+  assert.equal(recovered.items.length, 1)
+  assert.equal(listReads, 2)
+})
+
+test("my published force refresh also refreshes supplemental detail at the listed version", async () => {
+  let details = 0
+  const detailUrls: string[] = []
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input) => {
+      if (String(input).includes("/v1/packages/-/my-skills"))
+        return Response.json({ data: [{ name: "@acme/demo", version: "2.0.0" }] })
+      details++
+      detailUrls.push(String(input))
+      return Response.json({
+        packageName: "@acme/demo",
+        packageVersion: "2.0.0",
+        title: `Title ${details}`,
+        skills: [{ name: "demo" }],
+      })
+    }),
+  )
+  const account = { id: "a", name: "Alice" }
+  await listMyPublishedSkillPackages({ account })
+  const result = await listMyPublishedSkillPackages({ account, forceRefresh: true })
+  assert.equal(details, 2)
+  assert.equal(result.items[0]?.displayName, "Title 2")
+  assert.ok(detailUrls.every((url) => url.endsWith("/2.0.0")))
+})
+
+test("private details are isolated by account and legitimate non-skill packages are excluded", async () => {
+  let details = 0
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input) => {
+      if (String(input).includes("/v1/packages/-/my-skills")) return Response.json({ data: [{ name: "@acme/demo" }] })
+      details++
+      return Response.json({ packageName: "@acme/demo", skills: details === 1 ? [] : [{ name: "demo" }] })
+    }),
+  )
+  assert.equal((await listMyPublishedSkillPackages({ account: { id: "a", name: "A" } })).items.length, 0)
+  assert.equal((await listMyPublishedSkillPackages({ account: { id: "b", name: "B" } })).items.length, 1)
+  assert.equal(details, 2)
 })

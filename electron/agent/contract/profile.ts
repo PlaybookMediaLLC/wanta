@@ -12,8 +12,8 @@ import { ACP_AGENT_REGISTRY } from "../acp/registry.ts"
 // from these declarations and from reflected adapter events — never from
 // `if (agent === "...")` branches.
 
-/** Closed set of integrated agents: built-in kernel, native adapters, and ACP registry entries. */
-export type AgentKind = "opencode" | "claude-code" | AcpAgentKind
+/** Closed set of integrated agents: built-in kernel plus registry-backed ACP agents. */
+export type AgentKind = "opencode" | AcpAgentKind
 
 /**
  * Which optional parts of the input contract the adapter genuinely honors.
@@ -22,6 +22,8 @@ export type AgentKind = "opencode" | "claude-code" | AcpAgentKind
  * cross-adapter contract tests enforce that declaration honesty.
  */
 export interface AgentInputCapabilityFlags {
+  /** Agent-owned authentication through an advertised ACP method. */
+  authenticate: boolean
   /** File/directory attachments on a prompt. */
   attachments: boolean
   /** Wanta build/plan modes. */
@@ -40,16 +42,15 @@ export interface AgentInputCapabilityFlags {
 export const AGENT_PERMISSION_MODE_ORDER: readonly AgentPermissionMode[] = AGENT_PERMISSION_MODES
 
 /**
- * Who owns model selection for this agent. "wanta" means the Wanta model
- * catalog applies (model selector and BYOK UI visible); "agent" means the
- * agent brings its own models and Wanta must hide model routing UI.
+ * Who owns model selection for this agent. "wanta" is reserved for the
+ * built-in OpenCode kernel (Wanta catalog and BYOK); every BYOA profile is
+ * "agent" and surfaces only the local runtime's native catalog.
  */
 export type AgentModelSource = "wanta" | "agent"
 
 /**
- * How the agent authenticates. Wanta never stores subscription secrets for
- * external agents: "agent-cli" delegates entirely to the agent's own login
- * (for example `claude login`), and Wanta only reflects the observed state.
+ * How the agent authenticates. BYOA always uses agent-cli; wanta-account is
+ * reserved for the built-in OpenCode model route.
  */
 export type AgentAuthMode = { kind: "wanta-account" } | { kind: "agent-cli"; loginCommand: string }
 
@@ -65,12 +66,14 @@ export interface AgentProfile {
 }
 
 /**
- * External agents own their models, auth, and native base prompts. ACP has no
+ * External agents own their native base prompts, model catalog, provider
+ * configuration, and authentication. ACP has no
  * portable dynamic system-prompt field, so Wanta's per-turn host context uses
  * a delimited compatibility block while host capabilities enforce identity
  * outside the prompt. Attachments are delivered as file references.
  */
 const externalAgentInputs: AgentInputCapabilityFlags = {
+  authenticate: true,
   attachments: true,
   modes: false,
   permissionResponse: true,
@@ -88,9 +91,10 @@ function acpAgentProfiles(): Record<AcpAgentKind, AgentProfile> {
       kind,
       displayName: registration.displayName,
       modelSource: "agent",
-      auth: { kind: "agent-cli", loginCommand: registration.loginHint },
+      auth: { kind: "agent-cli", loginCommand: registration.loginCommand },
       inputs: {
         ...externalAgentInputs,
+        modes: Boolean(registration.workModeMap),
         setModel: registration.selection?.model ?? false,
         setEffort: registration.selection?.effort ?? false,
       },
@@ -111,6 +115,7 @@ export const AGENT_PROFILES = {
     modelSource: "wanta",
     auth: { kind: "wanta-account" },
     inputs: {
+      authenticate: false,
       attachments: true,
       modes: true,
       permissionResponse: true,
@@ -120,23 +125,12 @@ export const AGENT_PROFILES = {
     },
     permissionModes: ["default", "full_access"],
   },
-  "claude-code": {
-    kind: "claude-code",
-    displayName: "Claude Code",
-    modelSource: "agent",
-    auth: { kind: "agent-cli", loginCommand: "Run `claude` in a terminal and sign in, then retry." },
-    inputs: { ...externalAgentInputs, setModel: true, setEffort: true },
-    // Mapped 1:1 onto SDK permission modes (auto = the CLI's classifier mode,
-    // full_access = bypassPermissions).
-    permissionModes: ["default", "accept_edits", "plan", "auto", "full_access"],
-  },
   ...acpAgentProfiles(),
 } satisfies Record<AgentKind, AgentProfile> as Record<AgentKind, AgentProfile>
 
 /** The agent's login-command hint; empty for Wanta-account agents. */
 export function agentLoginHint(kind: AgentKind): string {
-  const auth = AGENT_PROFILES[kind].auth
-  return auth.kind === "agent-cli" ? auth.loginCommand : ""
+  return kind === "opencode" ? "" : ACP_AGENT_REGISTRY[kind].loginHint
 }
 
 /** Agent kinds handled by external adapters (everything except the built-in kernel). */
@@ -146,6 +140,11 @@ export const EXTERNAL_AGENT_KINDS = (Object.keys(AGENT_PROFILES) as AgentKind[])
   (kind): kind is ExternalAgentKind => kind !== "opencode",
 )
 
-export function isExternalAgentKind(kind: AgentKind): kind is ExternalAgentKind {
-  return kind !== "opencode"
+/** Runtime-safe registry check for persisted, IPC, and renderer-owned values. */
+export function isAgentKind(value: unknown): value is AgentKind {
+  return typeof value === "string" && Object.hasOwn(AGENT_PROFILES, value)
+}
+
+export function isExternalAgentKind(value: unknown): value is ExternalAgentKind {
+  return isAgentKind(value) && value !== "opencode"
 }

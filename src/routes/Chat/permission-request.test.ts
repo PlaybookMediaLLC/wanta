@@ -104,6 +104,12 @@ test("high risk command detection marks destructive commands for default access 
     isHighRiskPermissionRequest(permission({ metadata: { command: "oo connector apps posthog 2>&1 | head -80" } })),
     false,
   )
+  assert.equal(isHighRiskPermissionRequest(permission({ metadata: { command: "docker rm container-1" } })), false)
+  assert.equal(isHighRiskPermissionRequest(permission({ metadata: { command: "docker rm -v container-1" } })), true)
+  assert.equal(
+    isHighRiskPermissionRequest(permission({ metadata: { command: "docker rm --volumes container-1" } })),
+    true,
+  )
 })
 
 test("managed Python dependency installs are narrow enough for a task approval", () => {
@@ -140,6 +146,18 @@ test("managed Python dependency installs are narrow enough for a task approval",
       permission({
         metadata: {
           command: `cd ${processRoot} && .wanta-python/bin/python -m pip install weasyprint 2>&1 | tail -5`,
+        },
+      }),
+      processRoot,
+    ),
+    { packages: ["weasyprint"] },
+  )
+  const directPipCommand = `${processRoot}/.wanta-python/bin/pip install weasyprint`
+  assert.deepEqual(
+    managedPythonDependencyInstall(
+      permission({
+        metadata: {
+          command: `${directPipCommand} 2>&1 | tail -5`,
         },
       }),
       processRoot,
@@ -251,6 +269,19 @@ test("managed Python dependency installs are narrow enough for a task approval",
       protectedArguments,
     )
   }
+  for (const protectedArguments of [
+    "--build-constraint build-constraints.txt",
+    "--requirements-from-script package.py",
+  ]) {
+    assert.equal(
+      managedPythonDependencyInstall(
+        permission({ metadata: { command: `${directPipCommand} ${protectedArguments}` } }),
+        processRoot,
+      ),
+      null,
+      protectedArguments,
+    )
+  }
   assert.equal(
     managedPythonDependencyInstall(permission({ metadata: { command: `${command} && rm -rf /tmp/x` } }), processRoot),
     null,
@@ -265,6 +296,28 @@ test("managed Python dependency installs are narrow enough for a task approval",
       "/Users/example/code/customer-project",
     ),
     true,
+  )
+  assert.equal(
+    isProjectScopedPythonDependencyInstallRequest(
+      permission({
+        metadata: {
+          command: "/Users/example/code/customer-project/.venv/bin/pip install --compile pandas",
+        },
+      }),
+      "/Users/example/code/customer-project",
+    ),
+    true,
+  )
+  assert.equal(
+    isProjectScopedPythonDependencyInstallRequest(
+      permission({
+        metadata: {
+          command: "/Users/example/code/other-project/.venv/bin/pip install pandas",
+        },
+      }),
+      "/Users/example/code/customer-project",
+    ),
+    false,
   )
   assert.equal(
     isProjectScopedPythonDependencyInstallRequest(
@@ -343,7 +396,7 @@ test("default prompt detection only flags basic safety boundaries", () => {
     ),
     false,
   )
-  assert.equal(permissionRequestNeedsDefaultPrompt(permission({ metadata: { command: "npm install" } })), true)
+  assert.equal(permissionRequestNeedsDefaultPrompt(permission({ metadata: { command: "npm install" } })), false)
   assert.equal(permissionRequestNeedsDefaultPrompt(permission({ metadata: { command: "find ~ -type f" } })), false)
   assert.equal(permissionRequestNeedsDefaultPrompt(permission({ metadata: { command: "ls -la ~" } })), false)
   assert.equal(permissionRequestNeedsDefaultPrompt(permission({ metadata: { command: "ls -R ~" } })), false)

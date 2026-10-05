@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest"
 import {
-  isWgKnowledgeBashPart,
-  isWikigraphKnowledgeActivityPart,
-  isWikigraphKnowledgeSkillPart,
   normalizeServiceSlug,
   parseToolAuthorization,
   toolActionSummary,
+  toolDisplayInput,
   toolDisplayLine,
   toolServiceSlug,
 } from "./tool-display.ts"
@@ -53,141 +51,69 @@ describe("tool display", () => {
     })
   })
 
-  it("renders knowledge queries without exposing the internal tool name", () => {
+  it("renders managed OOCLI connector commands with the same business labels as built-in tools", () => {
     const t = (key: string, vars?: Record<string, string | number>) => `${key}:${vars?.detail ?? ""}`
-    const part = {
+    const run = {
       kind: "tool" as const,
-      partId: "p1",
-      tool: "query_knowledge",
+      partId: "run",
+      tool: "execute",
       status: "completed" as const,
-      input: { operation: "search", query: "唐僧师徒关系" },
+      input: { command: 'oo connector run "posthog" --action "run_query" --data \'{}\' --json' },
+    }
+    const schema = {
+      kind: "tool" as const,
+      partId: "schema",
+      tool: "execute",
+      status: "completed" as const,
+      input: { command: 'oo connector schema "posthog.run_query" --json' },
     }
 
-    expect(toolDisplayLine(t, part)).toEqual({
-      title: "chat.toolKnowledgeSearchGeneric:",
-      detail: "唐僧师徒关系",
+    expect(toolDisplayLine(t, run)).toEqual({
+      title: "chat.toolCallGeneric:",
+      detail: "posthog · run_query",
       detailKind: "text",
     })
-    expect(toolActionSummary(t, part)).toBe("chat.toolKnowledgeSearch:唐僧师徒关系")
-  })
-
-  it("renders WG Bash knowledge calls without exposing command details", () => {
-    const t = (key: string, vars?: Record<string, string | number>) => `${key}:${vars?.detail ?? ""}`
-    const part = {
-      kind: "tool" as const,
-      partId: "p1",
-      tool: "bash",
-      status: "completed" as const,
-      input: { command: 'printf "%s\\n" "唐僧" | wg wikg://lib/entity --query - --json | jq .' },
-    }
-
-    expect(isWgKnowledgeBashPart(part)).toBe(true)
-    expect(toolDisplayLine(t, part)).toEqual({ title: "chat.toolBashQueryKnowledge:" })
-    expect(toolActionSummary(t, part)).toBe("chat.toolBashQueryKnowledge:")
-  })
-
-  it("renders assignment-prefix WG substitutions as hidden knowledge Bash calls", () => {
-    const t = (key: string, vars?: Record<string, string | number>) => `${key}:${vars?.detail ?? ""}`
-    const part = {
-      kind: "tool" as const,
-      partId: "p1",
-      tool: "bash",
-      status: "completed" as const,
-      input: { command: "OO=$(wg wikg://lib/entity --query 唐僧 --json) node -e 1" },
-    }
-
-    expect(isWgKnowledgeBashPart(part)).toBe(true)
-    expect(toolDisplayLine(t, part)).toEqual({ title: "chat.toolBashQueryKnowledge:" })
-    expect(toolActionSummary(t, part)).toBe("chat.toolBashQueryKnowledge:")
-  })
-
-  it("keeps quoted assignment WG text in the ordinary Bash display path", () => {
-    const t = (key: string, vars?: Record<string, string | number>) => `${key}:${vars?.detail ?? ""}`
-    const command = "env FOO='$(wg wikg://lib/entity --query 唐僧 --json)' node -e 1"
-    const part = {
-      kind: "tool" as const,
-      partId: "p1",
-      tool: "bash",
-      status: "completed" as const,
-      input: { command },
-    }
-
-    expect(isWgKnowledgeBashPart(part)).toBe(false)
-    expect(toolDisplayLine(t, part)).toEqual({
-      title: "chat.toolRunGeneric:",
-      detail: command,
-      detailKind: "code",
+    expect(toolActionSummary(t, run)).toBe("chat.toolCall:posthog · run_query")
+    expect(toolDisplayLine(t, schema)).toEqual({
+      title: "chat.toolInspectGeneric:",
+      detail: "posthog · run_query",
+      detailKind: "text",
     })
   })
 
-  it("renders the wikigraph-knowledge skill load as a hidden knowledge activity", () => {
+  it("renders managed File and Flow commands without exposing signed URLs", () => {
     const t = (key: string, vars?: Record<string, string | number>) => `${key}:${vars?.detail ?? ""}`
-    const part = {
+    const download = {
       kind: "tool" as const,
-      partId: "p1",
-      tool: "skill",
+      partId: "download",
+      tool: "execute",
       status: "completed" as const,
-      title: "  Loaded  skill :  wikigraph-knowledge  ",
-      output: "# WikiGraph Knowledge",
+      input: {
+        command: 'oo file download "https://signed.example.test/a?token=secret" ./artifacts --name "report" --ext pdf',
+      },
+    }
+    const publish = {
+      kind: "tool" as const,
+      partId: "publish",
+      tool: "execute",
+      status: "completed" as const,
+      input: { command: "oo flow publish demo --project project-a --json" },
     }
 
-    expect(isWikigraphKnowledgeSkillPart(part)).toBe(true)
-    expect(isWikigraphKnowledgeActivityPart(part)).toBe(true)
-    expect(toolDisplayLine(t, part)).toEqual({ title: "chat.toolBashQueryKnowledge:" })
-    expect(toolActionSummary(t, part)).toBe("chat.toolBashQueryKnowledge:")
-  })
-
-  it("does not treat ordinary skill loads as wikigraph knowledge activity", () => {
-    const part = {
-      kind: "tool" as const,
-      partId: "p1",
-      tool: "skill",
-      status: "completed" as const,
-      title: "Loaded skill: pdf",
-    }
-
-    expect(isWikigraphKnowledgeSkillPart(part)).toBe(false)
-    expect(isWikigraphKnowledgeActivityPart(part)).toBe(false)
-  })
-
-  it("keeps ordinary Bash calls in the existing command display path", () => {
-    const t = (key: string, vars?: Record<string, string | number>) => `${key}:${vars?.detail ?? ""}`
-    const part = {
-      kind: "tool" as const,
-      partId: "p1",
-      tool: "bash",
-      status: "completed" as const,
-      input: { command: 'echo "wikg://lib"' },
-    }
-
-    expect(isWgKnowledgeBashPart(part)).toBe(false)
-    expect(toolDisplayLine(t, part)).toEqual({
-      title: "chat.toolRunGeneric:",
-      detail: 'echo "wikg://lib"',
-      detailKind: "code",
+    expect(toolDisplayLine(t, download)).toEqual({
+      title: "chat.toolDownloadFile:",
+      detail: "report",
+      detailKind: "text",
     })
-  })
-
-  it("uses operation-specific knowledge query labels", () => {
-    const t = (key: string) => key
-    const expected = {
-      evidence: "chat.toolKnowledgeEvidenceGeneric",
-      inspect: "chat.toolKnowledgeInspectGeneric",
-      pack: "chat.toolKnowledgePackGeneric",
-      related: "chat.toolKnowledgeRelatedGeneric",
-    }
-
-    for (const [operation, title] of Object.entries(expected)) {
-      expect(
-        toolDisplayLine(t, {
-          kind: "tool",
-          partId: operation,
-          tool: "query_knowledge",
-          status: "completed",
-          input: { operation },
-        }).title,
-      ).toBe(title)
-    }
+    expect(JSON.stringify(toolDisplayLine(t, download))).not.toContain("secret")
+    expect(toolDisplayInput(download)).toBeUndefined()
+    expect(toolDisplayInput({ ...download, input: { ...download.input, destination: "artifacts" } })).toEqual({
+      destination: "artifacts",
+    })
+    expect(toolDisplayInput(publish)).toEqual(publish.input)
+    expect(toolActionSummary(t, download)).toBe("chat.toolDownloadFile:")
+    expect(toolDisplayLine(t, publish)).toEqual({ title: "chat.toolPublishFlow:" })
+    expect(toolActionSummary(t, publish)).toBe("chat.toolPublishFlow:")
   })
 
   it("extracts the provider slug from an oo 1.3.0 dotted `connector schema` command", () => {

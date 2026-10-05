@@ -1,3 +1,4 @@
+import type { AuthAccountSummary } from "../../../electron/auth/common.ts"
 import type { PublicSkillPackage } from "../../../electron/skills/common.ts"
 import type { ManagedSkillGroupById } from "./skill-route-model.ts"
 
@@ -13,6 +14,7 @@ import {
   getPublicSkillInstallState,
   getPublicSkillInstallStateLabel,
 } from "./skill-route-model.ts"
+import { SkillPackageMaintainers } from "./SkillPackageMaintainers.tsx"
 import { SkillIconFrame, SkillManagementSheet } from "./SkillUiParts.tsx"
 import { AppIcons } from "@/components/AppIcons"
 import { InspectorCard, InspectorInsetCard } from "@/components/InspectorPanel"
@@ -23,11 +25,13 @@ import { useAppI18n } from "@/i18n"
 import { cn } from "@/lib/utils"
 
 interface PublicSkillPackageSheetProps {
+  fallbackFocus?: () => HTMLElement | null
   additionalActions?: React.ReactNode
   canInstall?: boolean
   groupById: ManagedSkillGroupById
   installingKey: string | null
   locale: string
+  maintainerAccount?: AuthAccountSummary
   onClose: () => void
   onInstall: (pkg: PublicSkillPackage, skillName?: string) => void
   onOpenManagedSkill: (skillName: string) => void
@@ -35,11 +39,13 @@ interface PublicSkillPackageSheetProps {
 }
 
 export function PublicSkillPackageSheet({
+  fallbackFocus,
   additionalActions,
   canInstall = true,
   groupById,
   installingKey,
   locale,
+  maintainerAccount,
   onClose,
   onInstall,
   onOpenManagedSkill,
@@ -47,6 +53,7 @@ export function PublicSkillPackageSheet({
 }: PublicSkillPackageSheetProps) {
   return (
     <SkillManagementSheet
+      fallbackFocus={fallbackFocus}
       ariaLabel={pkg.displayName}
       subjectName={pkg.displayName}
       title={pkg.displayName}
@@ -58,6 +65,7 @@ export function PublicSkillPackageSheet({
         groupById={groupById}
         installingKey={installingKey}
         locale={locale}
+        maintainerAccount={maintainerAccount}
         pkg={pkg}
         onInstall={onInstall}
         onOpenManagedSkill={onOpenManagedSkill}
@@ -73,18 +81,20 @@ interface PublicSkillPackageDetailProps {
   groupById: ManagedSkillGroupById
   installingKey: string | null
   locale: string
+  maintainerAccount?: AuthAccountSummary
   onInstall: (pkg: PublicSkillPackage, skillName?: string) => void
   onOpenManagedSkill: (skillName: string) => void
   pkg: PublicSkillPackage
 }
 
-function PublicSkillPackageDetail({
+export function PublicSkillPackageDetail({
   additionalActions,
   canInstall,
   className,
   groupById,
   installingKey,
   locale,
+  maintainerAccount,
   onInstall,
   onOpenManagedSkill,
   pkg,
@@ -194,6 +204,9 @@ function PublicSkillPackageDetail({
           ) : null}
         </div>
       </InspectorInsetCard>
+      {maintainerAccount ? (
+        <SkillPackageMaintainers account={maintainerAccount} packageName={pkg.name} version={pkg.version} />
+      ) : null}
     </aside>
   )
 }

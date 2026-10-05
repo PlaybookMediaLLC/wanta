@@ -202,15 +202,13 @@ async function createHarness(
   const fake = createFakeAgent(behavior)
   const registration = ACP_AGENT_REGISTRY[kind]
   const scratchRootDir = await mkdtemp(path.join(os.tmpdir(), "acp-selection-edge-"))
-  const probe = vi.fn(
-    async (): Promise<ExternalAgentRuntimeStatus> => ({
-      kind,
-      displayName: registration.displayName,
-      binary: { status: "detected", path: "/fake/bin/agent", version: "1.0.0" },
-      login: { status: "unknown" },
-      loginHint: registration.loginHint,
-    }),
-  )
+  const probe = vi.fn(async (): Promise<ExternalAgentRuntimeStatus> => ({
+    kind,
+    displayName: registration.displayName,
+    binary: { status: "detected", path: "/fake/bin/agent", version: "1.0.0" },
+    login: { status: "unknown" },
+    loginHint: registration.loginHint,
+  }))
   const adapter = new AcpAgentAdapter({ kind, registration, probe, scratchRootDir, connect: fake.connect })
   await adapter.start()
   startedAdapters.push(adapter)
@@ -743,21 +741,89 @@ describe("acp selection: permission-mode projection", () => {
     ])
   })
 
-  test("an agent without a permissionModeMap ignores mode projection entirely", async () => {
+  test("native current_mode_update is normalized back to Wanta UI state", async () => {
     const harness = await createHarness(
       {
-        newSession: () => ({ ...modelsShape("m1", ["m1"]), sessionId: "acp-session-1", modes: MODES_ALL }),
+        newSession: () => ({
+          sessionId: "acp-session-1",
+          modes: {
+            currentModeId: "default",
+            availableModes: [
+              { id: "default", name: "Default" },
+              { id: "auto", name: "Auto" },
+            ],
+          },
+        }),
+      },
+      "claude-code",
+    )
+    await harness.adapter.send(promptInput())
+    await harness.waitFor((event) => event.event === "messageCompleted")
+
+    await harness.fake.notifySessionUpdate("acp-session-1", {
+      sessionUpdate: "current_mode_update",
+      currentModeId: "auto",
+    })
+
+    const updated = await harness.waitFor((event) => event.event === "permissionModeUpdated")
+    expect(updated).toEqual({
+      event: "permissionModeUpdated",
+      data: { sessionId: WANTA_SESSION_ID, permissionMode: "auto" },
+    })
+  })
+
+  test("Grok opens a session under its own default policy when session/new carries no modes", async () => {
+    // Real shape from grok 1.0.5: session/new returns sessionId + models only.
+    const harness = await createHarness(
+      { newSession: () => ({ ...modelsShape("grok-4.6", ["grok-4.6", "grok-4.5"]), sessionId: "acp-session-1" }) },
+      "grok",
+    )
+    await harness.adapter.applyPermissionMode(WANTA_SESSION_ID, "default")
+    await harness.adapter.send(promptInput())
+    await harness.waitFor((event) => event.event === "messageCompleted")
+    expect(harness.fake.setModeRequests).toEqual([])
+    expect((await harness.adapter.runtimeStatus()).permissionModes).toEqual(["default"])
+    await expect(harness.adapter.applyPermissionMode(WANTA_SESSION_ID, "full_access")).rejects.toThrow(
+      /permission mode "full_access" is not available/u,
+    )
+  })
+
+  test("Grok exposes only permission modes confirmed by its live session", async () => {
+    const harness = await createHarness(
+      {
+        newSession: () => ({
+          ...modelsShape("m1", ["m1"]),
+          sessionId: "acp-session-1",
+          modes: {
+            currentModeId: "default",
+            availableModes: [
+              { id: "default", name: "Default" },
+              { id: "acceptEdits", name: "Accept edits" },
+              { id: "plan", name: "Plan" },
+              { id: "auto", name: "Auto" },
+              { id: "bypassPermissions", name: "Full access" },
+            ],
+          },
+        }),
       },
       "grok",
     )
     await harness.adapter.send(promptInput())
     await harness.waitFor((event) => event.event === "messageCompleted")
     await expect(harness.adapter.applyPermissionMode(WANTA_SESSION_ID, "full_access")).resolves.toBeUndefined()
-    expect(harness.fake.setModeRequests).toHaveLength(0)
-    // grok declares no effort selection; the input is rejected loudly, not dropped.
+    expect(harness.fake.setModeRequests.at(-1)?.modeId).toBe("bypassPermissions")
+    expect((await harness.adapter.runtimeStatus()).permissionModes).toEqual([
+      "default",
+      "accept_edits",
+      "plan",
+      "auto",
+      "full_access",
+    ])
+    // Grok owns its effort selection, but a concrete session that omits the
+    // native option rejects the change instead of silently pretending it took.
     await expect(
       harness.adapter.send({ type: "set-effort", sessionId: WANTA_SESSION_ID, effortId: "high" }),
-    ).rejects.toThrow(/set-effort/u)
+    ).rejects.toThrow(/effort selection is not available/u)
   })
 })
 
@@ -881,3 +947,87 @@ describe("acp selection: catalog parsing resilience", () => {
     expect(status.catalog).toBeUndefined()
   })
 })
+
+describe("model-scoped catalog previews", () => {
+  test.each(["codex", "claude-code", "grok"] as const)(
+    "%s reads effort options for the requested model without changing a user session",
+    async (kind) => {
+      const harness = await createHarness(
+        {
+          newSession: () => ({ sessionId: "preview", configOptions: MODEL_EFFORT_CONFIG_OPTIONS }) as never,
+          setConfigOption: ({ value }) => ({
+            configOptions: [
+              { ...MODEL_EFFORT_CONFIG_OPTIONS[0], currentValue: value },
+              { ...MODEL_EFFORT_CONFIG_OPTIONS[1], currentValue: "high", options: [{ value: "high", name: "High" }] },
+            ],
+          }),
+        },
+        kind,
+      )
+      const catalog = await harness.adapter.previewCatalog("gpt-b")
+      expect(catalog.defaultModelId).toBe("gpt-b")
+      expect(catalog.efforts.map((option) => option.id)).toEqual(["high"])
+      expect(harness.fake.setConfigOptionRequests).toEqual([
+        { sessionId: "preview", configId: "model", value: "gpt-b" },
+      ])
+      expect(harness.fake.closedSessionIds).toEqual(["preview"])
+      expect(harness.fake.promptRequests).toHaveLength(0)
+      expect(harness.adapter.sessionSelection("any-user-session")).toEqual({})
+    },
+  )
+
+  test("a model without reasoning options does not inherit them from the default model", async () => {
+    const harness = await createHarness({
+      newSession: () => ({ sessionId: "preview", configOptions: MODEL_EFFORT_CONFIG_OPTIONS }) as never,
+      setConfigOption: () => ({ configOptions: [{ ...MODEL_EFFORT_CONFIG_OPTIONS[0], currentValue: "gpt-b" }] }),
+    })
+    expect((await harness.adapter.previewCatalog("gpt-b")).efforts).toEqual([])
+    expect((await harness.adapter.previewCatalog()).efforts.map((option) => option.id)).toEqual([
+      "low",
+      "medium",
+      "high",
+    ])
+  })
+
+  test("a rejected preview always closes its temporary session", async () => {
+    const harness = await createHarness({
+      newSession: () => ({ sessionId: "preview", configOptions: MODEL_EFFORT_CONFIG_OPTIONS }) as never,
+    })
+    await expect(harness.adapter.previewCatalog("unknown-model")).rejects.toThrow("not available")
+    expect(harness.fake.closedSessionIds).toEqual(["preview"])
+    expect(harness.fake.setConfigOptionRequests).toHaveLength(0)
+  })
+})
+
+test.each(["config", "legacy"] as const)(
+  "catalog previews include delayed %s selection notifications",
+  async (channel) => {
+    let publish!: () => void
+    const selected = () => {
+      setTimeout(() => publish(), 30)
+      return channel === "config" ? { configOptions: [] } : {}
+    }
+    const harness = await createHarness({
+      newSession: () =>
+        channel === "config"
+          ? ({ sessionId: "delayed-preview", configOptions: MODEL_EFFORT_CONFIG_OPTIONS } as never)
+          : { ...modelsShape("gpt-a", ["gpt-a", "gpt-b"]), sessionId: "delayed-preview" },
+      setConfigOption: selected,
+      setModel: selected,
+    })
+    publish = () => {
+      void harness.fake.notifySessionUpdate("delayed-preview", {
+        sessionUpdate: "config_option_update",
+        configOptions: [
+          { ...MODEL_EFFORT_CONFIG_OPTIONS[0], currentValue: "gpt-b" },
+          { ...MODEL_EFFORT_CONFIG_OPTIONS[1], currentValue: "high", options: [{ value: "high", name: "High" }] },
+        ],
+      })
+    }
+    const result = await harness.adapter.previewCatalog("gpt-b")
+    expect(result.defaultModelId).toBe("gpt-b")
+    expect(result.efforts.map((option) => option.id)).toEqual(["high"])
+    expect(result.defaultEffortId).toBe("high")
+    expect(harness.fake.closedSessionIds).toEqual(["delayed-preview"])
+  },
+)

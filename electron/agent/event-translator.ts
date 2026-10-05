@@ -299,6 +299,7 @@ export function translateOpencodeEvent(event: OpencodeEvent): ChatEmit[] {
         | {
             id?: string
             sessionID?: string
+            parentID?: string
             role?: ChatRole
             error?: unknown
             finish?: unknown
@@ -318,6 +319,7 @@ export function translateOpencodeEvent(event: OpencodeEvent): ChatEmit[] {
             sessionId: info.sessionID,
             messageId: info.id,
             role: info.role,
+            ...(info.parentID ? { parentMessageId: info.parentID } : {}),
             ...(info.summary === true ? { internal: true } : {}),
             ...(finishReason ? { finishReason } : {}),
             ...(completedAt === undefined ? {} : { completedAt }),
@@ -353,7 +355,11 @@ export function translateOpencodeEvent(event: OpencodeEvent): ChatEmit[] {
         sessionID?: string
         status?: { type?: string; attempt?: number; message?: string }
       }
-      if (!p.sessionID || p.status?.type !== "retry") {
+      if (!p.sessionID) return []
+      if (p.status?.type === "busy") {
+        return [{ event: "assistantActivity", data: { sessionId: p.sessionID, phase: "thinking" } }]
+      }
+      if (p.status?.type !== "retry") {
         return []
       }
       // v2 的 retry status 不再带 next 字段，nextRetryAt 在 UI 契约里可选，故省略。

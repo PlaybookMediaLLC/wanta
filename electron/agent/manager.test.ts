@@ -2,13 +2,12 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { IMAGE_UNDERSTANDING_BUILTIN_MODEL_ID, resolveBuiltinModel } from "../models/builtin.ts"
 import {
   AgentManager,
   buildAgentSidecarEnv,
   buildArtifactSystem,
   buildWorkspaceIdentitySystem,
-  isPersistedConnectorToolPart,
+  isPersistedSensitiveOoToolPart,
   isUserVisibleSession,
 } from "./manager.ts"
 
@@ -18,57 +17,69 @@ afterEach(() => {
 })
 
 describe("AgentManager", () => {
-  it("limits persisted redaction to connector executions", () => {
-    expect(isPersistedConnectorToolPart({ tool: "call_action" })).toBe(true)
+  it("limits persisted redaction to connector executions and signed OO uploads", () => {
+    expect(isPersistedSensitiveOoToolPart({ tool: "call_action" })).toBe(true)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: "oo --lang zh connector run posthog --action list_projects --json" } },
       }),
     ).toBe(true)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: "printf 'password = \"example\"\\n'" } },
       }),
     ).toBe(false)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: "printf 'oo connector run demo'" } },
       }),
     ).toBe(false)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: "bash -lc 'oo connector apps posthog --json'" } },
       }),
     ).toBe(true)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: `printf '%s\\n' "$(oo connector run demo)"` } },
       }),
     ).toBe(true)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: `printf '%s\\n' '$(oo connector run demo)'` } },
       }),
     ).toBe(false)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: `connector_data="$(oo connector apps posthog --json)"` } },
       }),
     ).toBe(true)
     expect(
-      isPersistedConnectorToolPart({
+      isPersistedSensitiveOoToolPart({
         tool: "bash",
         state: { input: { command: "# $(oo connector run demo)" } },
       }),
     ).toBe(false)
-    expect(isPersistedConnectorToolPart({ tool: "read", state: { input: { filePath: "README.md" } } })).toBe(false)
+    expect(
+      isPersistedSensitiveOoToolPart({
+        tool: "bash",
+        state: { input: { command: 'BUN_BE_BUN=1 oo file upload "/managed/input.png" --json' } },
+      }),
+    ).toBe(true)
+    expect(
+      isPersistedSensitiveOoToolPart({
+        tool: "bash",
+        state: { input: { command: 'oo file download "https://example.com/a" ./out' } },
+      }),
+    ).toBe(false)
+    expect(isPersistedSensitiveOoToolPart({ tool: "read", state: { input: { filePath: "README.md" } } })).toBe(false)
   })
 
   it("pins raw connector CLI guidance to the current team", () => {
@@ -201,7 +212,7 @@ describe("AgentManager", () => {
     expect(inventory).toHaveBeenCalledTimes(2)
   })
 
-  it("does not expose Wanta WikiGraph control variables to the sidecar", () => {
+  it("does not expose unused sidecar control variables", () => {
     const env = buildAgentSidecarEnv({
       commandPath: "/usr/bin:/bin",
       linkRuntime: null,
@@ -213,10 +224,6 @@ describe("AgentManager", () => {
       WANTA_TEAM_SCOPE_PATH: "/tmp/wanta-agent/team-scope.json",
       PATH: "/usr/bin:/bin",
     })
-    expect(env).not.toHaveProperty("WANTA_WIKIGRAPH_COMMAND")
-    expect(env).not.toHaveProperty("WANTA_WIKIGRAPH_STATE_DIR")
-    expect(env).not.toHaveProperty("WANTA_WIKIGRAPH_WRAPPER_PATH")
-    expect(env).not.toHaveProperty("WIKIGRAPH_STATE_DIR")
     expect(env).not.toHaveProperty("WANTA_LARK_CLI_BIN")
     expect(env).not.toHaveProperty("LARKSUITE_CLI_CONFIG_DIR")
     expect(env).not.toHaveProperty("WANTA_WECOM_CLI_BIN")
@@ -494,6 +501,15 @@ describe("AgentManager", () => {
     expect(system).not.toContain("Do not present a remote")
   })
 
+  it("separates explicit deliverables from process files", () => {
+    const system = buildArtifactSystem("/tmp/wanta-artifacts/turn")
+
+    expect(system).toContain("machine-review files belong in the managed process directory")
+    expect(system).toContain("write .wanta-artifact.json")
+    expect(system).toContain("publishes only declared primary, summary, and supporting files")
+    expect(system).not.toContain("Do not create a manifest")
+  })
+
   it("tells project turns that managed deliverables are published into the visible project", () => {
     const system = buildArtifactSystem("/tmp/project/.wanta/artifacts/session/turn", "/tmp/project")
 
@@ -542,15 +558,9 @@ describe("AgentManager", () => {
       await manager.setTeamName("workspace-default")
       await manager.setSessionTeamName("session-a", "team-a")
       await manager.setSessionTeamName("session-b", undefined)
-      await manager.setSessionKnowledgeBaseIds("session-a", [" knowledge-a ", "knowledge-a", "knowledge-b"])
-      await manager.inheritSessionKnowledgeBaseIds("session-a", "session-child")
 
       await expect(readFile(scopePath, "utf8").then((content) => JSON.parse(content))).resolves.toEqual({
         teamName: "workspace-default",
-        sessionKnowledgeBaseIds: {
-          "session-a": ["knowledge-a", "knowledge-b"],
-          "session-child": ["knowledge-a", "knowledge-b"],
-        },
         sessionTeams: {
           "session-a": "team-a",
           "session-b": "",
@@ -558,14 +568,9 @@ describe("AgentManager", () => {
       })
 
       await manager.clearSessionTeamName("session-a")
-      await manager.removeKnowledgeBaseAccess("knowledge-a")
 
       await expect(readFile(scopePath, "utf8").then((content) => JSON.parse(content))).resolves.toEqual({
         teamName: "workspace-default",
-        sessionKnowledgeBaseIds: {
-          "session-a": ["knowledge-b"],
-          "session-child": ["knowledge-b"],
-        },
         sessionTeams: {
           "session-b": "",
         },
@@ -867,20 +872,15 @@ describe("AgentManager", () => {
         type: "text",
         text: expect.stringContaining("A test photo"),
       })
-      expect(calls[1]?.[0]).toMatchObject({ model: { modelID: "deepseek-v4-flash", providerID: "oomol" } })
-      expect(calls[1]?.[0].parts[0]).toMatchObject({
-        metadata: { wantaPurpose: "attachment-reference", wantaVisibility: "internal" },
-        synthetic: true,
-        type: "text",
-      })
-      expect(calls[1]?.[0].parts[1]).toMatchObject({
-        metadata: { wantaPurpose: "image-understanding", wantaVisibility: "internal" },
-        synthetic: true,
-        type: "text",
-        text: expect.stringContaining(resolveBuiltinModel(IMAGE_UNDERSTANDING_BUILTIN_MODEL_ID).displayName),
-      })
+      expect(calls[1]?.[0]).toMatchObject({ model: { modelID: "oopilot", providerID: "oomol" } })
+      expect(calls[1]?.[0].parts[0]).toMatchObject({ mime: "image/png", type: "file" })
+      expect(calls[1]?.[0].parts).not.toContainEqual(
+        expect.objectContaining({
+          metadata: { wantaPurpose: "image-understanding", wantaVisibility: "internal" },
+        }),
+      )
       expect(calls[2]?.[0].parts[0]).toMatchObject({ mime: "image/png", type: "file" })
-      expect(imageUnderstandingFetch).toHaveBeenCalledTimes(2)
+      expect(imageUnderstandingFetch).toHaveBeenCalledTimes(1)
       const visionRequest = imageUnderstandingFetch.mock.calls[0]?.[1]
       expect(visionRequest?.headers).toMatchObject({ Authorization: "Bearer test" })
       expect(JSON.parse(String(visionRequest?.body))).toMatchObject({
@@ -915,7 +915,7 @@ describe("AgentManager", () => {
     try {
       await manager.promptStreaming("session-1", "what is shown?", {
         attachments: [{ id: "image-1", mime: "image/png", name: "photo.png", path: imagePath, size: 10 }],
-        model: { kind: "builtin", id: "oopilot" },
+        model: { kind: "builtin", id: "deepseek-v4-flash" },
         teamName: "acme",
       })
 
@@ -1014,7 +1014,7 @@ describe("AgentManager", () => {
     try {
       const prompting = manager.promptStreaming("session-1", "what is shown?", {
         attachments: [{ id: "image-1", mime: "image/png", name: "photo.png", path: imagePath, size: 10 }],
-        model: { kind: "builtin", id: "oopilot" },
+        model: { kind: "builtin", id: "deepseek-v4-flash" },
         signal: controller.signal,
         teamName: "acme",
       })
@@ -1223,6 +1223,24 @@ describe("AgentManager", () => {
     expect(reject).toHaveBeenCalledWith({ requestID: "q1" })
   })
 
+  it("forwards policy feedback through the native permission reply instead of a bare rejection", async () => {
+    const reply = vi.fn(async () => ({ data: true }))
+    const manager = new AgentManager({
+      linkRuntime: { kind: "oomol", sessionToken: "test" },
+      modelAccess: { kind: "oomol", sessionToken: "test" },
+      opencodeBinPath: "/tmp/opencode",
+      ooBinPath: "/tmp/oo",
+      rootDir: "/tmp/wanta-agent",
+    })
+    ;(manager as unknown as { sidecar: unknown }).sidecar = { client: { permission: { reply } } }
+    await manager.answerPermission("session-1", "permission-1", "reject", "Blocked by Wanta policy: environment_dump")
+    expect(reply).toHaveBeenCalledWith({
+      requestID: "permission-1",
+      reply: "reject",
+      message: "Blocked by Wanta policy: environment_dump",
+    })
+  })
+
   it("turns OpenCode SDK error results into rejected operations", async () => {
     const failure = async () => ({ error: { message: "runtime unavailable" } })
     const manager = new AgentManager({
@@ -1304,6 +1322,32 @@ describe("AgentManager", () => {
       response_format: { type: "json_object" },
     })
     expect(request?.headers).toMatchObject({ Authorization: "Bearer test" })
+  })
+
+  it("keeps the oopilot gateway alias when Auto generates a session title", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => {
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"title":"动态路由标题"}' } }] }), {
+        status: 200,
+      })
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const manager = new AgentManager({
+      linkRuntime: { kind: "oomol", sessionToken: "test" },
+      modelAccess: { kind: "oomol", sessionToken: "test" },
+      opencodeBinPath: "/tmp/opencode",
+      ooBinPath: "/tmp/oo",
+      rootDir: "/tmp/wanta-agent",
+    })
+
+    const title = await manager.generateSessionTitle({
+      model: { kind: "builtin", id: "oopilot" },
+      text: "生成标题",
+    })
+
+    expect(title).toEqual({ generated: true, title: "动态路由标题" })
+    const request = fetchMock.mock.calls[0]?.[1]
+    expect(JSON.parse(String(request?.body))).toMatchObject({ model: "oopilot" })
   })
 
   it("disables thinking and requests structured output for DeepSeek session titles", async () => {

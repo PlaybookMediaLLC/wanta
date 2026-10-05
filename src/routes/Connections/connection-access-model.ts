@@ -1,4 +1,37 @@
 import type { ConnectionActionCatalogItem } from "../../../electron/connections/common.ts"
+import type { TeamMember, TeamUserSummary } from "../../../electron/teams/common.ts"
+import type { ConnectionAppAccess, ConnectionPermissionGrant } from "@/lib/team-connection-access"
+
+import { isGuestTeamServiceAccount } from "@/lib/team-permissions"
+
+export function createConnectionPermissionRuleGrant(): ConnectionPermissionGrant {
+  return { actionAccess: { actionNames: [], mode: "restricted" } }
+}
+
+export function canRestoreConnectionAccess(canManage: boolean, access: ConnectionAppAccess | null): boolean {
+  return canManage && access !== null && (access.mode === "configured" || access.mode === "invalid")
+}
+
+export function isConnectionAccessConflict(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "status" in error && error.status === 412)
+}
+
+export function mergeConnectionRuleAssignments(
+  assignments: Record<string, string>,
+  ruleId: string,
+  selectedUserIds: readonly string[],
+  loadedUserIds: readonly string[],
+): Record<string, string> {
+  const loaded = new Set(loadedUserIds)
+  const selected = new Set(selectedUserIds)
+  const next = Object.fromEntries(
+    Object.entries(assignments).filter(
+      ([userId, assignedRuleId]) => !loaded.has(userId) || (assignedRuleId !== ruleId && !selected.has(userId)),
+    ),
+  )
+  for (const userId of selected) next[userId] = ruleId
+  return next
+}
 
 export function defaultRestrictedActionNames(actions: readonly ConnectionActionCatalogItem[]): string[] {
   return uniqueSorted(actions.filter((action) => action.operationType === "read").map((action) => action.name))
@@ -37,4 +70,26 @@ export function connectionAccessSaveDisabled(input: {
 
 function uniqueSorted(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean))).sort()
+}
+
+/** Guest service accounts have a separate access scope, outside ordinary team rules. */
+export function connectionRuleMembers(members: readonly TeamMember[]): TeamMember[] {
+  return members.filter((member) => !isGuestTeamServiceAccount(member))
+}
+
+export function removeGuestConnectionAssignments(
+  assignments: Record<string, string>,
+  members: readonly TeamMember[],
+): Record<string, string> {
+  const guestIds = new Set(members.filter(isGuestTeamServiceAccount).map((member) => member.user_id))
+  return Object.fromEntries(Object.entries(assignments).filter(([userId]) => !guestIds.has(userId)))
+}
+
+export function connectionMemberLabel(
+  userId: string,
+  summaries: Record<string, TeamUserSummary>,
+  name?: string,
+): string {
+  const summary = summaries[userId]
+  return summary?.nickname?.trim() || summary?.username?.trim() || name?.trim() || userId
 }

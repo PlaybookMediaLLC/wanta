@@ -1,11 +1,11 @@
 import type { ConnectionAppSummary } from "../../electron/connections/common.ts"
-import type { TeamAppAccess, TeamMember, TeamProviderOption, TeamUserSummary } from "../../electron/teams/common.ts"
+import type { ServiceAccount, TeamAppAccess, TeamMember, TeamUserSummary } from "../../electron/teams/common.ts"
 
 import {
   getTeamAppAccess,
+  listServiceAccounts,
   listTeamConnectionApps,
   listTeamMembers,
-  listTeamProviderOptions,
   listUserSummaries,
 } from "./teams-client.ts"
 
@@ -23,10 +23,6 @@ const resourceCache = new Map<string, ResourceEntry<unknown>>()
 
 function resourceKey(accountId: string, teamId: string, resource: string): string {
   return `${accountId}\u0000${teamId}\u0000${resource}`
-}
-
-function providerOptionsResourceKey(accountId: string, teamId: string, teamName: string): string {
-  return resourceKey(accountId, teamId, `provider-options:${teamName.trim()}`)
 }
 
 function connectionAppsResourceKey(accountId: string, teamId: string, teamName: string): string {
@@ -111,14 +107,6 @@ export function subscribeTeamMembersResource(accountId: string, teamId: string, 
   }
 }
 
-export function getCachedTeamProviderOptions(
-  accountId: string,
-  teamId: string,
-  teamName: string,
-): TeamProviderOption[] | null {
-  return readCached(providerOptionsResourceKey(accountId, teamId, teamName))
-}
-
 export function getCachedTeamAppAccess(accountId: string, teamId: string): TeamAppAccess | null {
   return readCached(resourceKey(accountId, teamId, "app-access"))
 }
@@ -131,13 +119,36 @@ export function getCachedTeamConnectionApps(
   return readCached(connectionAppsResourceKey(accountId, teamId, teamName))
 }
 
+interface UserSummaryEntry {
+  data?: TeamUserSummary
+  loadedAt: number
+  promise?: Promise<void>
+}
+
+type UserSummaryCache = Map<string, UserSummaryEntry>
+
+function summaryCache(accountId: string, teamId: string): UserSummaryCache {
+  const entry = entryFor<UserSummaryCache>(resourceKey(accountId, teamId, "user-summaries"))
+  return (entry.data ??= new Map())
+}
+
+function normalizedUserIds(userIds: string[]): string[] {
+  return [...new Set(userIds.map((id) => id.trim()).filter(Boolean))]
+}
+
 export function getCachedTeamUserSummaries(
   accountId: string,
   teamId: string,
   userIds: string[],
 ): Record<string, TeamUserSummary> | null {
-  const normalizedUserIds = Array.from(new Set(userIds.map((userId) => userId.trim()).filter(Boolean))).sort()
-  return readCached(resourceKey(accountId, teamId, `user-summaries:${normalizedUserIds.join(",")}`))
+  const cache = summaryCache(accountId, teamId)
+  const summaries: Record<string, TeamUserSummary> = {}
+  for (const id of normalizedUserIds(userIds)) {
+    const entry = cache.get(id)
+    if (!entry || entry.promise || Date.now() - entry.loadedAt >= teamDetailsStaleMs) return null
+    if (entry.data) summaries[id] = entry.data
+  }
+  return summaries
 }
 
 export function getTeamMembersResource(
@@ -146,19 +157,6 @@ export function getTeamMembersResource(
   options: TeamDetailsResourceOptions = {},
 ): Promise<TeamMember[]> {
   return loadResource(resourceKey(accountId, teamId, "members"), () => listTeamMembers(teamId), options.forceRefresh)
-}
-
-export function getTeamProviderOptionsResource(
-  accountId: string,
-  teamId: string,
-  teamName: string,
-  options: TeamDetailsResourceOptions = {},
-): Promise<TeamProviderOption[]> {
-  return loadResource(
-    providerOptionsResourceKey(accountId, teamId, teamName),
-    () => listTeamProviderOptions(teamName),
-    options.forceRefresh,
-  )
 }
 
 export function getTeamAppAccessResource(
@@ -186,28 +184,62 @@ export function getTeamConnectionAppsResource(
   )
 }
 
-export function getTeamUserSummariesResource(
+export async function getTeamUserSummariesResource(
   accountId: string,
   teamId: string,
   userIds: string[],
   options: TeamDetailsResourceOptions = {},
 ): Promise<Record<string, TeamUserSummary>> {
-  const normalizedUserIds = Array.from(new Set(userIds.map((userId) => userId.trim()).filter(Boolean))).sort()
-  return loadResource(
-    resourceKey(accountId, teamId, `user-summaries:${normalizedUserIds.join(",")}`),
-    () => listUserSummaries(normalizedUserIds),
-    options.forceRefresh,
-  )
+  const ids = normalizedUserIds(userIds)
+  const cache = summaryCache(accountId, teamId)
+  const missing = ids.filter((id) => {
+    const entry = cache.get(id)
+    return options.forceRefresh || !entry || (!entry.promise && Date.now() - entry.loadedAt >= teamDetailsStaleMs)
+  })
+  if (missing.length) {
+    const entries = missing.map((id) => {
+      const entry: UserSummaryEntry = { loadedAt: 0 }
+      cache.set(id, entry)
+      return entry
+    })
+    const promise = listUserSummaries(missing).then(
+      (summaries) => {
+        missing.forEach((id, index) => {
+          const entry = entries[index]
+          entry.data = summaries[id]
+          entry.loadedAt = Date.now()
+          entry.promise = undefined
+        })
+      },
+      (error: unknown) => {
+        missing.forEach((id, index) => {
+          if (cache.get(id) === entries[index]) cache.delete(id)
+        })
+        throw error
+      },
+    )
+    entries.forEach((entry) => {
+      entry.promise = promise
+    })
+  }
+  // Capture this consumer's entries so superseding refreshes cannot replace its result.
+  const entries = ids.map((id) => [id, cache.get(id)!] as const)
+  await Promise.all(new Set(entries.map(([, entry]) => entry.promise)))
+  return Object.fromEntries(entries.flatMap(([id, entry]) => (entry.data ? [[id, entry.data]] : [])))
 }
 
 /** 团队成员、授权等变更后，仅清掉对应团队的短时读取资源。 */
-export function invalidateTeamDetailsResource(accountId: string | undefined, teamId: string): void {
+export function invalidateTeamDetailsResource(
+  accountId: string | undefined,
+  teamId: string,
+  options: { preserveUserSummaries?: boolean } = {},
+): void {
   if (!accountId) {
     return
   }
   const prefix = `${accountId}\u0000${teamId}\u0000`
   for (const key of resourceCache.keys()) {
-    if (key.startsWith(prefix)) {
+    if (key.startsWith(prefix) && !(options.preserveUserSummaries && key === `${prefix}user-summaries`)) {
       const entry = resourceCache.get(key)
       if (entry) {
         entry.data = null
@@ -234,4 +266,11 @@ function notifyResourceEntry(entry: ResourceEntry<unknown>): void {
   for (const listener of entry.listeners) {
     listener()
   }
+}
+
+export function getServiceAccountsResource(
+  accountId: string,
+  options: TeamDetailsResourceOptions = {},
+): Promise<ServiceAccount[]> {
+  return loadResource(resourceKey(accountId, "", "service-accounts"), listServiceAccounts, options.forceRefresh)
 }

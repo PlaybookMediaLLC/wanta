@@ -8,7 +8,9 @@ export interface AssistantTimelineBlock {
   block: RenderBlock
 }
 
-export type AssistantTimelineSegmentKind = "process" | "response"
+export type AssistantTimelineSegmentKind = "pending" | "process" | "response"
+
+type AssistantTimelinePhase = Exclude<AssistantTimelineSegmentKind, "pending">
 
 export interface AssistantTimelineSegment {
   kind: AssistantTimelineSegmentKind
@@ -34,52 +36,15 @@ function isToolCallFinishReason(reason: string | undefined): boolean {
   return reason === "tool-calls" || reason === "tool_calls" || reason === "tool-use" || reason === "tool_use"
 }
 
-function messageToolParts(message: ChatMessage): ChatMessagePart[] {
-  return message.parts.filter((part) => part.kind === "tool")
-}
-
-function textBelongsToProcess(
-  message: ChatMessage,
-  part: ChatMessagePart,
-  activeAssistantMessageId: string | undefined,
-): boolean {
-  const text = part.text?.trim() ?? ""
-  if (!text) {
-    return false
-  }
-
-  if (message.finishReason && !isToolCallFinishReason(message.finishReason)) {
-    // stop 等终止原因表示这条消息已经直接回应用户，即使同一消息里也有工具记录。
-    return false
-  }
-
-  const tools = messageToolParts(message)
-  if (tools.some((tool) => tool.tool === "question")) {
-    // 问题前的说明是用户做决定所需的上下文，不能随工具详情一起隐藏。
-    return false
-  }
-  if (tools.length > 0) {
-    return true
-  }
-  // Keep all still-active narration in the process disclosure until the
-  // adapter supplies a terminal finish reason. This is deliberately based on
-  // turn lifecycle rather than prose length or Markdown shape: a detailed
-  // progress report is still progress while the agent continues using tools.
-  if (message.id === activeAssistantMessageId) {
-    return true
-  }
-  return isToolCallFinishReason(message.finishReason)
-}
-
-function blockSegmentKind(
-  item: AssistantTimelineBlock,
-  activeAssistantMessageId: string | undefined,
-): AssistantTimelineSegmentKind {
+function blockSegmentKind(item: AssistantTimelineBlock, phase: AssistantTimelinePhase): AssistantTimelinePhase {
   switch (item.block.kind) {
     case "tools":
       return "process"
     case "text":
-      return textBelongsToProcess(item.message, item.block.part, activeAssistantMessageId) ? "process" : "response"
+      // A non-tool finish reason is explicit final-response evidence. Without
+      // it, narration follows the current turn phase: text seen before the
+      // first tool stays put, while text between tools remains in processing.
+      return item.message.finishReason && !isToolCallFinishReason(item.message.finishReason) ? "response" : phase
     case "status":
       return item.block.part.statusType === "connectionFailed" || item.block.part.statusType === "runtimeFailed"
         ? "response"
@@ -99,46 +64,65 @@ export function segmentAssistantTimeline(
   options: { activeAssistantMessageId?: string } = {},
 ): AssistantTimelineSegment[] {
   const blocks = assistantTimelineBlocks(messages)
-  const classified = blocks.map((item) => ({ item, kind: blockSegmentKind(item, options.activeAssistantMessageId) }))
-  const hasIncompleteTool = classified.some(
-    ({ item, kind }) =>
-      kind === "process" && item.block.kind === "tools" && item.block.parts.some((part) => part.status !== "completed"),
-  )
-
-  // Some adapters can finish a turn immediately after a tool-use step without
-  // emitting a separate stop message. Once the turn is settled, preserve the
-  // last narrated result as the visible outcome instead of leaving the user
-  // with process activity only.
-  if (
-    options.activeAssistantMessageId === undefined &&
-    !hasIncompleteTool &&
-    !classified.some(
-      ({ item, kind }) => kind === "response" && (item.block.kind === "text" || item.block.kind === "attachment"),
-    )
-  ) {
-    const fallbackIndex = classified.findLastIndex(
-      ({ item, kind }) => kind === "process" && item.block.kind === "text" && Boolean(item.block.part.text?.trim()),
-    )
-    if (fallbackIndex >= 0 && classified[fallbackIndex]) {
-      classified[fallbackIndex].kind = "response"
-    }
-  }
-
-  // Render one stable process disclosure per user turn. Agent loops commonly
-  // alternate narration and tools several times; mirroring those alternations
-  // as separate disclosures makes settled content appear to be regenerated.
-  // Bucketing retains the order inside each lane without constraining the
-  // agent's native loop or rewriting its transcript.
-  const processBlocks = classified.filter(({ kind }) => kind === "process").map(({ item }) => item)
-  const responseBlocks = classified.filter(({ kind }) => kind === "response").map(({ item }) => item)
   const segments: AssistantTimelineSegment[] = []
-  if (processBlocks.length > 0) {
-    const first = processBlocks[0]
-    segments.push({ kind: "process", key: first ? blockKey(first) : "process", blocks: processBlocks })
+  let phase: AssistantTimelinePhase = "response"
+  let pendingText: AssistantTimelineBlock[] = []
+  const append = (kind: AssistantTimelineSegmentKind, items: AssistantTimelineBlock[]): void => {
+    if (items.length === 0) return
+    const current = segments.at(-1)
+    if (current?.kind === kind) {
+      current.blocks.push(...items)
+      return
+    }
+    const first = items[0]
+    segments.push({ kind, key: first ? blockKey(first) : kind, blocks: items })
   }
-  if (responseBlocks.length > 0) {
-    const first = responseBlocks[0]
-    segments.push({ kind: "response", key: first ? blockKey(first) : "response", blocks: responseBlocks })
+  const flushPending = (kind: AssistantTimelinePhase): void => {
+    append(kind, pendingText)
+    pendingText = []
+  }
+
+  for (const item of blocks) {
+    const kind = blockSegmentKind(item, phase)
+    if (item.block.kind === "tools" || (item.block.kind === "status" && kind === "process")) {
+      flushPending("process")
+      phase = "process"
+      append("process", [item])
+      continue
+    }
+    if (item.block.kind === "text" && kind === "process") {
+      pendingText.push(item)
+      continue
+    }
+    if (item.block.kind === "text" && kind === "response" && item.message.finishReason) {
+      flushPending("process")
+      phase = "response"
+      append("response", [item])
+      continue
+    }
+    if (item.block.kind === "attachment") {
+      flushPending("response")
+      phase = "response"
+      append("response", [item])
+      continue
+    }
+    flushPending("process")
+    append(kind, [item])
+  }
+  if (pendingText.length > 0) {
+    const activeMessageId = options.activeAssistantMessageId
+    if (activeMessageId === undefined) {
+      append("response", pendingText)
+    } else {
+      append(
+        "response",
+        pendingText.filter((item) => item.message.id !== activeMessageId),
+      )
+      append(
+        "pending",
+        pendingText.filter((item) => item.message.id === activeMessageId),
+      )
+    }
   }
   return segments
 }

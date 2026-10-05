@@ -1,24 +1,23 @@
-import type { Team, TeamProviderOption } from "../../../electron/teams/common.ts"
-import type { MemberSearchState, MemberView, ProviderAccessForm } from "./team-management-model.ts"
+import type { Team } from "../../../electron/teams/common.ts"
+import type { MemberSearchState } from "./team-management-model.ts"
 
-import { CheckIcon, LoaderCircleIcon, PencilIcon, PlusIcon, SearchIcon, UploadIcon, XIcon } from "lucide-react"
+import { LoaderCircleIcon, PencilIcon, PlusIcon, SearchIcon, UploadIcon, XIcon } from "lucide-react"
 import * as React from "react"
 import {
-  filterTeamProviderOptions,
   maxTeamNameLength,
   minimumMemberSearchLength,
+  resolveMemberInput,
   teamNameValidation,
-  userFallback,
 } from "./team-management-model.ts"
 import { TeamUserAvatar } from "./TeamUserAvatar.tsx"
 import { CachedAvatarImage } from "@/components/CachedAvatarImage"
 import { Button } from "@/components/ui/button"
 import { Dialog } from "@/components/ui/dialog"
+import { Field, FieldSet, FieldLabel, FieldDescription } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
 import { Label } from "@/components/ui/label"
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Separator } from "@/components/ui/separator"
 import { teamAvatarStyle, teamInitials } from "@/hooks/useTeamWorkspace"
 import { useAppI18n } from "@/i18n"
 import { cn } from "@/lib/utils"
@@ -100,6 +99,7 @@ export function TeamProfileSettingsPanel({
   avatarFile,
   busy,
   editing,
+  error,
   name,
   nameError,
   onAvatarChange,
@@ -113,6 +113,7 @@ export function TeamProfileSettingsPanel({
   avatar: string
   avatarFile: File | null
   busy: boolean
+  error?: string | null
   editing: boolean
   name: string
   nameError: string | null
@@ -125,7 +126,9 @@ export function TeamProfileSettingsPanel({
   team: Team
 }) {
   const { t } = useAppI18n()
-  const disabled = teamNameValidation(name.trim()) !== "valid" || Boolean(nameError) || busy
+  const nameInputRef = React.useRef<HTMLInputElement>(null)
+  const dirty = Boolean(avatarFile) || name.trim() !== team.name || avatar.trim() !== team.avatar.trim()
+  const disabled = !dirty || teamNameValidation(name.trim()) !== "valid" || Boolean(nameError) || busy
   const avatarPreviewUrl = useObjectUrl(avatarFile)
 
   if (!editing) {
@@ -147,14 +150,14 @@ export function TeamProfileSettingsPanel({
   }
 
   return (
-    <section className="min-w-0 overflow-hidden rounded-md border border-[var(--oo-divider)] bg-background">
-      <div className="border-b border-[var(--oo-divider)] px-3 py-2.5">
+    <section className="min-w-0 bg-background">
+      <div className="pb-4">
         <h2 className="oo-text-title text-foreground">{t("teams.teamProfile")}</h2>
-        <p className="oo-text-caption mt-0.5 text-muted-foreground">{t("teams.editTeamDescription")}</p>
       </div>
       <form onSubmit={onSubmit}>
-        <div className="grid gap-4 p-3">
+        <FieldSet disabled={busy}>
           <TeamAvatarField
+            compact
             avatar={avatar}
             file={avatarFile}
             name={name || team.name}
@@ -168,30 +171,54 @@ export function TeamProfileSettingsPanel({
             }}
             onFileChange={onAvatarFileChange}
           />
-          <div className="grid gap-2">
-            <Label htmlFor="edit-team-name">{t("teams.teamName")}</Label>
-            <Input
-              id="edit-team-name"
-              value={name}
-              maxLength={maxTeamNameLength}
-              aria-invalid={Boolean(nameError)}
-              autoFocus
-              onChange={(event) => onNameChange(event.currentTarget.value)}
-            />
-            {nameError ? (
-              <p className="oo-text-caption-compact text-destructive">{nameError}</p>
-            ) : (
-              <p className="oo-text-caption-compact text-muted-foreground">{t("teams.teamNameDescription")}</p>
-            )}
-          </div>
-        </div>
-        <div className="flex justify-end gap-2 border-t border-[var(--oo-divider)] px-3 py-2.5">
-          <Button type="button" variant="outline" disabled={busy} onClick={onClose}>
-            {t("common.cancel")}
-          </Button>
+          <Separator />
+          <Field data-invalid={Boolean(nameError)} className="grid gap-2 sm:grid-cols-[96px_minmax(0,1fr)] sm:gap-5">
+            <FieldLabel htmlFor="edit-team-name" className="sm:pt-2">
+              {t("teams.teamName")}
+            </FieldLabel>
+            <div className="flex min-w-0 flex-col gap-2">
+              <Input
+                ref={nameInputRef}
+                id="edit-team-name"
+                value={name}
+                maxLength={maxTeamNameLength}
+                aria-invalid={Boolean(nameError)}
+                aria-describedby="edit-team-name-hint"
+                disabled={busy}
+                onChange={(event) => onNameChange(event.currentTarget.value)}
+              />
+              {nameError ? (
+                <p id="edit-team-name-hint" role="alert" className="oo-text-caption-compact text-destructive">
+                  {nameError}
+                </p>
+              ) : (
+                <FieldDescription id="edit-team-name-hint">{t("teams.teamNameDescription")}</FieldDescription>
+              )}
+            </div>
+          </Field>
+        </FieldSet>
+        {error ? (
+          <p role="alert" className="oo-text-caption mt-4 text-destructive">
+            {error}
+          </p>
+        ) : null}
+        <div className="mt-5 flex justify-end gap-2">
+          {dirty ? (
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={busy}
+              onClick={() => {
+                onClose()
+                nameInputRef.current?.focus()
+              }}
+            >
+              {t("teams.revertChanges")}
+            </Button>
+          ) : null}
           <Button type="submit" disabled={disabled}>
             {busy ? <LoaderCircleIcon className="size-3.5 animate-spin" /> : null}
-            {busy ? t("teams.savingTeam") : t("common.save")}
+            {busy ? t("teams.savingTeam") : t("teams.saveChanges")}
           </Button>
         </div>
       </form>
@@ -244,6 +271,7 @@ function useObjectUrl(file: File | null): string {
 }
 
 function TeamAvatarField({
+  compact = false,
   avatar = "",
   file,
   name,
@@ -254,6 +282,7 @@ function TeamAvatarField({
   title,
   uploading = false,
 }: {
+  compact?: boolean
   avatar?: string
   file: File | null
   name: string
@@ -274,12 +303,15 @@ function TeamAvatarField({
   const fallbackStyle = imageVisible ? undefined : teamAvatarStyle(seed || name || "team")
 
   return (
-    <div className="grid gap-2">
-      <Label htmlFor={inputId}>{title}</Label>
+    <div className={cn("grid gap-2", compact && "sm:grid-cols-[96px_minmax(0,1fr)] sm:gap-5")}>
+      <Label htmlFor={inputId} className={compact ? "sm:self-start sm:pt-2" : undefined}>
+        {title}
+      </Label>
       <div className="flex min-w-0 items-center gap-3">
         <span
           className={cn(
-            "relative flex size-16 shrink-0 items-center justify-center overflow-hidden rounded-md text-lg font-medium",
+            "relative flex shrink-0 items-center justify-center overflow-hidden rounded-md text-lg font-medium",
+            compact ? "size-12" : "size-16",
             imageVisible ? "bg-transparent text-transparent" : "border border-[var(--oo-frame-border)] text-foreground",
           )}
           style={fallbackStyle}
@@ -349,7 +381,7 @@ function TeamAvatarField({
             ) : null}
           </div>
           <p className="oo-text-caption-compact truncate text-muted-foreground">
-            {file ? file.name : t("teams.teamAvatarUploadHint")}
+            {file ? file.name : t(compact ? "teams.profileSaveHint" : "teams.teamAvatarUploadHint")}
           </p>
         </div>
       </div>
@@ -361,6 +393,7 @@ export function AddMemberDialog({
   activeUserId,
   addError,
   busy,
+  submitDisabled = false,
   input,
   selectedUserId,
   onClose,
@@ -374,6 +407,7 @@ export function AddMemberDialog({
   activeUserId: string | null
   addError: string | null
   busy: boolean
+  submitDisabled?: boolean
   input: string
   selectedUserId: string | null
   onClose: () => void
@@ -385,9 +419,9 @@ export function AddMemberDialog({
   search: MemberSearchState
 }) {
   const { t } = useAppI18n()
+  const searchInputRef = React.useRef<HTMLInputElement>(null)
   const hasSearchResults = search.items.length > 0
-  const canSubmit =
-    input.trim().length > 0 && !busy && !search.loading && (!hasSearchResults || Boolean(selectedUserId))
+  const canSubmit = !busy && !submitDisabled && Boolean(resolveMemberInput(input, search, selectedUserId))
 
   const handleInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>): void => {
     switch (event.key) {
@@ -422,6 +456,8 @@ export function AddMemberDialog({
     <Dialog
       open={open}
       onClose={onClose}
+      initialFocus={() => searchInputRef.current}
+      closeLabel={t("common.close")}
       title={t("teams.addMember")}
       description={t("teams.addMemberDescription")}
       footer={
@@ -444,6 +480,7 @@ export function AddMemberDialog({
               <SearchIcon />
             </InputGroupAddon>
             <InputGroupInput
+              ref={searchInputRef}
               id="team-member-search"
               type="search"
               value={input}
@@ -530,13 +567,13 @@ function MemberSearchResults({
                 className={cn(
                   "relative flex w-full min-w-0 items-center gap-3 rounded-md px-2 py-2 text-left hover:bg-accent/70 hover:text-accent-foreground",
                   active && "bg-accent text-accent-foreground",
+                  selected && "bg-secondary text-secondary-foreground hover:bg-secondary",
                 )}
                 disabled={busy}
                 aria-selected={selected}
                 role="option"
                 onClick={() => onSelect(user)}
               >
-                {active ? <span className="absolute inset-y-2 left-0 w-0.5 rounded-full bg-primary" /> : null}
                 <TeamUserAvatar avatar={user.avatar} fallback={user.fallback} />
                 <span className="min-w-0 flex-1">
                   <span className="oo-text-label block truncate">{user.displayName}</span>
@@ -549,7 +586,6 @@ function MemberSearchResults({
                     {user.username}
                   </span>
                 </span>
-                {selected ? <CheckIcon className="size-4 shrink-0" /> : null}
               </button>
             )
           })}
@@ -560,228 +596,6 @@ function MemberSearchResults({
       {showEmpty ? <DialogHint>{t("teams.noUsersFoundCanAddId")}</DialogHint> : null}
       {search.error ? <DialogHint danger>{search.error}</DialogHint> : null}
       {error ? <DialogHint danger>{error}</DialogHint> : null}
-    </div>
-  )
-}
-
-export function ProviderAccessDialog({
-  busy,
-  form,
-  memberOptions,
-  onClose,
-  onFormChange,
-  onSubmit,
-  providerOptions,
-}: {
-  busy: boolean
-  form: ProviderAccessForm
-  memberOptions: MemberView[]
-  onClose: () => void
-  onFormChange: React.Dispatch<React.SetStateAction<ProviderAccessForm>>
-  onSubmit: (event: React.FormEvent) => void
-  providerOptions: TeamProviderOption[]
-}) {
-  const { t } = useAppI18n()
-
-  return (
-    <Dialog
-      open={form.open}
-      onClose={onClose}
-      title={form.mode === "create" ? t("teams.grantProviderAccess") : t("teams.editProviderAccess")}
-      description={t("teams.providerAccessDescription")}
-      footer={
-        <>
-          <Button type="button" variant="outline" disabled={busy} onClick={onClose}>
-            {t("common.cancel")}
-          </Button>
-          <Button type="submit" form="provider-access-form" disabled={busy}>
-            {t("common.save")}
-          </Button>
-        </>
-      }
-    >
-      <form id="provider-access-form" className="grid gap-4" onSubmit={onSubmit}>
-        <div className="grid gap-2">
-          <Label htmlFor="provider-access-member">{t("teams.member")}</Label>
-          {form.mode === "create" && !form.userId ? (
-            <Select
-              value={form.userId}
-              onValueChange={(value) => onFormChange((current) => ({ ...current, userId: value ?? "" }))}
-            >
-              <SelectTrigger id="provider-access-member" className="w-full">
-                <SelectValue placeholder={t("teams.memberRequired")} />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {memberOptions.map((member) => (
-                    <SelectItem key={member.user_id} value={member.user_id}>
-                      {member.displayName}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          ) : (
-            <MemberDisplay userId={form.userId} members={memberOptions} />
-          )}
-        </div>
-        <div className="grid gap-2">
-          <Label>{t("teams.connectionScope")}</Label>
-          <ProviderSelect
-            allProviders={form.allProviders}
-            allProvidersLabel={t("teams.allProviders")}
-            emptyLabel={t("teams.emptyProviders")}
-            options={providerOptions}
-            selectLabel={t("teams.selectProviders")}
-            selectedProviders={form.providers}
-            onAllProvidersChange={(allProviders) =>
-              onFormChange((current) => ({
-                ...current,
-                allProviders,
-                providers: allProviders ? [] : current.providers,
-              }))
-            }
-            onToggleProvider={(service) =>
-              onFormChange((current) => ({
-                ...current,
-                allProviders: false,
-                providers: current.providers.includes(service)
-                  ? current.providers.filter((item) => item !== service)
-                  : [...current.providers, service].sort(),
-              }))
-            }
-          />
-        </div>
-      </form>
-    </Dialog>
-  )
-}
-
-function ProviderSelect({
-  allProviders,
-  allProvidersLabel,
-  emptyLabel,
-  onAllProvidersChange,
-  onToggleProvider,
-  options,
-  selectLabel,
-  selectedProviders,
-}: {
-  allProviders: boolean
-  allProvidersLabel: string
-  emptyLabel: string
-  onAllProvidersChange: (value: boolean) => void
-  onToggleProvider: (service: string) => void
-  options: TeamProviderOption[]
-  selectLabel: string
-  selectedProviders: string[]
-}) {
-  const { t } = useAppI18n()
-  const [open, setOpen] = React.useState(false)
-  const [query, setQuery] = React.useState("")
-  const closePopover = React.useCallback(() => {
-    setOpen(false)
-    setQuery("")
-  }, [])
-  const labelsByService = React.useMemo(
-    () => new Map(options.map((option) => [option.service, option.label])),
-    [options],
-  )
-  const filteredOptions = React.useMemo(() => filterTeamProviderOptions(options, query), [options, query])
-  const label = allProviders
-    ? allProvidersLabel
-    : selectedProviders.map((service) => labelsByService.get(service) ?? service).join(", ")
-
-  return (
-    <Popover
-      open={open}
-      onOpenChange={(nextOpen) => {
-        if (nextOpen) {
-          setOpen(true)
-        } else {
-          closePopover()
-        }
-      }}
-    >
-      <PopoverTrigger asChild>
-        <Button type="button" variant="outline" className="w-full justify-between">
-          <span className="min-w-0 truncate text-left">{label || selectLabel}</span>
-          {allProviders ? null : <span className="shrink-0 text-muted-foreground">{selectedProviders.length}</span>}
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent align="start" sideOffset={6} className="w-[min(26rem,calc(100vw-2rem))] p-1">
-        <button
-          type="button"
-          className="oo-text-body flex w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 py-2 text-left hover:bg-accent hover:text-accent-foreground"
-          onClick={() => {
-            onAllProvidersChange(true)
-            closePopover()
-          }}
-        >
-          <span className="truncate">{allProvidersLabel}</span>
-          {allProviders ? <CheckIcon className="size-4" /> : null}
-        </button>
-        <div className="my-1 h-px bg-border" />
-        {options.length > 0 ? (
-          <InputGroup className="mb-1">
-            <InputGroupAddon>
-              <SearchIcon className="size-4" />
-            </InputGroupAddon>
-            <InputGroupInput
-              value={query}
-              aria-label={t("teams.searchProviders")}
-              placeholder={t("teams.searchProviders")}
-              autoFocus
-              onChange={(event) => setQuery(event.currentTarget.value)}
-            />
-          </InputGroup>
-        ) : null}
-        {options.length === 0 ? (
-          <div className="oo-text-body px-2 py-6 text-center text-muted-foreground">{emptyLabel}</div>
-        ) : filteredOptions.length === 0 ? (
-          <div className="oo-text-body px-2 py-6 text-center text-muted-foreground">{t("teams.noProviderMatches")}</div>
-        ) : (
-          <div className="max-h-64 overflow-y-auto">
-            {filteredOptions.map((provider) => {
-              const selected = !allProviders && selectedProviders.includes(provider.service)
-              return (
-                <button
-                  type="button"
-                  key={provider.service}
-                  className="oo-list-render-boundary flex w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 py-2 text-left hover:bg-accent hover:text-accent-foreground"
-                  onClick={() => {
-                    onToggleProvider(provider.service)
-                    closePopover()
-                  }}
-                >
-                  <span className="min-w-0">
-                    <span className="oo-text-body block truncate">{provider.label}</span>
-                    <span className="oo-text-caption-compact block truncate font-mono text-muted-foreground">
-                      {provider.service}
-                    </span>
-                  </span>
-                  {selected ? <CheckIcon className="size-4 shrink-0" /> : null}
-                </button>
-              )
-            })}
-          </div>
-        )}
-      </PopoverContent>
-    </Popover>
-  )
-}
-
-function MemberDisplay({ members, userId }: { members: MemberView[]; userId: string }) {
-  const member = members.find((item) => item.user_id === userId)
-  const label = member?.displayName ?? userId
-  const secondary = member?.secondaryLabel ?? userId
-  return (
-    <div className="flex min-h-9 min-w-0 items-center gap-3 rounded-md border bg-muted/40 px-3 py-2">
-      <TeamUserAvatar avatar={member?.avatar ?? ""} fallback={member?.fallback ?? userFallback(label)} />
-      <span className="min-w-0">
-        <span className="oo-text-label block truncate">{label}</span>
-        <span className="oo-text-caption-compact block truncate font-mono text-muted-foreground">{secondary}</span>
-      </span>
     </div>
   )
 }

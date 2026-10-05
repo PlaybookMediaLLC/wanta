@@ -31,12 +31,18 @@ interface ScaleChangingEvent {
 
 export default function ArtifactPdfPreview({
   source,
+  data,
   name,
   onResourceError,
+  onResourceLoaded,
+  onRetry,
 }: {
-  source: string
+  source?: string
+  data?: Uint8Array
   name: string
   onResourceError?: () => void
+  onResourceLoaded?: () => void
+  onRetry?: () => void
 }) {
   const t = useT()
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null)
@@ -52,11 +58,13 @@ export default function ArtifactPdfPreview({
   React.useEffect(() => {
     const scrollContainer = scrollContainerRef.current
     const pagesContainer = pagesContainerRef.current
-    if (!scrollContainer || !pagesContainer) {
+    if (!scrollContainer || !pagesContainer || (!source && !data)) {
       return
     }
 
     let cancelled = false
+    let reportedResourceLoaded = false
+    let resourceFailed = false
     let pagesInitialized = false
     let resizeFrame: number | null = null
     const abortController = new AbortController()
@@ -106,9 +114,19 @@ export default function ArtifactPdfPreview({
         setScale(nextScale)
       }
     }
-    const handlePageRendered = (): void => {
-      if (!cancelled) {
-        setLoading(false)
+    const handlePageRendered = ({ error }: { error?: unknown }): void => {
+      if (cancelled) return
+      setLoading(false)
+      if (error) {
+        if (!isCancellation(error)) {
+          resourceFailed = true
+          setLoadFailed(true)
+          onResourceError?.()
+        }
+      } else if (!reportedResourceLoaded && !resourceFailed) {
+        // Later page/zoom renders must not replenish a failed document's retry budget.
+        reportedResourceLoaded = true
+        onResourceLoaded?.()
       }
     }
 
@@ -134,11 +152,11 @@ export default function ArtifactPdfPreview({
     })
     resizeObserver.observe(scrollContainer)
 
-    const task: PDFDocumentLoadingTask = pdfjs.getDocument(source)
+    const task: PDFDocumentLoadingTask = pdfjs.getDocument(data ? { data: data.slice() } : { url: source })
     void task.promise
       .then((document: PDFDocumentProxy) => {
         if (cancelled) {
-          void document.destroy()
+          void task.destroy()
           return
         }
         setNumPages(document.numPages)
@@ -147,6 +165,7 @@ export default function ArtifactPdfPreview({
       })
       .catch((error: unknown) => {
         if (!cancelled && !isCancellation(error)) {
+          resourceFailed = true
           setLoadFailed(true)
           setLoading(false)
           onResourceError?.()
@@ -172,7 +191,7 @@ export default function ArtifactPdfPreview({
       }
       void task.destroy()
     }
-  }, [onResourceError, source])
+  }, [data, onResourceError, onResourceLoaded, source])
 
   const changePage = React.useCallback((delta: number) => {
     const viewer = viewerRef.current
@@ -192,7 +211,7 @@ export default function ArtifactPdfPreview({
   }, [])
 
   return (
-    <div className="flex min-h-full min-w-0 flex-col bg-[var(--oo-artifact-preview-canvas)]">
+    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--oo-artifact-preview-canvas)]">
       <div className="oo-border-divider flex h-10 shrink-0 items-center justify-between gap-2 border-b bg-background px-3">
         <div className="oo-text-caption-compact min-w-0 truncate text-muted-foreground">
           <span className="font-medium text-foreground">{name}</span>
@@ -257,6 +276,11 @@ export default function ArtifactPdfPreview({
         {loading || loadFailed ? (
           <div className="oo-text-body pointer-events-none absolute inset-0 flex items-center justify-center px-4 py-8 text-center text-muted-foreground">
             {loadFailed ? t("artifacts.previewReadFailed") : t("artifacts.previewLoading")}
+            {loadFailed && onRetry ? (
+              <Button className="pointer-events-auto ml-3" onClick={onRetry}>
+                {t("artifacts.retry")}
+              </Button>
+            ) : null}
           </div>
         ) : null}
       </div>

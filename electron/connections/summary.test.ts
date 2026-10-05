@@ -3,7 +3,13 @@ import { test } from "vitest"
 import { mergeConnectionSummary, normalizeConnectionAppDetail, normalizeFederatedCredentialConfig } from "./summary.ts"
 
 const providers = [
-  { service: "gmail", displayName: "Gmail", authTypes: ["oauth2" as const], categories: [{ displayName: "Email" }] },
+  {
+    service: "gmail",
+    displayName: "Gmail",
+    searchAliases: [" Google Mail ", "Gmail", "Google Mail", ""],
+    authTypes: ["oauth2" as const],
+    categories: [{ displayName: "电子邮件", id: "communication" }],
+  },
   { service: "quickchart", displayName: "QuickChart", authTypes: ["no_auth" as const] },
   { service: "ably", displayName: "Ably", authTypes: ["api_key" as const] },
 ]
@@ -19,7 +25,9 @@ test("merge marks connected providers and computes counts", () => {
   assert.equal(gmail?.status, "connected")
   assert.equal(gmail?.appStatus, "active")
   assert.equal(gmail?.canDisconnect, true)
-  assert.deepEqual(gmail?.categoryLabels, ["Email"])
+  assert.deepEqual(gmail?.categoryIds, ["communication"])
+  assert.deepEqual(gmail?.categoryLabels, ["电子邮件"])
+  assert.deepEqual(gmail?.searchAliases, ["Google Mail", "Gmail"])
   assert.equal(gmail?.appCount, 1)
 })
 
@@ -34,7 +42,7 @@ test("connected providers sort before available ones", () => {
 
 test("pure no_auth connected provider cannot be disconnected", () => {
   const summary = mergeConnectionSummary({
-    apps: [{ id: "app-1", service: "quickchart", status: "active" }],
+    apps: [{ authType: "no_auth", id: "app-1", service: "quickchart", status: "active" }],
     providers,
   })
   const quickchart = summary.providers.find((provider) => provider.service === "quickchart")
@@ -46,7 +54,7 @@ test("pure no_auth connected provider cannot be disconnected", () => {
 
 test("non-active app becomes needs_attention", () => {
   const summary = mergeConnectionSummary({
-    apps: [{ id: "app-1", service: "ably", status: "reauth_required" }],
+    apps: [{ authType: "api_key", id: "app-1", service: "ably", status: "reauth_required" }],
     providers,
   })
   const ably = summary.providers.find((provider) => provider.service === "ably")
@@ -166,6 +174,105 @@ test("merge preserves multiple apps for one provider", () => {
   )
 })
 
+test("normalizes an OOMOL Marketplace virtual connection without exposing credential mutations", () => {
+  const summary = mergeConnectionSummary({
+    apps: [
+      {
+        accountLabel: "OOMOL Marketplace",
+        authType: "marketplace",
+        connectionName: "marketplace_oomol",
+        id: "marketplace:oomol:ably",
+        isDefault: true,
+        marketplace: { id: "oomol", pricing: "metered" },
+        service: "ably",
+        status: "active",
+        updatedAt: 0,
+      },
+    ],
+    meta: { summary: { connectedProviderCount: 1 } },
+    providers,
+  })
+  const ably = summary.providers.find((provider) => provider.service === "ably")
+
+  assert.equal(ably?.status, "connected")
+  assert.equal(ably?.appAuthType, "marketplace")
+  assert.equal(ably?.appCount, 1)
+  assert.equal(ably?.canDisconnect, false)
+  assert.equal(ably?.apps[0]?.connectionName, "marketplace_oomol")
+  assert.deepEqual(ably?.apps[0]?.marketplace, { id: "oomol", pricing: "metered" })
+  assert.equal(summary.connectedProviderCount, 1)
+})
+
+test("keeps Marketplace and user credentials as separate selectable connections", () => {
+  const summary = mergeConnectionSummary({
+    apps: [
+      {
+        authType: "marketplace",
+        id: "marketplace:oomol:ably",
+        isDefault: false,
+        marketplace: { id: "oomol", pricing: "metered" },
+        service: "ably",
+        status: "active",
+        updatedAt: 0,
+      },
+      {
+        accountLabel: "My key",
+        authType: "api_key",
+        id: "app-user-key",
+        isDefault: true,
+        service: "ably",
+        status: "active",
+        updatedAt: 20,
+      },
+      {
+        accountLabel: "Backup key",
+        authType: "api_key",
+        id: "app-backup-key",
+        isDefault: false,
+        service: "ably",
+        status: "active",
+        updatedAt: 10,
+      },
+    ],
+    providers,
+  })
+  const ably = summary.providers.find((provider) => provider.service === "ably")
+
+  assert.equal(ably?.appCount, 3)
+  assert.equal(ably?.appId, "app-user-key")
+  assert.equal(ably?.appAuthType, "api_key")
+  assert.equal(ably?.canDisconnect, true)
+  assert.deepEqual(
+    ably?.apps.map((app) => app.id),
+    ["marketplace:oomol:ably", "app-user-key", "app-backup-key"],
+  )
+})
+
+test("removes Marketplace availability when the virtual app disappears from the current catalog", () => {
+  const summary = mergeConnectionSummary({ apps: [], providers })
+  const ably = summary.providers.find((provider) => provider.service === "ably")
+
+  assert.equal(ably?.status, "available")
+  assert.equal(ably?.appCount, 0)
+  assert.equal(ably?.appAuthType, undefined)
+})
+
+test("fails closed on active apps with missing or unknown auth types", () => {
+  const summary = mergeConnectionSummary({
+    apps: [
+      { authType: "future_server_managed", id: "managed-unknown", service: "ably", status: "active" },
+      { id: "managed-missing", service: "ably", status: "active" },
+    ],
+    providers,
+  })
+  const ably = summary.providers.find((provider) => provider.service === "ably")
+
+  assert.deepEqual(summary.apps, [])
+  assert.equal(ably?.status, "available")
+  assert.equal(ably?.appCount, 0)
+  assert.equal(ably?.canDisconnect, false)
+})
+
 test("merge exposes connection account labels for UI distinction", () => {
   const summary = mergeConnectionSummary({
     apps: [
@@ -216,6 +323,23 @@ test("merge normalizes OAuth client config metadata for setup dialogs", () => {
           nextConnectSource: "unconfigured",
           tokenEndpointAuthMethod: "client_secret_basic",
           oauthScopes: ["tweet.read", "users.read"],
+          authorizationOptions: [
+            {
+              id: "tweet.read",
+              label: "Read posts",
+              description: "Read posts from the account.",
+              required: true,
+              defaultSelected: true,
+              risk: "sensitive",
+              requires: ["tweet.read", "users.read", "missing"],
+            },
+            {
+              id: "users.read",
+              label: "Read users",
+              description: "Read user profiles.",
+              risk: "unexpected",
+            },
+          ],
           clientConfigFields: [
             {
               key: "appBearerToken",
@@ -237,6 +361,26 @@ test("merge normalizes OAuth client config metadata for setup dialogs", () => {
   assert.equal(twitter?.oauthClientConfig?.clientConfigPolicy, "user_required")
   assert.equal(twitter?.oauthClientConfig?.tokenEndpointAuthMethod, "client_secret_basic")
   assert.deepEqual(twitter?.oauthClientConfig?.oauthScopes, ["tweet.read", "users.read"])
+  assert.deepEqual(twitter?.oauthClientConfig?.authorizationOptions, [
+    {
+      defaultSelected: true,
+      description: "Read posts from the account.",
+      id: "tweet.read",
+      label: "Read posts",
+      required: true,
+      requires: ["users.read"],
+      risk: "sensitive",
+    },
+    {
+      defaultSelected: false,
+      description: "Read user profiles.",
+      id: "users.read",
+      label: "Read users",
+      required: false,
+      requires: [],
+      risk: "standard",
+    },
+  ])
   assert.equal(twitter?.oauthClientConfig?.clientConfigFields[0]?.location, "secretExtra")
   assert.equal(twitter?.oauthClientConfig?.clientConfigFields[0]?.secret, true)
   assert.deepEqual(twitter?.oauthClientConfig?.clientConfigFields[0]?.defaultValue, ["keep", "safe"])
@@ -248,6 +392,7 @@ test("normalizes app credential detail without exposing unknown fields", () => {
     service: "aliyun_sts",
     authType: "federated",
     status: "active",
+    scopes: [" read ", "write", "read", ""],
     comment: "developer role",
     credentialFields: [
       { key: "roleArn", label: "Role ARN", displayValue: "acs:ram::123:role/dev", secret: false },
@@ -264,6 +409,7 @@ test("normalizes app credential detail without exposing unknown fields", () => {
   })
 
   assert.equal(app?.comment, "developer role")
+  assert.deepEqual(app?.scopes, ["read", "write"])
   assert.deepEqual(app?.credentialFields, [
     { key: "roleArn", label: "Role ARN", displayValue: "acs:ram::123:role/dev", secret: false },
     { key: "token", label: "Token", displayValue: "redacted", secret: true },

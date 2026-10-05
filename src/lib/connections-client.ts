@@ -4,6 +4,7 @@ import type {
   ConnectionAppDetail,
   ConnectionExecutionLogRequest,
   ConnectionExecutionLogSummary,
+  ConnectionLingxingErpUser,
   ConnectionProviderDetail,
   ConnectionSummary,
   ConnectionUserOAuthClientConfigSummary,
@@ -16,6 +17,7 @@ import { branding } from "../../electron/branding.ts"
 import { createConnectorOAuthReturnUri, parseConnectorAuthorizationUrl } from "../../electron/connections/domain.ts"
 import { normalizeConnectionExecutionLogs } from "../../electron/connections/executions.ts"
 import { createFederatedConnectBody } from "../../electron/connections/federated.ts"
+import { providerIconSpriteFromMeta } from "../../electron/connections/provider-icon.ts"
 import {
   mergeConnectionSummary,
   normalizeConnectionAppDetail,
@@ -26,6 +28,12 @@ import {
   normalizeProvider,
 } from "../../electron/connections/summary.ts"
 import { connectionWorkspaceKey, isConnectionManagementWorkspace } from "@/lib/connection-workspace"
+import {
+  clearPersistentConnectionAppsCache,
+  invalidatePersistentWorkspaceApps,
+  readPersistentConnectorCache,
+  writePersistentConnectorCache,
+} from "@/lib/connections-persistent-cache"
 import { connectorBaseUrl, consoleBaseUrl } from "@/lib/domain"
 import { oomolFetch } from "@/lib/oomol-http"
 import { reportRendererHandledError } from "@/lib/renderer-diagnostics"
@@ -89,12 +97,21 @@ interface ConnectorCacheEntry {
 }
 
 export interface ConnectorReadOptions {
+  /** Cancellable reads are owned by one caller and are never shared. */
+  signal?: AbortSignal
   forceRefresh?: boolean
   /** 同一次 UI 刷新产生的强制读取可合并；新 mutation 使用新的 generation。 */
   refreshGeneration?: string
 }
 
+export interface ConnectionCatalogReadOptions extends ConnectorReadOptions {
+  /** Account mutations do not invalidate the public provider catalog. */
+  refreshProviders?: boolean
+  onProvidersLoaded?: (summary: ConnectionSummary) => void
+}
+
 interface ConnectorInFlightEntry {
+  signal?: AbortSignal
   promise: Promise<{ data: unknown; meta: unknown }>
   refreshGeneration?: string
 }
@@ -111,6 +128,7 @@ const connectorGetRequestVersions = new Map<string, number>()
 const oauthConnectInFlight = new Map<string, Promise<OAuthConnectStart>>()
 const oauthClientConfigsCache: OAuthClientConfigsCacheEntry = { data: null, fetchedAt: 0, promise: null }
 let connectorReadCacheGeneration = 0
+let connectorRequestSequence = 0
 
 function clearConnectorReadCache(): void {
   connectorReadCacheGeneration += 1
@@ -159,7 +177,7 @@ function invalidateConnectorReadCache(predicate: (cacheKey: string) => boolean):
     }
     connectorGetCache.delete(key)
     connectorGetInFlight.delete(key)
-    connectorGetRequestVersions.set(key, (connectorGetRequestVersions.get(key) ?? 0) + 1)
+    connectorGetRequestVersions.delete(key)
   }
 }
 
@@ -186,6 +204,7 @@ function invalidateWorkspaceApps(workspace: ConnectionWorkspace, appId?: string)
       (appId ? path === `${appsPath}/by-id/${encodeURIComponent(appId)}` : path.startsWith(`${appsPath}/by-id/`))
     )
   })
+  invalidatePersistentWorkspaceApps(workspace)
 }
 
 function clearOAuthClientConfigsCache(): void {
@@ -198,6 +217,11 @@ export function clearConnectorCache(): void {
   clearConnectorReadCache()
   clearOAuthClientConfigsCache()
   oauthConnectInFlight.clear()
+}
+
+export function clearConnectorAccountCache(): void {
+  clearConnectorCache()
+  clearPersistentConnectionAppsCache()
 }
 
 function asString(value: unknown): string | undefined {
@@ -283,12 +307,12 @@ async function readConnectorPayload(response: Response): Promise<unknown> {
 /** 变更类请求（POST/DELETE/PATCH/PUT）：不缓存，cookie 鉴权 + 可选团队头。 */
 async function requestConnector<T>(
   path: string,
-  workspace: ConnectionWorkspace,
+  workspace: ConnectionWorkspace | null,
   init: Omit<RequestInit, "headers"> & { headers?: Record<string, string> } = {},
 ): Promise<{ data: T; meta: unknown }> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...workspaceHeaders(workspace),
+    ...(workspace ? workspaceHeaders(workspace) : {}),
     ...init.headers,
   }
   const response = await oomolFetch(`${connectorBaseUrl}${path}`, {
@@ -308,20 +332,7 @@ async function requestConnectorGlobal<T>(
   path: string,
   init: Omit<RequestInit, "headers"> & { headers?: Record<string, string> } = {},
 ): Promise<{ data: T; meta: unknown }> {
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    ...init.headers,
-  }
-  const response = await oomolFetch(`${connectorBaseUrl}${path}`, {
-    ...init,
-    headers,
-    timeoutMs: connectorRequestTimeoutMs,
-  })
-  const payload = await readConnectorPayload(response)
-  if (!response.ok) {
-    throw connectorResponseError(path, response, payload)
-  }
-  return unwrapConnectorEnvelope<T>(payload)
+  return requestConnector<T>(path, null, init)
 }
 
 /** 读类 GET：带条件请求 + 30s TTL；团队资源按 workspace 隔离，公共目录使用 global 键。 */
@@ -330,8 +341,16 @@ async function getConnector<T>(
   workspace: ConnectionWorkspace | null,
   options: ConnectorReadOptions = {},
 ): Promise<{ data: T; meta: unknown }> {
+  options.signal?.throwIfAborted()
   const cacheKey = `${workspace ? connectionWorkspaceKey(workspace) : "global"}:${path}`
-  const cached = connectorGetCache.get(cacheKey)
+  let cached = connectorGetCache.get(cacheKey)
+  if (!cached) {
+    const persistent = readPersistentConnectorCache(path, workspace)
+    if (persistent) {
+      cached = { ...persistent, fetchedAt: 0 }
+      setConnectorCacheEntry(cacheKey, cached)
+    }
+  }
   const now = Date.now()
   if (!options.forceRefresh && cached && now - cached.fetchedAt < connectorGetCacheMs) {
     connectorGetCache.delete(cacheKey)
@@ -341,6 +360,8 @@ async function getConnector<T>(
   const inFlight = connectorGetInFlight.get(cacheKey)
   if (
     inFlight &&
+    !options.signal &&
+    !inFlight.signal &&
     (!options.forceRefresh ||
       (Boolean(options.refreshGeneration) && inFlight.refreshGeneration === options.refreshGeneration))
   ) {
@@ -348,9 +369,18 @@ async function getConnector<T>(
   }
 
   const requestGeneration = connectorReadCacheGeneration
-  const requestVersion = (connectorGetRequestVersions.get(cacheKey) ?? 0) + 1
+  // Globally unique versions prevent an invalidated request from matching a later read.
+  const requestVersion = ++connectorRequestSequence
   connectorGetRequestVersions.set(cacheKey, requestVersion)
-  const request = fetchConnectorGet<T>(path, workspace, cacheKey, cached, requestGeneration, requestVersion)
+  const request = fetchConnectorGet<T>(
+    path,
+    workspace,
+    cacheKey,
+    cached,
+    requestGeneration,
+    requestVersion,
+    options.signal,
+  )
   const trackedRequest = request.finally(() => {
     if (
       connectorGetRequestVersions.get(cacheKey) === requestVersion &&
@@ -362,6 +392,7 @@ async function getConnector<T>(
     }
   })
   connectorGetInFlight.set(cacheKey, {
+    signal: options.signal,
     promise: trackedRequest as Promise<{ data: unknown; meta: unknown }>,
     refreshGeneration: options.refreshGeneration,
   })
@@ -375,8 +406,10 @@ async function fetchConnectorGet<T>(
   cached: ConnectorCacheEntry | undefined,
   generation: number,
   requestVersion: number,
+  signal?: AbortSignal,
 ): Promise<{ data: T; meta: unknown }> {
   const response = await oomolFetch(`${connectorBaseUrl}${path}`, {
+    signal,
     headers: {
       ...(workspace ? workspaceHeaders(workspace) : {}),
       ...(cached?.etag ? { "if-none-match": cached.etag } : {}),
@@ -399,25 +432,46 @@ async function fetchConnectorGet<T>(
 
   const result = unwrapConnectorEnvelope<T>(payload)
   if (connectorReadCacheGeneration === generation && connectorGetRequestVersions.get(cacheKey) === requestVersion) {
-    setConnectorCacheEntry(cacheKey, {
+    const nextEntry = {
       data: result.data,
       etag: asString(response.headers.get("etag")),
       fetchedAt: Date.now(),
       lastModified: asString(response.headers.get("last-modified")),
       meta: result.meta,
-    })
+    }
+    setConnectorCacheEntry(cacheKey, nextEntry)
+    writePersistentConnectorCache(path, workspace, nextEntry)
   }
   return result
 }
 
 export async function getConnectionCatalogSummary(
   workspace: ConnectionWorkspace,
-  options: ConnectorReadOptions = {},
+  options: ConnectionCatalogReadOptions = {},
+  locale?: string,
 ): Promise<ConnectionSummary> {
+  let appsSettled = false
   const [appsResult, providersResult] = await Promise.allSettled([
-    getConnectionApps(workspace, options),
+    getConnectionApps(workspace, options).finally(() => {
+      appsSettled = true
+    }),
     // Provider 是公共发现目录，不应因当前团队的连接管理权限而不可见。
-    getConnectionProviders(options),
+    getConnectionProviders(options.refreshProviders === false ? { signal: options.signal } : options, locale).then(
+      (result) => {
+        if (!appsSettled)
+          options.onProvidersLoaded?.({
+            ...mergeConnectionSummary({
+              apps: [],
+              meta: null,
+              providers: result.data,
+              providerMeta: result.meta,
+              workspace,
+            }),
+            appsStatus: "loading",
+          })
+        return result
+      },
+    ),
   ])
   if (providersResult.status === "rejected") {
     throw providersResult.reason
@@ -444,9 +498,33 @@ export async function getConnectionCatalogSummary(
       apps: appsResult.status === "fulfilled" ? appsResult.value.data : [],
       meta: appsResult.status === "fulfilled" ? (appsResult.value.meta as RawAppListMeta | null) : null,
       providers: providersResult.value.data,
+      providerMeta: providersResult.value.meta,
       workspace,
     }),
     appsStatus,
+  }
+}
+
+export function getCachedConnectionCatalogSummary(
+  workspace: ConnectionWorkspace,
+  locale?: string,
+): ConnectionSummary | null {
+  const providersResult = readPersistentConnectorCache(connectionProvidersPath(locale), null)
+  if (!providersResult) return null
+  const appsResult = readPersistentConnectorCache(connectionAppsPath(workspace), workspace)
+  try {
+    return {
+      ...mergeConnectionSummary({
+        apps: (appsResult?.data as RawApp[] | undefined) ?? [],
+        meta: (appsResult?.meta as RawAppListMeta | null | undefined) ?? null,
+        providers: providersResult.data as RawProvider[],
+        providerMeta: providersResult.meta,
+        workspace,
+      }),
+      appsStatus: appsResult ? "ready" : "unavailable",
+    }
+  } catch {
+    return null
   }
 }
 
@@ -461,40 +539,67 @@ export function getConnectionApps(
 /** Provider 是全局公共目录，跨 workspace 复用条件请求缓存。 */
 export function getConnectionProviders(
   options: ConnectorReadOptions = {},
+  locale?: string,
 ): Promise<{ data: RawProvider[]; meta: unknown }> {
-  return getConnector<RawProvider[]>("/v1/providers", null, options)
+  return getConnector<RawProvider[]>(connectionProvidersPath(locale), null, options)
+}
+
+function connectionProvidersPath(locale?: string): string {
+  const search = locale ? `?${new URLSearchParams({ locale }).toString()}` : ""
+  return `/v1/providers${search}`
 }
 
 export function getConnectionActions(
   service: string,
   options: ConnectorReadOptions = {},
+  locale?: string,
 ): Promise<{ data: ConnectionActionCatalogItem[]; meta: unknown }> {
-  const search = new URLSearchParams({ service }).toString()
-  return getConnector<ConnectionActionCatalogItem[]>(`/v1/actions?${search}`, null, options)
+  const searchParams = new URLSearchParams({ service })
+  if (locale) searchParams.set("locale", locale)
+  return getConnector<ConnectionActionCatalogItem[]>(`/v1/actions?${searchParams.toString()}`, null, options)
+}
+
+export function getConnectionLingxingErpUsers(
+  appId: string,
+  workspace: ConnectionWorkspace,
+  options: ConnectorReadOptions = {},
+): Promise<{ data: ConnectionLingxingErpUser[]; meta: unknown }> {
+  requireConnectionManagement(workspace)
+  return getConnector<ConnectionLingxingErpUser[]>(
+    `${connectionAppsPath(workspace)}/by-id/${encodeURIComponent(appId)}/lingxing/erp-users`,
+    workspace,
+    options,
+  )
 }
 
 export async function getConnectionSummary(
   workspace: ConnectionWorkspace,
-  options: ConnectorReadOptions = {},
+  options: ConnectionCatalogReadOptions = {},
+  locale?: string,
 ): Promise<ConnectionSummary> {
-  return getConnectionCatalogSummary(workspace, options)
+  return getConnectionCatalogSummary(workspace, options, locale)
 }
 
 export async function getActiveConnectionAppIdsForService(
   service: string,
   workspace: ConnectionWorkspace,
+  signal?: AbortSignal,
 ): Promise<string[]> {
-  const appsResult = await getConnector<RawApp[]>(connectionAppsPath(workspace), workspace, { forceRefresh: true })
+  const appsResult = await getConnector<RawApp[]>(connectionAppsPath(workspace), workspace, {
+    forceRefresh: true,
+    signal,
+  })
   return appsResult.data
     .filter((app) => app.service === service && app.status === "active")
     .map((app) => asString(app.id))
     .filter((appId): appId is string => Boolean(appId))
 }
 
-export async function getConnectionProviderDetail(service: string): Promise<ConnectionProviderDetail> {
+export async function getConnectionProviderDetail(service: string, locale?: string): Promise<ConnectionProviderDetail> {
   // Provider 详情属于公共目录；账号状态已经由摘要提供，不再为打开详情重复读取整套摘要与 usage。
-  const providerResult = await getConnector<RawProvider>(`/v1/providers/${encodeURIComponent(service)}`, null)
-  const provider = normalizeProvider(providerResult.data, new Map())
+  const search = locale ? `?${new URLSearchParams({ locale }).toString()}` : ""
+  const providerResult = await getConnector<RawProvider>(`/v1/providers/${encodeURIComponent(service)}${search}`, null)
+  const provider = normalizeProvider(providerResult.data, new Map(), providerIconSpriteFromMeta(providerResult.meta))
   if (!provider) {
     throw new Error(`Provider ${service} is not available`)
   }
@@ -548,9 +653,9 @@ export async function getConnectionExecutionLogs(
   return normalizeConnectionExecutionLogs(result.data)
 }
 
-export interface OAuthConnectStart {
-  authorizationUrl: string
-}
+export type OAuthConnectStart =
+  | { authorizationUrl: string; app?: never }
+  | { authorizationUrl?: never; app: ConnectionAppDetail }
 
 function oauthConnectInFlightKey(
   input: Extract<ConnectionConnectInput, { authType: "oauth2" }>,
@@ -559,7 +664,7 @@ function oauthConnectInFlightKey(
   // 只有完整请求相同才合并，避免重连或 connect-only 字段串用授权 URL。
   return JSON.stringify({
     appId: input.appId ?? null,
-    authorizationScopes: input.authorizationScopes ?? null,
+    authorizationOptionIds: input.authorizationOptionIds ?? null,
     extra: input.extra ?? null,
     secretExtra: input.secretExtra ?? null,
     service: input.service,
@@ -594,21 +699,25 @@ async function requestOAuthConnect(
   const path = input.appId
     ? `${appsPath}/by-id/${encodeURIComponent(input.appId)}/connect`
     : `${appsPath}/${service}/connect`
-  const result = await requestConnector<{ authorizationUrl?: unknown }>(path, workspace, {
+  const result = await requestConnector<{ authorizationUrl?: unknown; app?: RawApp }>(path, workspace, {
     method: "POST",
     body: JSON.stringify({
       returnUri: createConnectorOAuthReturnUri(consoleBaseUrl, connectorOAuthReturnProtocol()),
-      authorizationScopes: input.authorizationScopes,
+      authorizationOptionIds: input.authorizationOptionIds,
       extra: input.extra,
       secretExtra: input.secretExtra,
     }),
   })
   const authorizationUrl = asString(result.data.authorizationUrl)
-  if (!authorizationUrl) {
-    throw new Error("Connector connect request did not return an authorization URL")
+  const app = result.data.app ? normalizeConnectionAppDetail(result.data.app) : undefined
+  if (!authorizationUrl && !app) {
+    throw new Error("Connector connect request did not return an authorization URL or a connected app")
   }
-  invalidateWorkspaceApps(workspace, "appId" in input ? input.appId : undefined)
-  return { authorizationUrl: parseConnectorAuthorizationUrl(authorizationUrl).toString() }
+  invalidateWorkspaceApps(workspace, input.appId)
+  // Console's wire response permits both fields; an authorization URL takes precedence over app metadata.
+  return authorizationUrl
+    ? { authorizationUrl: parseConnectorAuthorizationUrl(authorizationUrl).toString() }
+    : { app: app! }
 }
 
 export async function listOAuthClientConfigs(): Promise<ConnectionUserOAuthClientConfigSummary[]> {
@@ -662,9 +771,10 @@ export async function upsertOAuthClientConfig(
   )
   clearOAuthClientConfigsCache()
   const encodedService = encodeURIComponent(service)
-  invalidateConnectorReadCache(
-    (key) => key === "global:/v1/providers" || key === `global:/v1/providers/${encodedService}`,
-  )
+  invalidateConnectorReadCache((key) => {
+    const resource = key.split("?")[0]
+    return resource === "global:/v1/providers" || resource === `global:/v1/providers/${encodedService}`
+  })
   return result.data
 }
 
@@ -738,4 +848,21 @@ export async function updateAlias(appId: string, alias: string, workspace: Conne
     body: JSON.stringify({ alias: alias.trim() === "" ? null : alias.trim() }),
   })
   invalidateWorkspaceApps(workspace, appId)
+}
+
+export async function setDefaultConnection(
+  service: string,
+  appId: string,
+  workspace: ConnectionWorkspace,
+): Promise<void> {
+  requireConnectionManagement(workspace)
+  await requestConnector(
+    `${connectionAppsPath(workspace)}/services/${encodeURIComponent(service)}/default`,
+    workspace,
+    {
+      method: "PUT",
+      body: JSON.stringify({ appId }),
+    },
+  )
+  invalidateWorkspaceApps(workspace)
 }

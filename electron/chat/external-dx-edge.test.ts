@@ -1,6 +1,7 @@
 import type { AgentEvent } from "../agent/contract/event.ts"
 import type {
   AgentSendOptions,
+  AuthenticateAgentInput,
   CancelAgentInput,
   PermissionResponseAgentInput,
   PromptAgentInput,
@@ -17,7 +18,7 @@ import type { UserAttachmentStore } from "./user-attachments.ts"
 
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
-import { mkdtemp, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, realpath, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { test, vi } from "vitest"
@@ -33,7 +34,7 @@ import { ChatServiceImpl } from "./node.ts"
 // resolution, plus the session-removal composition wired in electron/main.ts
 // (SessionServiceImpl.remove -> adapter.forgetSession + chatService.forgetSession).
 //
-// The adapter layer itself (claude/acp adapters, transcript store) is covered by
+// The adapter layer itself (ACP adapters and transcript store) is covered by
 // the earlier *-edge.test.ts campaign; these tests deliberately sit one layer up
 // and drive ChatServiceImpl through a scripted ExternalAgentAdapter that mimics
 // the observable behavior of the real adapters (user-turn echo, transcript-backed
@@ -49,9 +50,8 @@ const localScope = {
  * Scripted external adapter. Mirrors the real adapters where the chat service
  * can observe the difference:
  * - handlePrompt echoes the user turn (messageStarted + messageDelta), like the
- *   Claude adapter does (adapter.ts:284-299), and records the input.
- * - handlePermissionResponse resolves known ids and throws the same named error
- *   the Claude adapter uses for unknown ids.
+ *   external adapter base does, and records the input.
+ * - handlePermissionResponse resolves known ids and throws a named error for unknown ids.
  * - handleSetModel/handleSetEffort are gated on the profile flags exactly like
  *   the generic ACP adapter (acp/adapter.ts:529-541).
  * Assistant progress is driven explicitly by each test via emit helpers.
@@ -60,6 +60,7 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
   public override readonly kind: ExternalAgentKind
   public override readonly profile: AgentProfile
   public readonly prompts: PromptAgentInput[] = []
+  public readonly authentications: AuthenticateAgentInput[] = []
   public readonly cancels: CancelAgentInput[] = []
   public readonly permissionResponses: PermissionResponseAgentInput[] = []
   public readonly setModels: SetModelAgentInput[] = []
@@ -74,6 +75,7 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
   public permissionModeBarrierEntries = 0
   /** When set, the next native permission-mode projection rejects. */
   public failNextPermissionMode: Error | undefined
+  public runtimeStatusError: Error | undefined
   private readonly modelSelections = new Map<string, string>()
   private readonly effortSelections = new Map<string, string>()
   private readonly nativePendingPermissionIds = new Set<string>()
@@ -118,6 +120,10 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
 
   protected async handleCancel(input: CancelAgentInput): Promise<void> {
     this.cancels.push(input)
+  }
+
+  protected override async handleAuthenticate(input: AuthenticateAgentInput): Promise<void> {
+    this.authentications.push(input)
   }
 
   protected override async handlePermissionResponse(input: PermissionResponseAgentInput): Promise<void> {
@@ -178,6 +184,7 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
   }
 
   public runtimeStatus(): Promise<ExternalAgentRuntimeStatus> {
+    if (this.runtimeStatusError) return Promise.reject(this.runtimeStatusError)
     return Promise.resolve({
       kind: this.kind,
       displayName: this.profile.displayName,
@@ -208,12 +215,17 @@ class FakeExternalAdapter extends ExternalAgentAdapter {
   }
 
   /** Surface a native permission request through the contract event channel. */
-  public askPermission(sessionId: string, requestId: string): ChatPermissionRequest {
+  public askPermission(
+    sessionId: string,
+    requestId: string,
+    details: Partial<ChatPermissionRequest> = {},
+  ): ChatPermissionRequest {
     const request: ChatPermissionRequest = {
       id: requestId,
       sessionId,
       action: "read_file",
       resources: [`/Users/example/.ssh/${requestId}`],
+      ...details,
     }
     this.nativePendingPermissionIds.add(requestId)
     this.emit({ event: "permissionAsked", data: { sessionId, request } })
@@ -281,6 +293,23 @@ async function waitForTurnCompletion(service: ChatServiceImpl): Promise<void> {
   await waitForCondition(() => !service.hasActiveGeneration(), "generation completion")
 }
 
+test("external agent probe failures remain visible as disabled error rows", async () => {
+  const { service, adapters } = createHarness(["claude-code", "codex"])
+  const failed = adapters.get("codex")
+  if (!failed) assert.fail("codex adapter missing")
+  failed.runtimeStatusError = new Error("probe exploded")
+
+  const statuses = await service.getExternalAgents()
+
+  assert.deepEqual(
+    statuses.map((status) => ({ kind: status.kind, binary: status.binary })),
+    [
+      { kind: "claude-code", binary: { status: "detected", path: "/fake/bin/claude-code" } },
+      { kind: "codex", binary: { status: "error", message: "probe exploded" } },
+    ],
+  )
+})
+
 // ---------------------------------------------------------------------------
 // Edge 1: attachments into an external session
 // ---------------------------------------------------------------------------
@@ -300,10 +329,17 @@ test("external turns receive managed output directories and finalize against the
   const getMessages = vi.spyOn(adapter, "getMessages")
   const sessionId = mintExternalSessionId("claude-code")
 
-  await service.sendMessage(sendRequest(sessionId, "create an output"))
+  await service.sendMessage(
+    sendRequest(sessionId, "create an output", {
+      model: { kind: "builtin", id: "gpt-5.6-sol" },
+      reasoningLevel: "high",
+    }),
+  )
   const prompt = adapter.prompts[0]
   assert.ok(prompt?.artifactDir)
   assert.ok(prompt.processDir)
+  assert.equal(prompt.model, undefined)
+  assert.equal(prompt.reasoningLevel, undefined)
   assert.equal(prompt.additionalDirectories?.length, 2)
   assert.equal(
     prompt.additionalDirectories?.every((root) => path.isAbsolute(root)),
@@ -316,6 +352,64 @@ test("external turns receive managed output directories and finalize against the
     getMessages.mock.calls.some(([id]) => id === sessionId),
     true,
   )
+})
+
+test("external turns publish and clear their guarded OOCLI workspace scope", async () => {
+  const scopeChanges = vi.fn(
+    async (_input: { active: boolean; cwdRoots?: readonly string[]; sessionId: string; teamName?: string }) =>
+      undefined,
+  )
+  const { service, adapters } = createHarness(["claude-code"], {
+    onExternalTurnScopeChanged: scopeChanges,
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("claude-code")
+
+  await service.sendMessage({
+    scope: { kind: "team", teamId: "team-id", teamName: "OOMOL-Internal" },
+    sessionId,
+    text: "query PostHog",
+  })
+  await waitForCondition(() => adapter.prompts.length === 1, "external prompt")
+  const prompt = adapter.prompts[0]
+  assert.deepEqual(scopeChanges.mock.calls[0]?.[0], {
+    active: true,
+    cwdRoots: [prompt?.artifactDir, prompt?.processDir].filter((root): root is string => Boolean(root)),
+    sessionId,
+    teamName: "OOMOL-Internal",
+  })
+
+  adapter.completeAssistantTurn(sessionId, "reply-scope", "done")
+  await waitForTurnCompletion(service)
+  assert.deepEqual(scopeChanges.mock.calls.at(-1)?.[0], { active: false, sessionId })
+})
+
+test("an accepted external turn is not interrupted while the model has a slow first response", async () => {
+  vi.useFakeTimers()
+  try {
+    const { service, events, adapters } = createHarness()
+    const adapter = adapters.get("claude-code")
+    assert.ok(adapter)
+    const sessionId = mintExternalSessionId("claude-code")
+
+    await service.sendMessage(sendRequest(sessionId, "take time to think"))
+    await Promise.resolve()
+    assert.equal(adapter.prompts.length, 1)
+    assert.equal(service.hasActiveGeneration(), true)
+
+    await vi.advanceTimersByTimeAsync(45_000)
+    assert.equal(service.hasActiveGeneration(), true)
+    assert.equal(adapter.cancels.length, 0)
+    assert.equal(
+      sessionEvents(events, sessionId).some((event) => event.event === "messageError"),
+      false,
+    )
+
+    adapter.completeAssistantTurn(sessionId, "slow-reply", "done")
+  } finally {
+    vi.useRealTimers()
+  }
 })
 
 test("external plan turns keep the registered project read-only and use managed output directories", async () => {
@@ -351,12 +445,136 @@ test("external plan turns keep the registered project read-only and use managed 
   await waitForCondition(() => adapter.prompts.length === 1, "external plan prompt")
 
   const prompt = adapter.prompts[0]
+  assert.equal(prompt?.mode, "plan")
   assert.equal(prompt?.outputProjectRoot, undefined)
   assert.equal(prompt?.workingDirectory, undefined)
   assert.ok(prompt?.artifactDir)
   assert.equal(prompt.artifactDir.startsWith(projectRoot), false)
 
   adapter.completeAssistantTurn(sessionId, "assistant-plan", "done")
+  await waitForTurnCompletion(service)
+})
+
+test("external /bug-report uses the host report contract and a Build artifact root", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "wanta-external-bug-report-"))
+  const attachment = await createProbeAttachment()
+  const scopeChanges = vi.fn(
+    async (_input: {
+      active: boolean
+      cwdRoots?: readonly string[]
+      diagnostic?: boolean
+      sessionId: string
+      teamName?: string
+    }) => undefined,
+  )
+  const { service, adapters } = createHarness(["claude-code"], {
+    bugReportRuntime: {
+      appCommit: "abc123",
+      appVersion: "1.2.3",
+      platform: "darwin",
+    },
+    trustedAttachmentPaths: new Set([attachment.path]),
+    onExternalTurnScopeChanged: scopeChanges,
+    projectStore: {
+      read: async () =>
+        new Map([
+          [
+            "project-1",
+            {
+              id: "project-1",
+              name: "Project",
+              path: projectRoot,
+              createdAt: 1,
+              updatedAt: 1,
+              scope: localScope,
+            },
+          ],
+        ]),
+    },
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  const sessionId = mintExternalSessionId("claude-code")
+  service.setLinkRuntime("openconnector")
+  vi.spyOn(adapter, "getMessages").mockResolvedValueOnce([
+    {
+      id: "user-1",
+      role: "user",
+      createdAt: 1,
+      parts: [{ kind: "text", partId: "t1", text: "请帮我修好 Gmail 授权卡住。" }],
+    },
+    {
+      id: "assistant-1",
+      role: "assistant",
+      createdAt: 2,
+      finishReason: "stop",
+      parts: [
+        {
+          kind: "tool",
+          partId: "tool-1",
+          tool: "bash",
+          status: "error",
+          failureKind: "authorization",
+          error: "connector unauthorized",
+          authorization: { service: "gmail", displayName: "Gmail", errorCode: "unauthorized" },
+        },
+      ],
+    },
+  ])
+
+  await service.sendMessage(
+    sendRequest(sessionId, "/bug-report Focus on the loop.", {
+      agentModelId: "sonnet",
+      attachments: [attachment],
+      mode: "plan",
+      projectContext: { id: "project-1", name: "Project", path: projectRoot },
+      teamSkills: [{ id: "posthog", name: "PostHog", description: "Analyze product usage" }],
+    }),
+  )
+  await waitForCondition(() => adapter.prompts.length === 1, "external bug-report prompt")
+
+  const prompt = adapter.prompts[0]
+  assert.equal(prompt?.text, "/bug-report Focus on the loop.")
+  assert.equal(prompt?.mode, "build")
+  assert.equal(prompt?.diagnostic, true)
+  assert.equal(prompt?.attachments, undefined)
+  assert.equal(prompt?.outputProjectRoot, undefined)
+  assert.equal(prompt?.processDir, undefined)
+  assert.ok(prompt?.artifactDir)
+  const evidenceDir = prompt.workingDirectory
+  assert.ok(evidenceDir)
+  assert.equal(path.basename(evidenceDir), "bug-report")
+  assert.deepEqual(prompt.additionalDirectories, [prompt.artifactDir])
+  assert.equal((await realpath(prompt.artifactDir)).startsWith(await realpath(projectRoot)), true)
+  assert.deepEqual(scopeChanges.mock.calls[0]?.[0], {
+    active: true,
+    cwdRoots: [evidenceDir, prompt.artifactDir],
+    diagnostic: true,
+    sessionId,
+  })
+  assert.match(prompt.system ?? "", /built-in \/bug-report command/)
+  assert.match(prompt.system ?? "", /Focus on the loop/)
+  assert.match(prompt.system ?? "", /wanta-bug-report\.md/)
+  assert.match(prompt.system ?? "", /Wanta version: 1\.2\.3/)
+  assert.match(prompt.system ?? "", /Build commit: abc123/)
+  assert.match(prompt.system ?? "", /Model: claude-code:sonnet/)
+  assert.match(prompt.system ?? "", /Do not reproduce the report body in the assistant response/)
+  assert.match(prompt.system ?? "", /index\.json/)
+  assert.match(prompt.system ?? "", /## Wanta diagnosis/)
+  assert.match(prompt.system ?? "", /classified the latest user instruction as Simplified Chinese/)
+  assert.doesNotMatch(prompt.system ?? "", /Wanta-managed `oo connector/)
+  assert.doesNotMatch(prompt.system ?? "", /Team-configured skills/)
+  assert.doesNotMatch(prompt.system ?? "", /Use local tools normally/)
+  assert.doesNotMatch(prompt.system ?? "", /Current local project context/)
+
+  const index = JSON.parse(await readFile(path.join(evidenceDir, "index.json"), "utf8")) as {
+    friction: { toolFailures: Array<{ tool?: string }> }
+    userGoal?: string
+  }
+  assert.equal(index.userGoal, "请帮我修好 Gmail 授权卡住。")
+  assert.equal(index.friction.toolFailures[0]?.tool, "bash")
+
+  adapter.completeAssistantTurn(sessionId, "assistant-bug-report", "done")
   await waitForTurnCompletion(service)
 })
 
@@ -412,7 +630,7 @@ test("edge1b: a failed attachment send rolls the display record back", async () 
     removeMessage,
   } as unknown as UserAttachmentStore
   const attachment = await createProbeAttachment()
-  const { service, adapters } = createHarness(["claude-code"], {
+  const { service, adapters, events } = createHarness(["claude-code"], {
     userAttachmentStore: attachmentStore,
     trustedAttachmentPaths: new Set([attachment.path]),
   })
@@ -424,6 +642,42 @@ test("edge1b: a failed attachment send rolls the display record back", async () 
   await service.sendMessage(sendRequest(sessionId, "please read this", { attachments: [attachment] }))
   await waitForCondition(() => removeMessage.mock.calls.length === 1, "attachment record rollback")
   assert.equal(record.mock.calls.length, 1)
+  assert.equal(service.hasActiveGeneration(), false)
+  assert.ok(
+    sessionEvents(events, sessionId).some(
+      (event) =>
+        event.event === "turnOutcome" &&
+        (event.data as { kind?: string; reason?: string }).kind === "failed" &&
+        (event.data as { kind?: string; reason?: string }).reason === "prompt_dispatch_failed",
+    ),
+  )
+})
+
+test("edge1b2: a failed permission-mode projection after attachment record rolls the display record back", async () => {
+  const record = vi.fn(async () => undefined)
+  const removeMessage = vi.fn(async () => undefined)
+  const attachmentStore = {
+    read: async () => new Map(),
+    record,
+    removeMessage,
+  } as unknown as UserAttachmentStore
+  const attachment = await createProbeAttachment()
+  const { service, adapters } = createHarness(["claude-code"], {
+    userAttachmentStore: attachmentStore,
+    trustedAttachmentPaths: new Set([attachment.path]),
+  })
+  const adapter = adapters.get("claude-code")
+  assert.ok(adapter)
+  adapter.failNextPermissionMode = new Error("mode refused")
+  const sessionId = mintExternalSessionId("claude-code")
+
+  await assert.rejects(
+    service.sendMessage(sendRequest(sessionId, "please read this", { attachments: [attachment] })),
+    /mode refused/,
+  )
+  assert.equal(record.mock.calls.length, 1)
+  assert.equal(removeMessage.mock.calls.length, 1)
+  assert.equal(adapter.prompts.length, 0)
   assert.equal(service.hasActiveGeneration(), false)
 })
 
@@ -675,6 +929,7 @@ test("edge6: removing an external session mid-turn cleans the run and blocks zom
       await chatService.forgetSession(sessionId)
     },
   })
+  ;(sessionService as unknown as { send: () => Promise<void> }).send = async () => undefined
 
   const doomed = await sessionService.create({ agentKind: "claude-code", scope: localScope, title: "doomed" })
   const survivor = await sessionService.create({ agentKind: "claude-code", scope: localScope, title: "survivor" })
@@ -792,26 +1047,24 @@ test("edge7b: prototype-chain kind segments are not valid external kinds (in-ope
 })
 
 // ---------------------------------------------------------------------------
-// Edge 8: model/effort knobs against an agent that declares setEffort false
+// Edge 8: local Grok owns its account, catalog, model, and effort
 // ---------------------------------------------------------------------------
 
-test("edge8: prompt-borne model/effort ids are forwarded verbatim and never kill the turn; direct set-effort rejects with a named error", async () => {
+test("edge8: Grok ignores Wanta models and accepts its native model/effort mutations", async () => {
   const { service, events, adapters } = createHarness(["grok"])
   const grok = adapters.get("grok")
   assert.ok(grok)
+  assert.equal(grok.profile.modelSource, "agent")
+  assert.equal(grok.profile.auth.kind, "agent-cli")
   assert.equal(grok.profile.inputs.setModel, true)
-  assert.equal(grok.profile.inputs.setEffort, false)
+  assert.equal(grok.profile.inputs.setEffort, true)
   const sessionId = mintExternalSessionId("grok")
 
-  // The chat layer forwards both knobs on the prompt (chat/node.ts:1859-1860);
-  // the contract schema accepts them regardless of profile flags, and the
-  // adapter owns the decision. The turn must run to completion.
   await service.sendMessage(
-    sendRequest(sessionId, "with knobs", { agentModelId: "grok-4-fast", agentEffortId: "high" }),
+    sendRequest(sessionId, "ignore stale Wanta model", { model: { kind: "builtin", id: "oopilot" } }),
   )
   assert.equal(grok.prompts.length, 1)
-  assert.equal(grok.prompts[0]?.agentModelId, "grok-4-fast")
-  assert.equal(grok.prompts[0]?.agentEffortId, "high")
+  assert.equal(grok.prompts[0]?.model, undefined)
   grok.completeAssistantTurn(sessionId, "reply-knobs", "answered")
   await waitForTurnCompletion(service)
   assert.deepEqual(
@@ -819,28 +1072,43 @@ test("edge8: prompt-borne model/effort ids are forwarded verbatim and never kill
     [],
   )
 
-  // The supported axis works through the dedicated invoke...
   await service.setExternalSessionModel({ sessionId, modelId: "grok-4-fast" })
-  assert.equal(grok.setModels.length, 1)
-
-  // ...the undeclared axis rejects with the contract's named error and does
-  // not poison the session for later turns.
-  await assert.rejects(service.setExternalSessionEffort({ sessionId, effortId: "high" }), /set-effort is not supported/)
-  await service.sendMessage(sendRequest(sessionId, "after rejection"))
+  await service.setExternalSessionEffort({ sessionId, effortId: "high" })
+  assert.deepEqual(
+    grok.setModels.map(({ modelId }) => modelId),
+    ["grok-4-fast"],
+  )
+  assert.deepEqual(
+    grok.setEfforts.map(({ effortId }) => effortId),
+    ["high"],
+  )
+  await service.sendMessage(sendRequest(sessionId, "after native selection"))
   assert.equal(grok.prompts.length, 2)
-  grok.completeAssistantTurn(sessionId, "reply-after", "still fine")
+  assert.equal(grok.prompts[1]?.model, undefined)
+  grok.completeAssistantTurn(sessionId, "reply-after", "still native")
   await waitForTurnCompletion(service)
   assert.equal((await service.getMessages(sessionId)).filter((message) => message.role === "assistant").length, 2)
 })
 
+test("external authentication is delegated to the selected local agent", async () => {
+  const { service, adapters } = createHarness(["grok"])
+  const grok = adapters.get("grok")
+  assert.ok(grok)
+
+  const status = await service.authenticateExternalAgent({ kind: "grok", methodId: "grok.com" })
+
+  assert.deepEqual(grok.authentications, [{ type: "authenticate", methodId: "grok.com" }])
+  assert.equal(status.kind, "grok")
+})
+
 test("external model and effort choices are persisted per session", async () => {
   const persisted: Array<{ sessionId: string; patch: { modelId?: string | null; effortId?: string | null } }> = []
-  const { service } = createHarness(["claude-code"], {
+  const { service } = createHarness(["codex"], {
     onExternalSessionSelectionChanged: (sessionId, patch) => {
       persisted.push({ sessionId, patch })
     },
   })
-  const sessionId = mintExternalSessionId("claude-code")
+  const sessionId = mintExternalSessionId("codex")
 
   await service.setExternalSessionModel({ sessionId, modelId: "sonnet" })
   await service.setExternalSessionEffort({ sessionId, effortId: "high" })
@@ -855,14 +1123,14 @@ test("external model and effort choices are persisted per session", async () => 
 
 test("a rejected prompt-borne selection is rolled back in session metadata", async () => {
   const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
-  const { service, adapters } = createHarness(["claude-code"], {
+  const { service, adapters } = createHarness(["codex"], {
     onExternalSessionSelectionChanged: (_sessionId, patch) => {
       persisted.push(patch)
     },
   })
-  const adapter = adapters.get("claude-code")
+  const adapter = adapters.get("codex")
   assert.ok(adapter)
-  const sessionId = mintExternalSessionId("claude-code")
+  const sessionId = mintExternalSessionId("codex")
   adapter.failNextPrompt = new Error("model rejected")
 
   await service.sendMessage(sendRequest(sessionId, "use this model", { agentModelId: "sonnet", agentEffortId: "high" }))
@@ -874,14 +1142,14 @@ test("a rejected prompt-borne selection is rolled back in session metadata", asy
 
 test("a rejected prompt rollback cannot overwrite a newer model selection", async () => {
   const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
-  const { service, adapters } = createHarness(["claude-code"], {
+  const { service, adapters } = createHarness(["codex"], {
     onExternalSessionSelectionChanged: (_sessionId, patch) => {
       persisted.push(patch)
     },
   })
-  const adapter = adapters.get("claude-code")
+  const adapter = adapters.get("codex")
   assert.ok(adapter)
-  const sessionId = mintExternalSessionId("claude-code")
+  const sessionId = mintExternalSessionId("codex")
   let releasePromptFailure!: () => void
   adapter.promptFailureBarrier = new Promise<void>((resolve) => (releasePromptFailure = resolve))
   adapter.failNextPrompt = new Error("prompt rejected")
@@ -898,14 +1166,14 @@ test("a rejected prompt rollback cannot overwrite a newer model selection", asyn
 
 test("prompt rollback captures a direct selection that completed before prompt persistence", async () => {
   const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
-  const { service, adapters } = createHarness(["claude-code"], {
+  const { service, adapters } = createHarness(["codex"], {
     onExternalSessionSelectionChanged: (_sessionId, patch) => {
       persisted.push(patch)
     },
   })
-  const adapter = adapters.get("claude-code")
+  const adapter = adapters.get("codex")
   assert.ok(adapter)
-  const sessionId = mintExternalSessionId("claude-code")
+  const sessionId = mintExternalSessionId("codex")
   let releasePermissionMode!: () => void
   adapter.permissionModeBarrier = new Promise<void>((resolve) => (releasePermissionMode = resolve))
   adapter.failNextPrompt = new Error("prompt rejected")
@@ -925,7 +1193,7 @@ test("forgetSession waits for pending selection persistence and removes its muta
   let releasePersistence!: () => void
   const persistenceBarrier = new Promise<void>((resolve) => (releasePersistence = resolve))
   let persistenceStarted = false
-  const { service } = createHarness(["claude-code"], {
+  const { service } = createHarness(["codex"], {
     onExternalSessionSelectionChanged: async (_sessionId, patch) => {
       if (patch.modelId === "sonnet") {
         persistenceStarted = true
@@ -933,7 +1201,7 @@ test("forgetSession waits for pending selection persistence and removes its muta
       }
     },
   })
-  const sessionId = mintExternalSessionId("claude-code")
+  const sessionId = mintExternalSessionId("codex")
   const selection = service.setExternalSessionModel({ sessionId, modelId: "sonnet" })
   await waitForCondition(() => persistenceStarted, "pending selection persistence")
 
@@ -961,14 +1229,14 @@ test("forgetSession waits for pending selection persistence and removes its muta
 
 test("a prompt failure after session deletion cannot enqueue a late selection rollback", async () => {
   const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
-  const { service, adapters } = createHarness(["claude-code"], {
+  const { service, adapters } = createHarness(["codex"], {
     onExternalSessionSelectionChanged: (_sessionId, patch) => {
       persisted.push(patch)
     },
   })
-  const adapter = adapters.get("claude-code")
+  const adapter = adapters.get("codex")
   assert.ok(adapter)
-  const sessionId = mintExternalSessionId("claude-code")
+  const sessionId = mintExternalSessionId("codex")
   let releasePromptFailure!: () => void
   adapter.promptFailureBarrier = new Promise<void>((resolve) => (releasePromptFailure = resolve))
   adapter.failNextPrompt = new Error("prompt rejected after deletion")
@@ -1005,16 +1273,16 @@ test("external model and effort updates stay ordered when persistence overlaps",
   const modelPersistence = new Promise<void>((resolve) => (releaseModelPersistence = resolve))
   const effortPersistence = new Promise<void>((resolve) => (releaseEffortPersistence = resolve))
   const persisted: Array<{ modelId?: string | null; effortId?: string | null }> = []
-  const { service, adapters } = createHarness(["claude-code"], {
+  const { service, adapters } = createHarness(["codex"], {
     onExternalSessionSelectionChanged: async (_sessionId, patch) => {
       persisted.push(patch)
       if (patch.modelId === "first-model") await modelPersistence
       if (patch.effortId === "first-effort") await effortPersistence
     },
   })
-  const adapter = adapters.get("claude-code")
+  const adapter = adapters.get("codex")
   assert.ok(adapter)
-  const sessionId = mintExternalSessionId("claude-code")
+  const sessionId = mintExternalSessionId("codex")
 
   const firstModel = service.setExternalSessionModel({ sessionId, modelId: "first-model" })
   const secondModel = service.setExternalSessionModel({ sessionId, modelId: "second-model" })
@@ -1095,7 +1363,7 @@ test("external turns receive the same Wanta team and Link identity instead of fa
   assert.match(codex.prompts[0]?.system ?? "", /Current-turn Wanta Link workspace: team "OOMOL-Internal"/)
   assert.match(codex.prompts[0]?.system ?? "", /--team "OOMOL-Internal"/)
   assert.match(codex.prompts[0]?.system ?? "", /Team-configured skills for the active workspace/)
-  assert.match(codex.prompts[0]?.system ?? "", /Default Access with Wanta's shared approval policy/)
+  assert.match(codex.prompts[0]?.system ?? "", /approval decisions belong to the external agent runtime/)
   assert.match(codex.prompts[0]?.system ?? "", /application interface language: Simplified Chinese/)
 
   codex.completeAssistantTurn(sessionId, "reply", "done")
@@ -1118,3 +1386,130 @@ test("edge5b: a malformed external session uuid is never routed to an adapter", 
   )
   assert.equal(codex.prompts.length, 0)
 })
+
+test("late external tool results remain in history without advancing the replacement run", async () => {
+  const { service, adapters, events } = createHarness(["codex"])
+  const adapter = adapters.get("codex")!
+  const sessionId = mintExternalSessionId("codex")
+  await service.sendMessage(sendRequest(sessionId, "first"))
+  await waitForCondition(() => adapter.prompts.length === 1)
+  adapter.startAssistantReply(sessionId, "old-assistant", "first reply")
+  await service.stopGeneration(sessionId)
+  await service.sendMessage(sendRequest(sessionId, "second"))
+  await waitForCondition(() => adapter.prompts.length === 2)
+  adapter.startAssistantReply(sessionId, "new-assistant", "second reply")
+  const before = await service.getActiveRun(sessionId)
+  const count = events.length
+  adapter.emitEvent({
+    event: "toolCallResult",
+    data: {
+      sessionId,
+      messageId: "old-assistant",
+      partId: "old-part",
+      callId: "old-call",
+      tool: "bash",
+      input: {},
+      output: "late historical output",
+      status: "completed",
+    },
+  })
+  assert.deepEqual(await service.getActiveRun(sessionId), before)
+  assert.equal(events.length, count)
+  const oldMessage = (await adapter.getMessages(sessionId)).find((message) => message.id === "old-assistant")
+  assert.ok(oldMessage?.parts.some((part) => part.kind === "tool" && part.output === "late historical output"))
+  await service.stopGeneration(sessionId)
+})
+
+for (const kind of ["codex", "claude-code", "grok"] as const) {
+  for (const mode of ["default", "full_access"] as const) {
+    test(`${kind} ${mode}: native requests bypass host allow/deny rules and grants`, async () => {
+      const { service, events, adapters } = createHarness([kind])
+      const adapter = adapters.get(kind)!
+      const sessionId = mintExternalSessionId(kind)
+      await service.sendMessage(sendRequest(sessionId, "work", { permissionMode: mode }))
+      const nativeOptions = [
+        { optionId: "native-once", name: "Run once", kind: "allow_once" as const },
+        { optionId: "native-always", name: "Remember in agent", kind: "allow_always" as const },
+        { optionId: "native-no", name: "Never allow", kind: "reject_always" as const },
+      ]
+      for (const [index, details] of [
+        { action: "bash", metadata: { command: "echo hello" } },
+        { action: "bash", metadata: { command: "printenv OO_API_KEY" } },
+        { action: "bash", metadata: { command: "oo connector apps --json" } },
+        { action: "wanta_browser", metadata: { wantaHostTool: "browser_read" } },
+      ].entries()) {
+        adapter.askPermission(sessionId, `native-${index}`, { ...details, nativeOptions, resources: [] })
+      }
+      await waitForCondition(
+        () => events.filter((event) => event.event === "permissionAsked").length === 4,
+        "native requests",
+      )
+      assert.equal((await service.getPendingPermissions(sessionId)).length, 4)
+      assert.equal(adapter.permissionResponses.length, 0)
+      await assert.rejects(
+        service.answerPermission({ sessionId, requestId: "native-0", reply: "once", optionId: "invented" }),
+        /Unknown native permission option/,
+      )
+      assert.equal((await service.getPendingPermissions(sessionId)).length, 4)
+      await service.answerPermission({ sessionId, requestId: "native-0", reply: "once", optionId: "native-always" })
+      assert.equal(adapter.permissionResponses[0]?.optionId, "native-always")
+      assert.equal(adapter.permissionResponses[0]?.reply, "always")
+      adapter.askPermission(sessionId, "repeat", {
+        action: "bash",
+        metadata: { command: "echo hello" },
+        resources: [],
+        nativeOptions,
+      })
+      assert.equal((await service.getPendingPermissions(sessionId)).length, 4)
+      assert.equal(adapter.permissionResponses.length, 1)
+      await service.answerPermission({ sessionId, requestId: "repeat", reply: "once", optionId: "native-no" })
+      assert.equal(adapter.permissionResponses[1]?.reply, "reject")
+      assert.equal(adapter.permissionResponses[1]?.optionId, "native-no")
+      for (const request of await service.getPendingPermissions(sessionId)) {
+        await service.answerPermission({ sessionId, requestId: request.id, reply: "once", optionId: "native-once" })
+      }
+      adapter.completeAssistantTurn(sessionId, "done", "done")
+      await waitForTurnCompletion(service)
+    })
+  }
+}
+
+for (const kind of ["codex", "claude-code", "grok"] as const) {
+  test(`${kind}: native approvals enable host previews without approving future agent requests`, async () => {
+    const { service, adapters } = createHarness([kind])
+    const adapter = adapters.get(kind)!
+    const sessionId = mintExternalSessionId(kind)
+    await service.sendMessage(sendRequest(sessionId, "inspect files"))
+    for (const optionKind of ["allow_once", "allow_always", "reject_once", "reject_always"] as const) {
+      const attachment = await createProbeAttachment()
+      const requestId = `preview-${optionKind}`
+      const nativeOptions = [{ optionId: optionKind, name: optionKind, kind: optionKind }]
+      adapter.askPermission(sessionId, requestId, { action: "file.read", resources: [attachment.path], nativeOptions })
+      await assert.rejects(service.getLocalArtifactPreview({ path: attachment.path }), /not available/)
+      const response = { sessionId, requestId, reply: "once" as const, optionId: optionKind }
+      if (optionKind === "allow_once") {
+        vi.spyOn(adapter, "send").mockRejectedValueOnce(new Error("native delivery failed"))
+        await assert.rejects(service.answerPermission(response), /native delivery failed/)
+        await assert.rejects(service.getLocalArtifactPreview({ path: attachment.path }), /not available/)
+      }
+      await service.answerPermission(response)
+      if (optionKind.startsWith("allow")) {
+        const preview = await service.getLocalArtifactPreview({ path: attachment.path })
+        assert.equal(preview.text, "probe")
+        const responsesBefore = adapter.permissionResponses.length
+        adapter.askPermission(sessionId, `${requestId}-again`, {
+          action: "file.read",
+          resources: [attachment.path],
+          nativeOptions,
+        })
+        assert.equal((await service.getPendingPermissions(sessionId)).length, 1)
+        assert.equal(adapter.permissionResponses.length, responsesBefore)
+        await service.answerPermission({ ...response, requestId: `${requestId}-again` })
+      } else {
+        await assert.rejects(service.getLocalArtifactPreview({ path: attachment.path }), /not available/)
+      }
+    }
+    adapter.completeAssistantTurn(sessionId, "preview-done", "done")
+    await waitForTurnCompletion(service)
+  })
+}

@@ -6,8 +6,13 @@ import type { TranslateFn } from "@/i18n/i18n"
 import * as React from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
-import { htmlPreviewHasScripts, htmlPreviewSandbox, htmlPreviewSrcDoc } from "./artifact-html-preview.ts"
+import { htmlPreviewSandbox, htmlPreviewSrcDoc } from "./artifact-html-preview.ts"
 import { artifactGroupDisplayItem, artifactKindLabel, isVideoArtifact } from "./artifact-metadata.ts"
+import {
+  artifactListHeightForRatio,
+  artifactListMinimumHeight,
+  artifactListRatioForHeight,
+} from "./artifact-panel-layout.ts"
 import { buildArtifactPaletteItems } from "./composer-palette-items.ts"
 import { GeneratedArtifactsShelf } from "./GeneratedArtifacts.tsx"
 import { I18nContext, translate } from "@/i18n/i18n"
@@ -91,23 +96,21 @@ describe("htmlPreviewSrcDoc", () => {
     expect(result).toContain("frame-src 'none'")
     expect(result).toContain("object-src 'none'")
     expect(result).toContain("form-action 'none'")
-    expect(htmlPreviewSandbox(true)).toBe("allow-scripts")
-    expect(htmlPreviewSandbox(true)).not.toContain("allow-same-origin")
+    expect(htmlPreviewSandbox()).toBe("allow-scripts")
+    expect(htmlPreviewSandbox()).not.toContain("allow-same-origin")
   })
 
-  it("supports a static fallback that disables scripts", () => {
-    const result = htmlPreviewSrcDoc("<script>document.write('dynamic')</script>", { scriptsEnabled: false })
+  it("blocks external navigation while keeping embedded report scripts available", () => {
+    const result = htmlPreviewSrcDoc(
+      '<meta http-equiv="refresh" content="0;url=https://example.test"><script>location.href="https://example.test"</script>',
+    )
 
-    expect(result).toContain("script-src 'none'")
-    expect(htmlPreviewSandbox(false)).toBe("")
-  })
-
-  it("detects script elements and inline event handlers", () => {
-    expect(htmlPreviewHasScripts("<script type=module></script>")).toBe(true)
-    expect(htmlPreviewHasScripts("<script/>run()</script>")).toBe(true)
-    expect(htmlPreviewHasScripts('<button onclick="run()">Run</button>')).toBe(true)
-    expect(htmlPreviewHasScripts('<a href="  javascript:run()">Run</a>')).toBe(true)
-    expect(htmlPreviewHasScripts("<main>Static report</main>")).toBe(false)
+    expect(result).toContain("script-src 'unsafe-inline'")
+    expect(result).not.toContain("script-src 'unsafe-inline' https:")
+    expect(result).toContain("connect-src 'none'")
+    expect(result).toContain("navigate-to 'none'")
+    expect(result).not.toContain('http-equiv="refresh"')
+    expect(result).toContain('location.href="https://example.test"')
   })
 })
 
@@ -208,6 +211,25 @@ describe("artifact group display", () => {
         truncated: false,
       }),
     ).toBe(first)
+  })
+})
+
+describe("artifact panel split layout", () => {
+  it("reclamps a stored ratio against every current panel height", () => {
+    expect(artifactListHeightForRatio(0.9, 1_000)).toBe(550)
+    expect(artifactListHeightForRatio(0.9, 600)).toBe(330)
+    expect(artifactListHeightForRatio(0.9, 300)).toBe(80)
+  })
+
+  it("reports the same responsive minimum used by the layout clamp", () => {
+    expect(artifactListMinimumHeight(1_000)).toBe(96)
+    expect(artifactListMinimumHeight(300)).toBe(80)
+    expect(artifactListMinimumHeight(200)).toBe(0)
+  })
+
+  it("normalizes drag heights before persisting a ratio", () => {
+    expect(artifactListRatioForHeight(900, 1_000)).toBe(0.55)
+    expect(artifactListRatioForHeight(10, 1_000)).toBe(0.096)
   })
 })
 

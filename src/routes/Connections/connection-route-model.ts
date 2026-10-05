@@ -1,9 +1,9 @@
 import type {
   ConnectionAppsStatus,
   ConnectionAppDetail,
-  ConnectionAuthType,
   ConnectionAppSummary,
   ConnectionAppCredentialField,
+  ConnectionCredentialAuthType,
   ConnectionCredentialField,
   ConnectionCredentialSummary,
   ConnectionProviderSummary,
@@ -14,7 +14,10 @@ import type { MessageKey, TranslateFn } from "@/i18n/i18n"
 import {
   connectionAppDisplayLabel as connectionAppUiDisplayLabel,
   isConnectionlessNoAuthProvider,
+  isMarketplaceConnection,
+  isUserManagedCredentialApp,
 } from "../../../electron/connections/summary.ts"
+import { resolveConnectorBusinessCategory } from "./connection-provider-category.ts"
 import { authTypeLabel } from "./shared.ts"
 
 export const executionLogLimit = 12
@@ -43,6 +46,69 @@ export const categoryMessageKeysByRawLabel: Record<string, MessageKey> = {
 }
 
 export const crossBorderEcommerceCategory = "Cross-Border Ecommerce"
+
+/**
+ * Stable, task-led groups for the discovery experience. These deliberately
+ * sit above Connector's raw catalog labels: users decide what they want to
+ * accomplish, while the catalog remains free to expose more precise tags.
+ */
+export const connectionDiscoveryCategories = [
+  {
+    key: "cross-border-ecommerce",
+    featuredServices: ["shopify", "17track", "aftership", "shippo"],
+    titleKey: "connections.discovery.crossBorderTitle",
+    descriptionKey: "connections.discovery.crossBorderDescription",
+  },
+  {
+    key: "investment",
+    featuredServices: ["hithink_finance", "financial_modeling_prep", "coinbase", "binance"],
+    titleKey: "connections.discovery.investmentTitle",
+    descriptionKey: "connections.discovery.investmentDescription",
+  },
+  {
+    key: "ai",
+    featuredServices: ["openai", "anthropic", "gemini", "deepseek"],
+    titleKey: "connections.discovery.aiTitle",
+    descriptionKey: "connections.discovery.aiDescription",
+  },
+  {
+    key: "marketing",
+    featuredServices: ["hubspot", "mailchimp", "googleads", "googleanalytics"],
+    titleKey: "connections.discovery.marketingTitle",
+    descriptionKey: "connections.discovery.marketingDescription",
+  },
+  {
+    key: "communication",
+    featuredServices: ["slack", "notion", "gmail", "googledrive"],
+    titleKey: "connections.discovery.communicationTitle",
+    descriptionKey: "connections.discovery.communicationDescription",
+  },
+  {
+    key: "productivity",
+    featuredServices: ["asana", "jira", "trello", "clickup"],
+    titleKey: "connections.discovery.productivityTitle",
+    descriptionKey: "connections.discovery.productivityDescription",
+  },
+  {
+    key: "data-storage",
+    featuredServices: ["googlebigquery", "databricks", "algolia", "mongodb"],
+    titleKey: "connections.discovery.dataStorageTitle",
+    descriptionKey: "connections.discovery.dataStorageDescription",
+  },
+  {
+    key: "developer",
+    featuredServices: ["github", "gitlab", "vercel", "cloudflareworker"],
+    titleKey: "connections.discovery.developerTitle",
+    descriptionKey: "connections.discovery.developerDescription",
+  },
+] as const satisfies readonly {
+  descriptionKey: MessageKey
+  featuredServices: readonly string[]
+  key: string
+  titleKey: MessageKey
+}[]
+
+export type ConnectionDiscoveryCategory = (typeof connectionDiscoveryCategories)[number]["key"]
 
 const crossBorderEcommerceServices = new Set(
   [
@@ -87,9 +153,11 @@ export type ConnectionCatalogFilter =
   | { kind: "available-tools" }
   | { kind: "category"; category: string }
   | { kind: "connected" }
+  | { kind: "discovery-category"; category: ConnectionDiscoveryCategory }
   | { kind: "directly-available" }
+  | { kind: "managed" }
 
-export type ConnectionAuthFilter = "all" | Exclude<ConnectionAuthType, null>
+export type ConnectionAuthFilter = "all" | ConnectionCredentialAuthType
 
 export interface ConnectionCategoryFilter {
   count: number
@@ -139,6 +207,14 @@ export function isDirectlyAvailableProvider(provider: ConnectionProviderSummary)
   return provider.status === "connected" && isConnectionlessNoAuthProvider(provider)
 }
 
+export function isManagedConnection(provider: ConnectionProviderSummary): boolean {
+  return (
+    isConnected(provider) ||
+    provider.status === "needs_attention" ||
+    (provider.executionMode === "direct" && provider.status === "connected")
+  )
+}
+
 export function shouldLoadProviderDetail(provider: ConnectionProviderSummary): boolean {
   if (provider.executionMode === "direct") return false
   return !isDirectlyAvailableProvider(provider) || provider.authTypes.some((authType) => authType !== "no_auth")
@@ -147,6 +223,28 @@ export function shouldLoadProviderDetail(provider: ConnectionProviderSummary): b
 /** Direct providers do not have Connector-managed app metadata, aliases, usage, or execution logs. */
 export function supportsManagedConnectionAccountActions(provider: ConnectionProviderSummary): boolean {
   return provider.executionMode !== "direct"
+}
+
+export function isMarketplaceApp(
+  app: Pick<ConnectionAppSummary, "authType" | "id" | "marketplace"> | null | undefined,
+): boolean {
+  return isMarketplaceConnection(app)
+}
+
+export function canMutateConnectionApp(app: ConnectionAppSummary): boolean {
+  return isUserManagedCredentialApp(app)
+}
+
+export function getProviderMarketplaceApp(provider: ConnectionProviderSummary): ConnectionAppSummary | undefined {
+  return provider.apps.find(isMarketplaceApp)
+}
+
+export function shouldShowProviderUpdatedAt(provider: ConnectionProviderSummary): boolean {
+  return !isDirectlyAvailableProvider(provider) && provider.appAuthType !== "marketplace"
+}
+
+function getSelectedProviderApp(provider: ConnectionProviderSummary): ConnectionAppSummary | undefined {
+  return provider.apps.find((app) => app.id === provider.appId) ?? provider.apps.find((app) => app.isDefault)
 }
 
 export function getProviderStatusTone(
@@ -175,14 +273,18 @@ export function getProviderStatusLabel(provider: ConnectionProviderSummary, t: T
   }
 }
 
-export function getDefaultAuthType(provider: ConnectionProviderSummary): Exclude<ConnectionAuthType, null> | null {
-  if (provider.appAuthType && provider.authTypes.includes(provider.appAuthType)) {
+export function getDefaultAuthType(provider: ConnectionProviderSummary): ConnectionCredentialAuthType | null {
+  if (
+    provider.appAuthType &&
+    provider.appAuthType !== "marketplace" &&
+    provider.authTypes.includes(provider.appAuthType)
+  ) {
     return provider.appAuthType
   }
   return provider.authTypes[0] ?? null
 }
 
-export function formatAuthTypes(authTypes: Exclude<ConnectionAuthType, null>[], t: TranslateFn): string {
+export function formatAuthTypes(authTypes: ConnectionCredentialAuthType[], t: TranslateFn): string {
   if (authTypes.length === 0) {
     return t("connections.authUnknown")
   }
@@ -191,12 +293,12 @@ export function formatAuthTypes(authTypes: Exclude<ConnectionAuthType, null>[], 
 
 export function isConnectionAuthType(
   value: string,
-  authTypes: Exclude<ConnectionAuthType, null>[],
-): value is Exclude<ConnectionAuthType, null> {
+  authTypes: ConnectionCredentialAuthType[],
+): value is ConnectionCredentialAuthType {
   return authTypes.some((authType) => authType === value)
 }
 
-export function formatDateTime(value: number | string | undefined, t: TranslateFn): string {
+export function formatDateTime(value: number | string | undefined, t: TranslateFn, locale = "en"): string {
   if (!value) {
     return t("connections.notConnected")
   }
@@ -206,7 +308,7 @@ export function formatDateTime(value: number | string | undefined, t: TranslateF
     return t("connections.executionTimeUnknown")
   }
 
-  return date.toLocaleString([], {
+  return date.toLocaleString(locale, {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
@@ -214,7 +316,7 @@ export function formatDateTime(value: number | string | undefined, t: TranslateF
   })
 }
 
-export function formatDuration(durationMs: number | null, t: TranslateFn): string {
+export function formatDuration(durationMs: number | null, t: TranslateFn, locale = "en"): string {
   if (durationMs === null) {
     return t("connections.executionDurationUnknown")
   }
@@ -222,7 +324,7 @@ export function formatDuration(durationMs: number | null, t: TranslateFn): strin
     return t("connections.executionDurationMs", { value: durationMs })
   }
   return t("connections.executionDurationSeconds", {
-    value: Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(durationMs / 1000),
+    value: Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(durationMs / 1000),
   })
 }
 
@@ -234,6 +336,9 @@ export function getProviderDescription(provider: ConnectionProviderSummary, t: T
       if (provider.description) return provider.description
       if (isDirectlyAvailableProvider(provider)) {
         return t("connections.noAuthReadyDescription")
+      }
+      if (getSelectedProviderApp(provider)?.marketplace?.pricing === "metered") {
+        return t("connections.marketplaceMeteredDescription")
       }
       if (provider.appCount > 1) {
         return t("connections.connectionCount", { count: provider.appCount })
@@ -248,6 +353,9 @@ export function getProviderDescription(provider: ConnectionProviderSummary, t: T
 export function getProviderAccountValue(provider: ConnectionProviderSummary, t: TranslateFn): string {
   if (isDirectlyAvailableProvider(provider)) {
     return t("connections.noAccountRequired")
+  }
+  if (getSelectedProviderApp(provider) && provider.appAuthType === "marketplace") {
+    return t("connections.marketplaceAccount")
   }
   if (provider.appCount === 1 && provider.accountLabel) {
     return provider.accountLabel
@@ -269,7 +377,7 @@ export function getEmptyState(
   return { title: t("connections.emptyTitle"), description: t("connections.readyEmptyDescription") }
 }
 
-export function authTypeNeedsDialog(authType: Exclude<ConnectionAuthType, null>): boolean {
+export function authTypeNeedsDialog(authType: ConnectionCredentialAuthType): boolean {
   return authType === "api_key" || authType === "custom_credential" || authType === "federated"
 }
 
@@ -321,6 +429,29 @@ export function getProviderCategoryRawLabels(provider: ConnectionProviderSummary
   return labels.length > 0 ? labels : [uncategorizedCategoryValue]
 }
 
+export function getConnectionDiscoveryCategory(
+  key: ConnectionDiscoveryCategory,
+): (typeof connectionDiscoveryCategories)[number] {
+  const category = connectionDiscoveryCategories.find((item) => item.key === key)
+  if (!category) {
+    throw new Error(`Unknown connection discovery category: ${key}`)
+  }
+  return category
+}
+
+export function matchesConnectionDiscoveryCategory(
+  provider: ConnectionProviderSummary,
+  category: ConnectionDiscoveryCategory,
+): boolean {
+  return resolveConnectionDiscoveryCategory(provider) === category
+}
+
+export function resolveConnectionDiscoveryCategory(
+  provider: ConnectionProviderSummary,
+): ConnectionDiscoveryCategory | null {
+  return resolveConnectorBusinessCategory(provider)
+}
+
 function normalizeProviderCategoryLabel(label: string): string {
   const normalizedLabel = label.trim()
   const normalized = normalizedLabel.toLowerCase().replace(/[^\p{L}\p{M}\p{N}]+/gu, "-")
@@ -348,6 +479,9 @@ export function getProviderMeta(provider: ConnectionProviderSummary, t: Translat
   if (isDirectlyAvailableProvider(provider)) {
     return getProviderCategoryLabel(provider, t)
   }
+  if (provider.appCount === 1 && getProviderMarketplaceApp(provider)) {
+    return t("connections.marketplaceAccount")
+  }
   if (provider.status === "connected" && provider.appCount === 1 && provider.accountLabel) {
     return provider.accountLabel
   }
@@ -363,11 +497,19 @@ export function getConnectionAppGeneratedLabel(app: ConnectionAppSummary, index:
 }
 
 export function getConnectionAppDisplayLabel(app: ConnectionAppSummary, index: number, t: TranslateFn): string {
+  if (isMarketplaceApp(app)) return t("connections.marketplaceAccount")
   return connectionAppUiDisplayLabel(app) ?? getConnectionAppGeneratedLabel(app, index, t)
 }
 
 export function normalizeConnectionAliasInput(value: string): string {
-  return value.replaceAll(/[^A-Za-z0-9_-]/g, "").replace(/^-+/, "")
+  return value
+    .replaceAll(/[^A-Za-z0-9_-]/g, "")
+    .toLowerCase()
+    .replace(/^[_-]+/, "")
+}
+
+export function isValidConnectionAlias(value: string): boolean {
+  return value === "" || /^[a-z0-9][a-z0-9_-]*$/.test(value)
 }
 
 export function getConnectionAppNote(app: ConnectionAppDetail | null | undefined): string {
@@ -423,6 +565,7 @@ export function matchesProviderQuery(
   return (
     provider.displayName.toLowerCase().includes(normalizedQuery) ||
     provider.service.toLowerCase().includes(normalizedQuery) ||
+    provider.searchAliases?.some((alias) => alias.toLowerCase().includes(normalizedQuery)) ||
     getProviderCategoryRawLabels(provider).some((label) => {
       return (
         label.toLowerCase().includes(normalizedQuery) ||
@@ -470,7 +613,8 @@ export function parseFilterValue(value: string): ConnectionCatalogFilter | null 
     value === "available-tools" ||
     value === "connected" ||
     value === "attention" ||
-    value === "directly-available"
+    value === "directly-available" ||
+    value === "managed"
   ) {
     return { kind: value }
   }
@@ -558,10 +702,14 @@ export function matchesProviderFilter(provider: ConnectionProviderSummary, filte
       return isConnected(provider) || isDirectlyAvailableProvider(provider)
     case "connected":
       return isConnected(provider)
+    case "managed":
+      return isManagedConnection(provider)
     case "attention":
       return provider.status === "needs_attention"
     case "directly-available":
       return isDirectlyAvailableProvider(provider)
+    case "discovery-category":
+      return matchesConnectionDiscoveryCategory(provider, filter.category)
     case "category":
       return getProviderCategoryRawLabels(provider).includes(filter.category)
   }

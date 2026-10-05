@@ -43,6 +43,16 @@ export class OpencodeAgentAdapter extends BaseAgentAdapter implements ChatAgentB
     }
     this.detachManagerEvents = this.manager.subscribe(
       (event) => {
+        if (event.type === "session.idle") {
+          const sessionId = (event.properties as { sessionID?: unknown } | undefined)?.sessionID
+          if (typeof sessionId === "string" && sessionId) {
+            void this.manager.scrubSessionSensitiveOoOutputs(sessionId).catch(() => {
+              // UI/history events are already redacted by the translator. The
+              // startup sweep retries persistence cleanup if this best-effort
+              // post-turn update loses a sidecar race.
+            })
+          }
+        }
         for (const translated of translateOpencodeEvent(event)) {
           this.emit(translated)
         }
@@ -84,7 +94,11 @@ export class OpencodeAgentAdapter extends BaseAgentAdapter implements ChatAgentB
     // "always" is a Wanta-side session grant, not a kernel rule: the chat
     // service records it and the kernel only needs this one approval.
     const reply = input.reply === "always" ? "once" : input.reply
-    await this.manager.answerPermission(input.sessionId, input.requestId, reply)
+    if (input.message !== undefined) {
+      await this.manager.answerPermission(input.sessionId, input.requestId, reply, input.message)
+    } else {
+      await this.manager.answerPermission(input.sessionId, input.requestId, reply)
+    }
   }
 
   protected override async handleQuestionResponse(input: QuestionResponseAgentInput): Promise<void> {
@@ -112,10 +126,6 @@ export class OpencodeAgentAdapter extends BaseAgentAdapter implements ChatAgentB
 
   public setTeamName(teamName?: string): Promise<void> {
     return this.manager.setTeamName(teamName)
-  }
-
-  public removeKnowledgeBaseAccess(knowledgeBaseId: string): Promise<void> {
-    return this.manager.removeKnowledgeBaseAccess(knowledgeBaseId)
   }
 
   public getMessages(sessionId: string): Promise<ChatMessage[]> {
@@ -152,18 +162,6 @@ export class OpencodeAgentAdapter extends BaseAgentAdapter implements ChatAgentB
 
   public clearSessionTeamName(sessionId: string): Promise<void> {
     return this.manager.clearSessionTeamName(sessionId)
-  }
-
-  public setSessionKnowledgeBaseIds(sessionId: string, knowledgeBaseIds: readonly string[]): Promise<void> {
-    return this.manager.setSessionKnowledgeBaseIds(sessionId, knowledgeBaseIds)
-  }
-
-  public clearSessionKnowledgeBaseIds(sessionId: string): Promise<void> {
-    return this.manager.clearSessionKnowledgeBaseIds(sessionId)
-  }
-
-  public inheritSessionKnowledgeBaseIds(parentSessionId: string, childSessionId: string): Promise<void> {
-    return this.manager.inheritSessionKnowledgeBaseIds(parentSessionId, childSessionId)
   }
 
   public listSessions(): Promise<SessionInfo[]> {

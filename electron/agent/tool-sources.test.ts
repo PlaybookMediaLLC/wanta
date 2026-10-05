@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { SPACES_AGENT_TOOL_FILES } from "./spaces-tool-sources.ts"
 import { AGENT_TOOL_FILES, agentToolFiles, BROWSER_AGENT_TOOL_FILES } from "./tool-sources.ts"
 
 describe("runtime tool assembly", () => {
@@ -6,6 +7,7 @@ describe("runtime tool assembly", () => {
     expect(Object.keys(agentToolFiles(true))).toEqual([
       ...Object.keys(AGENT_TOOL_FILES),
       ...Object.keys(BROWSER_AGENT_TOOL_FILES),
+      ...Object.keys(SPACES_AGENT_TOOL_FILES),
     ])
     expect(Object.keys(agentToolFiles(false))).toEqual(Object.keys(BROWSER_AGENT_TOOL_FILES))
   })
@@ -151,7 +153,6 @@ afterEach(() => {
   delete process.env.WANTA_TEAM_SCOPE_PATH
   delete process.env.WANTA_ORGANIZATION_NAME
   delete process.env.WANTA_ORGANIZATION_SCOPE_PATH
-  delete process.env.WIKIGRAPH_STATE_DIR
   delete process.env.OO_API_KEY
   delete process.env.OO_CONNECTOR_TOKEN
   delete process.env.WANTA_HOST_CAPABILITY_TOKEN
@@ -403,6 +404,34 @@ describe("call_action embedded runtime", () => {
     expect(calls).toBe(2)
     expect(first.status).toBe("authorization_required")
     expect(second.status).toBe("authorization_required")
+  })
+
+  it("skips a repeated action after an action-level policy denial without blocking other actions", async () => {
+    let calls = 0
+    const runtime = loadCallActionTool(async () => {
+      calls += 1
+      const error = new Error("connector failed") as Error & { stderr: string }
+      error.stderr = "Request failed (errorCode: POLICY_DENIED): action denied"
+      throw error
+    })
+
+    const first = JSON.parse(
+      await runtime.execute({ service: "posthog", action: "run_query" }, { sessionID: "session-1" }),
+    ) as { errorCode?: string; status?: string }
+    const repeated = JSON.parse(
+      await runtime.execute({ service: "posthog", action: "run_query" }, { sessionID: "session-1" }),
+    ) as { errorCode?: string; reason?: string; status?: string }
+
+    expect(first).toMatchObject({ status: "error", errorCode: "POLICY_DENIED" })
+    expect(repeated).toMatchObject({
+      status: "skipped",
+      reason: "action_denied_cached",
+      errorCode: "POLICY_DENIED",
+    })
+    expect(calls).toBe(1)
+
+    await runtime.execute({ service: "posthog", action: "list_projects" }, { sessionID: "session-1" })
+    expect(calls).toBe(2)
   })
 
   it("limits matching fan-out calls after the canary succeeds", async () => {

@@ -39,6 +39,10 @@ export interface BrowserTypeInput {
 export class BrowserPage {
   public readonly sessionId: string
   private crashed = false
+  private disposed = false
+  private currentBounds: BrowserViewBounds | null = null
+  private pendingShowBounds: BrowserViewBounds | null = null
+  private screenshotsInFlight = 0
   private currentDialog: Dialog | null = null
   private documentColorScheme: string | null = null
   private readonly mainWindow: ElectronBrowserWindow
@@ -106,24 +110,37 @@ export class BrowserPage {
   }
 
   public isCrashed(): boolean {
-    return this.crashed || this.view.webContents.isDestroyed()
+    return this.disposed || this.crashed || this.view.webContents.isDestroyed()
   }
 
   public show(bounds: BrowserViewBounds): void {
+    // CDP screenshots temporarily resize the native viewport and restore its old
+    // size on completion. Resizing during capture leaves that restored viewport
+    // out of sync with the View bounds, corrupting subsequent on-screen scrolling.
+    // Keep the view attached while waiting: detaching during capture can stall
+    // Chromium's frame production. Explicit hide requests still take precedence.
+    if (this.screenshotsInFlight > 0) {
+      this.pendingShowBounds = { ...bounds }
+      return
+    }
     if (this.visible) {
-      this.view.setBounds(bounds)
-      this.applyZoomFactor()
+      if (!sameBrowserBounds(this.currentBounds, bounds)) {
+        this.view.setBounds(bounds)
+        this.currentBounds = bounds
+      }
       return
     }
     this.mainWindow.contentView.addChildView(this.view)
     this.visible = true
     this.view.setBounds(bounds)
+    this.currentBounds = bounds
     this.view.webContents.focus()
     this.applyZoomFactor()
     this.emitState()
   }
 
   public hide(): void {
+    this.pendingShowBounds = null
     if (!this.visible) return
     this.mainWindow.contentView.removeChildView(this.view)
     this.visible = false
@@ -211,8 +228,34 @@ export class BrowserPage {
     return this.read(undefined, signal)
   }
 
-  public screenshot(fullPage: boolean, signal?: AbortSignal): Promise<Buffer> {
-    return this.requirePage().screenshot({ fullPage, signal, type: "png" })
+  public async screenshot(fullPage: boolean, signal?: AbortSignal): Promise<Buffer> {
+    const page = this.requirePage()
+    const relay = this.relay
+    this.screenshotsInFlight += 1
+    try {
+      return await page.screenshot({ fullPage, signal, type: "png" })
+    } finally {
+      await relay?.waitForScreenshots()
+      this.screenshotsInFlight -= 1
+      if (this.screenshotsInFlight === 0 && this.pendingShowBounds) {
+        const bounds = this.pendingShowBounds
+        this.pendingShowBounds = null
+        if (!this.isCrashed()) this.show(bounds)
+      }
+    }
+  }
+
+  public async capturePreview(): Promise<string | null> {
+    if (this.isCrashed()) return null
+    // Modal backdrops only need the current frame. Avoid Playwright's screenshot
+    // lifecycle here: it can alter viewport state while the user resizes the panel.
+    try {
+      const image = await this.view.webContents.capturePage(undefined, { stayHidden: true })
+      return this.isCrashed() || image.isEmpty() ? null : image.toDataURL()
+    } catch (error) {
+      if (this.isCrashed()) return null
+      throw error
+    }
   }
 
   public async handleDialog(accept: boolean, promptText?: string): Promise<BrowserReadResult> {
@@ -226,6 +269,8 @@ export class BrowserPage {
   }
 
   public async dispose(): Promise<void> {
+    if (this.disposed) return
+    this.disposed = true
     nativeTheme.off("updated", this.applyTheme)
     this.hide()
     const relay = this.relay
@@ -318,6 +363,10 @@ export class BrowserPage {
   private emitState(): void {
     if (!this.view.webContents.isDestroyed()) this.stateChanged(this.state())
   }
+}
+
+function sameBrowserBounds(left: BrowserViewBounds | null, right: BrowserViewBounds): boolean {
+  return left?.height === right.height && left.width === right.width && left.x === right.x && left.y === right.y
 }
 
 function preventBlockedNavigation(event: ElectronEvent, url: string): void {

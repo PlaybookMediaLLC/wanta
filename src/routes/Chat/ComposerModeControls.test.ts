@@ -1,10 +1,12 @@
+// @vitest-environment happy-dom
 import type { ModelCatalog } from "../../../electron/models/common.ts"
 import type { TranslateFn } from "@/i18n/i18n"
 import type { ComponentProps } from "react"
 
 import * as React from "react"
+import { createRoot } from "react-dom/client"
 import { renderToStaticMarkup } from "react-dom/server"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { ComposerModeControls } from "./ComposerModeControls.tsx"
 import { I18nContext, translate } from "@/i18n/i18n"
 
@@ -79,11 +81,19 @@ describe("ComposerModeControls", () => {
     expect(html).not.toContain(reasoningPickerLabel)
   })
 
+  it("keeps Agent configuration enabled when only the composer runtime is unavailable", () => {
+    const html = renderControls({ agentConfigurationDisabled: false, composerDisabled: true })
+    const trigger = html.match(/<button[^>]*aria-label="Agent configuration"[^>]*>/u)?.[0]
+    expect(trigger).toBeDefined()
+    expect(trigger).not.toContain(' disabled=""')
+    expect(html.match(/<button[^>]*aria-label="Switch mode"[^>]*>/u)?.[0]).toContain(' disabled=""')
+  })
+
   it("keeps Wanta model and reasoning selections inside the combined trigger", () => {
     const html = renderControls({ agentModesEnabled: true, modelRoutingEnabled: true })
     expect(html).toContain(agentModeLabel)
     expect(html).toContain(agentConfigurationLabel)
-    expect(html).toContain("Auto · Default")
+    expect(html).toContain("Built-in Agent · Auto · Default")
   })
 
   it("orders mode and permission before the combined configuration trigger", () => {
@@ -110,7 +120,7 @@ describe("ComposerModeControls", () => {
       modelRoutingEnabled: false,
     })
     expect(html).toContain(agentConfigurationLabel)
-    expect(html).toContain("Default · Claude Code")
+    expect(html).toContain("Claude Code · Default")
     expect(html).not.toContain(modelPickerLabel)
   })
 
@@ -122,7 +132,7 @@ describe("ComposerModeControls", () => {
   it("keeps a model-only Wanta configuration in the combined trigger", () => {
     const html = renderControls({ modelCatalog: noReasoningCatalog })
     expect(html).toContain(agentConfigurationLabel)
-    expect(html).toContain("GPT 5.6 Sol · Default")
+    expect(html).toContain("Built-in Agent · GPT 5.6 Sol · Default")
     expect(html).not.toContain(reasoningPickerLabel)
   })
 
@@ -130,3 +140,51 @@ describe("ComposerModeControls", () => {
     expect(renderControls({ modelRequired: true })).toContain(t("chat.modelSelectOrConfigure"))
   })
 })
+
+it.each(["opencode", "codex", "claude-code", "grok"] as const)(
+  "%s uses its owner's Full Access selection flow",
+  async (agentKind) => {
+    ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    const host = document.createElement("div")
+    document.body.append(host)
+    const root = createRoot(host)
+    const confirm = vi.fn()
+    const select = vi.fn()
+    try {
+      await React.act(async () =>
+        root.render(
+          React.createElement(
+            I18nContext.Provider,
+            { value: { locale: "en", setLocale: () => undefined, t } },
+            React.createElement(ComposerModeControls, {
+              ...baseProps,
+              agentKind,
+              permissionModes: ["default", "full_access"],
+              onRequestFullAccessPermissionMode: confirm,
+              onSelectPermissionMode: select,
+            }),
+          ),
+        ),
+      )
+      await React.act(async () =>
+        (host.querySelector(`[aria-label="${t("chat.permissionModePicker")}"]`) as HTMLButtonElement).click(),
+      )
+      const option = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find((button) =>
+        button.textContent?.includes(t("chat.permissionModeFullAccess")),
+      )
+      expect(option).toBeDefined()
+      if (agentKind !== "opencode") expect(option?.textContent).toContain(t("chat.permissionModeNativeDescription"))
+      await React.act(async () => option!.click())
+      if (agentKind === "opencode") {
+        expect(confirm).toHaveBeenCalledOnce()
+        expect(select).not.toHaveBeenCalled()
+      } else {
+        expect(select).toHaveBeenCalledExactlyOnceWith("full_access")
+        expect(confirm).not.toHaveBeenCalled()
+      }
+    } finally {
+      await React.act(async () => root.unmount())
+      host.remove()
+    }
+  },
+)

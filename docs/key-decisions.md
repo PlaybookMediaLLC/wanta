@@ -27,8 +27,8 @@
   but was vetoed by the user (no appetite for cloud operations, wanted a fast POC); the Claude
   Agent SDK was explicitly ruled out by the user; Pi lost mainly because the approval/permission
   layer would have to be built entirely from scratch, plus its 0.x breaking iteration.
-- **Decision**: spawn the published binary `opencode-ai@1.18.10` as a sidecar; the main process
-  drives it via `@opencode-ai/sdk@1.18.10` over HTTP+SSE; pure-configuration customization
+- **Decision**: spawn the published binary `opencode-ai@1.18.30` as a sidecar; the main process
+  drives it via `@opencode-ai/sdk@1.18.30` over HTTP+SSE; pure-configuration customization
   (full replacement of the custom agent prompt + `.opencode/tools/` custom tools), zero source
   modifications. **Do not use the SDK's `createOpencodeServer`** — spawn it ourselves: the former
   allows no control over binary path/env/cwd, and in production packaging opencode-ai is not in
@@ -38,7 +38,7 @@
   server-related packages were private; `opencode-ai` is a pure bin package); vendoring the
   monorepo carried a heavy maintenance burden (~41 commits/day upstream at the 2026-05 research,
   with no API compatibility promise).
-- **Consequences**: the three packages are pinned at `1.18.10`, floating forbidden; the sidecar
+- **Consequences**: the three packages are pinned at `1.18.30`, floating forbidden; the sidecar
   must run in isolated directories (`XDG_*` pointed at userData, otherwise it reads the global
   `~/.config/opencode` and leaks local machine config); the default system prompt is selected by
   model ID (a coding persona), so it must be fully replaced via the agent `prompt` field.
@@ -184,12 +184,7 @@
     flow, and inputSchema is the single source of truth for parameters. After oo-cli 1.4.2
     provided `oo connector apps --json --team`, `list_apps` was added specifically to
     answer the current team's connected provider/app list, so catalog search stops being misused
-    as a connection-status query. WikiGraph access is intentionally not a custom OpenCode tool:
-    when a pinned archive is relevant, the agent uses bash to run `wg wikg://lib/arc/<id> ...`.
-    Wanta creates its own `wg` shim under the sidecar private bin directory, prepends that directory
-    to `PATH`, and calls WikiGraph's SDK runner with Wanta's private state dir. The shim forwards
-    stdin/stdout/stderr/exit code like a terminal command; Wanta does not wrap WikiGraph business
-    errors or expose `WANTA_WIKIGRAPH_*` / `WIKIGRAPH_STATE_DIR` as agent-controlled overrides.
+    as a connection-status query.
   - Prompt layering (R4): the stable persona/tools/contracts live in agent.prompt to benefit from
     prompt caching; the per-turn-changing authorized-existence hint goes through dynamic
     `body.system` injection, with no specific provider names by default. That same `body.system`
@@ -253,7 +248,12 @@
   filtering, ordinary file reads/writes, and specific non-sensitive paths; only fundamental
   security boundaries are pushed to the renderer for confirmation — credential/key paths, broad
   home/system edit scopes, destructive deletion, global/system or alternate-source dependency changes, privilege
-  escalation, `git push/reset/clean`, publish/deploy, infrastructure changes, and the like.
+  escalation, `git push` / `reset --hard` / `clean -f`, publish/deploy, infrastructure changes, and the like.
+  `git restore` of explicit narrow file pathspecs, named `docker rm`/`rmi`, and recognized read-only
+  access to a selected-project `.env` stay ordinary. Syntactically broad Git restore pathspecs such
+  as `.`, `:/`, directory forms ending in `/`, pathspec magic, and globs still prompt, as do
+  `docker rm -v` / `--volumes`. Deleting or writing that project `.env`, or passing it to an
+  executable whose read-only behavior is unknown, still prompts and may be granted for the session.
   Sensitive-resource checks take precedence over generic directory session grants; a generic grant
   can never green-light a high-risk request. Full Access can still take over the session's
   permissions after a single confirmation. The renderer only displays the pending UI, syncs the
@@ -276,8 +276,9 @@
   `npm test`, `rg`, data-processing scripts, or ordinary Desktop/Downloads files one by one;
   non-sensitive reads stay smooth even across broad home/system scopes; broad edits and destructive
   operations still prompt. Unscoped, global/system, or alternate-source dependency changes, reading credentials/keys, browser login state,
-  mail/messages/contacts/calendar data, recursive or destructive deletion outside managed scratch
-  or exact well-known generated project roots, storage overwrite,
+  mail/messages/contacts/calendar data, recursive or destructive deletion that is not managed
+  scratch, an exact well-known generated project root, or a direct `/tmp`/`/var/tmp` child;
+  deleting `/tmp` or `/var/tmp` themselves; storage overwrite,
   privilege escalation, push, deploy, remote repository deletion, and infrastructure or recursive
   cloud-storage destruction still require confirmation; such sensitive reads take precedence over
   generic directory session grants and cannot be silently waved through because the user once
@@ -286,8 +287,9 @@
   execution scope and explicit source overrides rather than a reviewed popularity list: direct
   Python requirements use the exact turn-private `.wanta-python` interpreter or an exact selected
   project's `.venv` / `venv` interpreter, directly or through `uv pip --python`; standard Node.js
-  install/ci/add/remove/update operations use npm/pnpm/yarn/bun commands explicitly targeted at the
-  turn process directory or selected project and may be lockfile-driven without package arguments.
+  install/ci/add/remove/update operations use npm/pnpm/yarn/bun commands targeted at the
+  turn process directory or selected project — either with an explicit `cd` / `--prefix` / `--dir`,
+  or when the permission request's proven cwd (metadata or ACP session cwd) is that root — and may be lockfile-driven without package arguments.
   Normal extras, version constraints, and unfamiliar ordinary flags are accepted
   without Wanta pinning a version. Node.js and Python package runners are ordinary local execution
   rather than a separate high-risk class. Package names, package size, and

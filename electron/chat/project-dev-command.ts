@@ -8,7 +8,7 @@ import {
   commandBodyAfterBoundedCd,
   commandBodyAfterLikelyCd,
   commandPathArguments,
-  commandWithoutSafeOutputFilter,
+  commandWithoutInertOutputSuffixes,
   explicitCdDirectory,
   hasUnsafeShellSyntax,
   optionValue,
@@ -18,6 +18,7 @@ import {
   shellWords,
   splitLeadingAnd,
 } from "./shell-command.ts"
+import { unwrappedShellCommandWords } from "./shell-syntax.ts"
 
 const projectDevCommandGrantPattern = "project_dev_command"
 const packageManagers = new Set(["bun", "npm", "pnpm", "yarn"])
@@ -232,11 +233,13 @@ function directInstallArgumentsUseStandardRegistry(words: readonly string[]): bo
   )
 }
 
-function commandExplicitlyTargetsProject(command: string, projectRoot: string): boolean {
+function commandExplicitlyTargetsRoot(command: string, projectRoot: string): boolean | undefined {
   const split = splitLeadingAnd(command)
   if (split) {
     const directory = explicitCdDirectory(split.left)
-    return Boolean(directory && projectPathAllowed(directory, projectRoot))
+    if (directory) {
+      return projectPathAllowed(directory, projectRoot)
+    }
   }
   const words = shellWords(command)
   if (!words) {
@@ -251,7 +254,15 @@ function commandExplicitlyTargetsProject(command: string, projectRoot: string): 
     const directory = word.includes("=") ? optionValue(word) : words[index + 1]
     return Boolean(directory && projectPathAllowed(directory, projectRoot))
   }
-  return false
+  return undefined
+}
+
+function commandTargetsBoundedRoot(command: string, projectRoot: string, implicitWorkingDirectory?: string): boolean {
+  const explicit = commandExplicitlyTargetsRoot(command, projectRoot)
+  if (explicit !== undefined) {
+    return explicit
+  }
+  return Boolean(implicitWorkingDirectory && projectPathAllowed(implicitWorkingDirectory, projectRoot))
 }
 
 function directDevCommandAllowed(words: readonly string[]): boolean {
@@ -291,11 +302,12 @@ function commandArgumentsSafeForProject(words: readonly string[], projectRoot: s
 
 function parsedProjectDevCommandWords(command: string, projectRoot: string): string[] | null {
   const rawBody = commandBodyAfterProjectCd(command.trim(), projectRoot)
-  const body = rawBody ? commandWithoutSafeOutputFilter(rawBody) : undefined
+  const body = rawBody ? commandWithoutInertOutputSuffixes(rawBody) : undefined
   if (!body || hasUnsafeShellSyntax(body)) {
     return null
   }
-  const words = shellWords(body)
+  const parsed = shellWords(body)
+  const words = parsed ? [...unwrappedShellCommandWords(parsed, false)] : null
   if (!words || words.length === 0 || !commandArgumentsSafeForProject(words, projectRoot)) {
     return null
   }
@@ -303,7 +315,7 @@ function parsedProjectDevCommandWords(command: string, projectRoot: string): str
 }
 
 function parsedLikelyProjectDevCommandWords(command: string): string[] | null {
-  const body = commandWithoutSafeOutputFilter(commandBodyAfterLikelyCd(command.trim()))
+  const body = commandWithoutInertOutputSuffixes(commandBodyAfterLikelyCd(command.trim()))
   if (!body || hasUnsafeShellSyntax(body)) {
     return null
   }
@@ -341,6 +353,7 @@ export function isProjectDevCommandRequest(request: ChatPermissionRequest, proje
 export function isStandardRegistryNodeDependencyInstallRequest(
   request: ChatPermissionRequest,
   targetRoot: string,
+  implicitWorkingDirectory?: string,
 ): boolean {
   if (permissionRequestKind(request) !== "command") {
     return false
@@ -350,7 +363,7 @@ export function isStandardRegistryNodeDependencyInstallRequest(
   return Boolean(
     command &&
     words &&
-    commandExplicitlyTargetsProject(command, targetRoot) &&
+    commandTargetsBoundedRoot(command, targetRoot, implicitWorkingDirectory) &&
     packageDependencyInstallAllowed(words) &&
     directInstallArgumentsUseStandardRegistry(words),
   )

@@ -69,6 +69,48 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+it("normalizes edited aliases before saving and permits clearing them", async () => {
+  const updateAlias = vi.fn(async () => true)
+  const host = document.createElement("div")
+  document.body.append(host)
+  const root = createRoot(host)
+  await act(async () =>
+    root.render(
+      <I18nContext.Provider
+        value={{ locale: "en", setLocale: () => undefined, t: (key, vars) => translate("en", key, vars) }}
+      >
+        <ConnectionAccountsList
+          busy={null}
+          canManageConnections
+          polling={null}
+          provider={{ ...provider, apps: [{ ...app, authType: "oauth2", alias: "original" }] }}
+          connections={{ updateAlias } as unknown as UseConnections}
+          onConnect={async () => undefined}
+          onDisconnect={() => undefined}
+          onOpenAccess={() => undefined}
+        />
+      </I18nContext.Provider>,
+    ),
+  )
+  for (const [inputValue, savedValue] of [
+    ["-_Work_01", "work_01"],
+    ["", ""],
+  ]) {
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Edit connection name"]')!.click())
+    const input = host.querySelector<HTMLInputElement>("input")!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, inputValue)
+      input.dispatchEvent(new Event("input", { bubbles: true }))
+    })
+    expect(input.value).toBe(savedValue)
+    const save = host.querySelector<HTMLButtonElement>('[aria-label="Save connection name"]')!
+    expect(save.disabled).toBe(false)
+    await act(async () => save.click())
+    expect(updateAlias).toHaveBeenLastCalledWith(app.id, savedValue)
+  }
+  act(() => root.unmount())
+})
+
 describe("ConnectionAccountsList access dialog ownership", () => {
   it("delegates access opening without mounting a modal from duplicated responsive lists", async () => {
     const onOpenAccess = vi.fn()
@@ -83,6 +125,137 @@ describe("ConnectionAccountsList access dialog ownership", () => {
     expect(onOpenAccess).toHaveBeenCalledOnce()
     expect(onOpenAccess).toHaveBeenCalledWith(app)
     expect(document.querySelectorAll('[aria-modal="true"]')).toHaveLength(0)
+
+    act(() => root.unmount())
+  })
+
+  it("shows Marketplace identity and default selection without credential mutations", async () => {
+    const marketplaceApp: ConnectionAppSummary = {
+      authType: "api_key",
+      createdAt: 0,
+      id: "marketplace:oomol:tikhub",
+      isDefault: false,
+      marketplace: { id: "oomol", pricing: "metered" },
+      service: "tikhub",
+      status: "active",
+      updatedAt: 0,
+    }
+    const marketplaceProvider: ConnectionProviderSummary = {
+      actionKind: "api_key",
+      appAuthType: "marketplace",
+      appCount: 1,
+      appId: marketplaceApp.id,
+      apps: [marketplaceApp],
+      authTypes: ["api_key"],
+      canDisconnect: false,
+      categoryLabels: [],
+      displayName: "TikHub",
+      service: "tikhub",
+      status: "connected",
+    }
+    const setDefaultConnection = vi.fn(async () => true)
+    const host = document.createElement("div")
+    document.body.append(host)
+    const root = createRoot(host)
+    await act(async () => {
+      root.render(
+        <I18nContext.Provider
+          value={{ locale: "en", setLocale: () => undefined, t: (key, vars) => translate("en", key, vars) }}
+        >
+          <ConnectionAccountsList
+            accessContext={{} as never}
+            busy={null}
+            canManageConnections
+            connections={{ setDefaultConnection } as unknown as UseConnections}
+            onConnect={async () => undefined}
+            onDisconnect={() => undefined}
+            onOpenAccess={() => undefined}
+            polling={null}
+            provider={marketplaceProvider}
+          />
+        </I18nContext.Provider>,
+      )
+    })
+
+    expect(host.textContent).toContain("OOMOL built-in account")
+    expect(host.textContent).toContain("OOMOL managed")
+    expect(host.textContent).toContain("Uses OOMOL Credits")
+    expect(host.textContent).toContain("Set as default")
+    expect(host.textContent).not.toContain("Reconnect")
+    expect(host.textContent).not.toContain("Disconnect")
+    expect(host.querySelector('[aria-label="Edit connection name"]')).toBeNull()
+
+    const setDefaultButton = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Set as default"),
+    )
+    await act(async () => setDefaultButton?.click())
+    expect(setDefaultConnection).toHaveBeenCalledWith("tikhub", marketplaceApp.id)
+
+    act(() => root.unmount())
+  })
+
+  it("switches a Marketplace default back to a user connection without a metered label for free usage", async () => {
+    const marketplaceApp: ConnectionAppSummary = {
+      authType: "marketplace",
+      createdAt: 0,
+      id: "marketplace:oomol:tinypng",
+      isDefault: true,
+      marketplace: { id: "oomol", pricing: "free" },
+      service: "tinypng",
+      status: "active",
+      updatedAt: 0,
+    }
+    const userApp: ConnectionAppSummary = {
+      accountLabel: "My TinyPNG key",
+      authType: "api_key",
+      createdAt: 1,
+      id: "app-user-key",
+      isDefault: false,
+      service: "tinypng",
+      status: "active",
+      updatedAt: 2,
+    }
+    const setDefaultConnection = vi.fn(async () => true)
+    const host = document.createElement("div")
+    document.body.append(host)
+    const root = createRoot(host)
+    await act(async () => {
+      root.render(
+        <I18nContext.Provider
+          value={{ locale: "en", setLocale: () => undefined, t: (key, vars) => translate("en", key, vars) }}
+        >
+          <ConnectionAccountsList
+            busy={null}
+            canManageConnections
+            connections={{ setDefaultConnection } as unknown as UseConnections}
+            onConnect={async () => undefined}
+            onDisconnect={() => undefined}
+            onOpenAccess={() => undefined}
+            polling={null}
+            provider={{
+              actionKind: "api_key",
+              appAuthType: "marketplace",
+              appCount: 2,
+              appId: marketplaceApp.id,
+              apps: [marketplaceApp, userApp],
+              authTypes: ["api_key"],
+              canDisconnect: true,
+              categoryLabels: [],
+              displayName: "TinyPNG",
+              service: "tinypng",
+              status: "connected",
+            }}
+          />
+        </I18nContext.Provider>,
+      )
+    })
+
+    expect(host.textContent).not.toContain("Uses OOMOL Credits")
+    const setDefaultButton = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Set as default"),
+    )
+    await act(async () => setDefaultButton?.click())
+    expect(setDefaultConnection).toHaveBeenCalledWith("tinypng", userApp.id)
 
     act(() => root.unmount())
   })

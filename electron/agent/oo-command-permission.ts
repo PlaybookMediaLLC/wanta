@@ -1,3 +1,5 @@
+import { effectiveShellCommandWords, topLevelShellSegments } from "../chat/shell-syntax.ts"
+
 export const OO_CLI_BASH_PERMISSION = {
   // 直接 oo 调用走 OpenCode 快速路径；其它 shell 进入 ChatService 默认访问策略，
   // 由主进程自动批准普通 bash，仅在基础安全边界暂停。
@@ -131,8 +133,63 @@ function shellWords(command: string): string[] | null {
   return words
 }
 
+const nonSensitiveEnvironmentNames = new Set([
+  "CI",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "NODE_ENV",
+  "PATH",
+  "PWD",
+  "SHELL",
+  "TEMP",
+  "TERM",
+  "TMP",
+  "TMPDIR",
+])
+
+/** Plain env launchers set up a process; they do not print the environment. */
+function environmentLauncherCommand(command: string): string | undefined {
+  if (!/^(?:env|'env'|"env")(?:\s|$)/u.test(command)) return undefined
+  if (hasUnsafeShellSyntax(command)) return undefined
+  const words = shellWords(command)
+  if (words?.[0] !== "env") return undefined
+  // env -S has its own expansion language; keep it outside this exception.
+  if (words.some((word) => word === "-S" || word.startsWith("-S") || word.startsWith("--split-string")))
+    return undefined
+  const executableWords = effectiveShellCommandWords(words)
+  if (!executableWords.length) return undefined
+  return executableWords
+    .map((word) => (/^[A-Za-z0-9_./-]+$/u.test(word) ? word : `'${word.replace(/'/gu, "'\\''")}'`))
+    .join(" ")
+}
+
 function isEnvironmentDump(command: string): boolean {
-  if (environmentDumpCommand.test(command)) return true
+  for (const { text } of topLevelShellSegments(command)) {
+    if (!environmentDumpCommand.test(text) && text[0] !== "'" && text[0] !== '"') continue
+    const words = shellWords(text)
+    if (!words || !environmentDumpCommand.test(words.join(" "))) continue
+    if (environmentLauncherCommand(text)) continue
+    if (
+      words?.[0] === "printenv" &&
+      words.length > 1 &&
+      words.slice(1).every((word) => nonSensitiveEnvironmentNames.has(word)) &&
+      !hasUnsafeShellSyntax(text)
+    )
+      continue
+    // `export NAME=value` sets variables without printing the environment.
+    // Admit only assignments with no executable shell syntax; all remaining
+    // segments still pass through the normal command and credential policies.
+    if (
+      words?.[0] === "export" &&
+      words.length > 1 &&
+      words.slice(1).every((word) => /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) &&
+      !hasUnsafeShellSyntax(text)
+    )
+      continue
+    return true
+  }
   const words = shellWords(command)
   if (!words || !["bash", "sh", "zsh"].includes(words[0] ?? "")) return false
   return words.slice(1).some((word) => ["env", "printenv", "set", "export"].includes(word))
@@ -176,6 +233,7 @@ function shellWrapperCommand(command: string): ShellWrapper {
 // can never smuggle a forbidden subcommand past forbiddenOoMutation.
 const ooGlobalFlagWithValue = "--lang"
 const ooGlobalBooleanFlags = new Set(["--debug", "-h", "--help", "-V", "--version"])
+const safeOoEnvironmentAssignments = new Set(["BUN_BE_BUN=1"])
 
 /** Advance past oo global flags (commander accepts them before AND between subcommands). */
 function skipOoGlobalFlags(tokens: readonly string[], start: number): number {
@@ -195,13 +253,21 @@ function skipOoGlobalFlags(tokens: readonly string[], start: number): number {
   return index
 }
 
+function ooExecutableIndex(words: readonly string[]): number {
+  let index = 0
+  while (safeOoEnvironmentAssignments.has(words[index] ?? "")) index += 1
+  return isOoExecutable(words[index] ?? "") ? index : -1
+}
+
 /** Tokens of a single `oo ...` command after skipping leading global flags, or null if not a bare oo call. */
 function ooSubcommandTokens(command: string): string[] | null {
   const words = shellWords(command.trim())
-  if (!words || !isOoExecutable(words[0] ?? "")) {
+  if (!words) {
     return null
   }
-  return words.slice(skipOoGlobalFlags(words, 1))
+  const executableIndex = ooExecutableIndex(words)
+  if (executableIndex < 0) return null
+  return words.slice(skipOoGlobalFlags(words, executableIndex + 1))
 }
 
 export type ConnectorBusinessCliTransport = "bare" | "managed"
@@ -269,8 +335,10 @@ export function isPureOoCliCommand(command: string): boolean {
     return false
   }
 
-  // 不自动放行前置 env 赋值，避免 PATH / endpoint / 二进制路径被这一条命令改写。
-  return isOoExecutable(words[0] ?? "")
+  // The bundled Bun launcher may add this one inert runtime marker. Continue
+  // rejecting arbitrary environment assignments so PATH, endpoints, tokens,
+  // and executable resolution cannot be changed by an auto-approved command.
+  return ooExecutableIndex(words) >= 0
 }
 
 export function isOoCliCommand(command: string): boolean {
@@ -284,19 +352,74 @@ export function isOoCliCommand(command: string): boolean {
   return false
 }
 
+export type OoCommandDenyReason =
+  | "credential_reference"
+  | "environment_dump"
+  | "runtime_environment_override"
+  | "runtime_auth_mutation"
+  | "runtime_option_override"
+
+function isLiteralCredentialNameSearch(command: string, depth = 0): boolean {
+  if (depth >= maxShellWrapperDepth || /[$`]/u.test(command)) return false
+  const segments = topLevelShellSegments(command)
+  if (segments.length > 1) {
+    return segments.every(
+      ({ text }) => !credentialEnvironmentReference.test(text) || isLiteralCredentialNameSearch(text, depth + 1),
+    )
+  }
+  const wrapper = shellWrapperCommand(command)
+  if (wrapper.kind === "command") return isLiteralCredentialNameSearch(wrapper.command, depth + 1)
+  if (hasUnsafeShellSyntax(command)) return false
+  const words = shellWords(command)
+  return words !== null && ["rg", "grep"].includes(words[0] ?? "")
+}
+
+function directCommandDenyReason(command: string): OoCommandDenyReason | null {
+  if (credentialEnvironmentReference.test(command) && !isLiteralCredentialNameSearch(command))
+    return "credential_reference"
+  if (isEnvironmentDump(command)) return "environment_dump"
+  if (linkEnvironmentAssignment.test(command)) return "runtime_environment_override"
+  if (forbiddenOoMutation.test(command) || isForbiddenOoMutationCommand(command)) return "runtime_auth_mutation"
+  if (ooCommandSegment.test(command) && forbiddenOoOption.test(command)) return "runtime_option_override"
+  return null
+}
+
+/** Stable metadata only: never return command text, values, or credentials. */
+export function ooCommandDenyReason(command: string): OoCommandDenyReason | null {
+  return inspectCommandDenyReason(command, 0)
+}
+
+function inspectCommandDenyReason(command: string, startDepth: number): OoCommandDenyReason | null {
+  let current = command.trim()
+  for (let depth = startDepth; depth < maxShellWrapperDepth; depth += 1) {
+    const reason = directCommandDenyReason(current)
+    if (reason) return reason
+    // Inspect each command after an assignment prefix too, including global
+    // flags before protected OO subcommands.
+    for (const { text } of topLevelShellSegments(current)) {
+      const segmentReason = directCommandDenyReason(text)
+      if (segmentReason) return segmentReason
+      if (text !== current) {
+        const nestedReason = inspectCommandDenyReason(text, depth + 1)
+        if (nestedReason) return nestedReason
+      }
+    }
+    const launcher = environmentLauncherCommand(current)
+    if (launcher) {
+      current = launcher
+      continue
+    }
+    const wrapper = shellWrapperCommand(current)
+    if (wrapper.kind !== "command") return null
+    current = wrapper.command
+  }
+  return null
+}
+
 export function openConnectorCommandPolicy(command: string): "allow" | "deny" | null {
+  if (ooCommandDenyReason(command)) return "deny"
   let current = command.trim()
   for (let depth = 0; depth < maxShellWrapperDepth; depth += 1) {
-    if (
-      credentialEnvironmentReference.test(current) ||
-      isEnvironmentDump(current) ||
-      linkEnvironmentAssignment.test(current) ||
-      forbiddenOoMutation.test(current) ||
-      isForbiddenOoMutationCommand(current) ||
-      (ooCommandSegment.test(current) && forbiddenOoOption.test(current))
-    ) {
-      return "deny"
-    }
     if (isPureOoCliCommand(current)) return "allow"
     const wrapper = shellWrapperCommand(current)
     if (wrapper.kind === "unsupported" || wrapper.kind === "not_wrapper") return null

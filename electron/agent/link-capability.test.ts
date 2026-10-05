@@ -1,7 +1,10 @@
-import type { LinkCommandExecutor } from "./link-capability.ts"
+import type { LinkActionAuditRecord, LinkCommandExecutor } from "./link-capability.ts"
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { describe, expect, test, vi } from "vitest"
 import { HostCapabilityServer } from "./host-capability-server.ts"
 import { HostCapabilityKernel } from "./host-capability.ts"
@@ -98,6 +101,144 @@ describe("LinkCapability", () => {
     expect(calls[1].env["WANTA_TEAM_NAME"]).toBe("Analytics Team")
   })
 
+  test("rejects cached contract violations locally before dispatching the connector action", async () => {
+    const { calls, capability } = oomolHarness((args) => {
+      if (args[1] !== "schema") return JSON.stringify({ ok: true })
+      return JSON.stringify({
+        inputSchema: {
+          additionalProperties: false,
+          properties: {
+            limit: { type: "integer" },
+            project_id: { type: "integer" },
+          },
+          required: ["project_id"],
+          type: "object",
+        },
+        name: "list_projects",
+      })
+    })
+    const context = { sessionId: "session-1", teamName: "Analytics Team" }
+
+    await capability.inspectActions(context, ["posthog.list_projects"])
+    const result = JSON.parse(
+      await capability.callAction(context, {
+        action: "list_projects",
+        params: { unexpected: true },
+        service: "posthog",
+      }),
+    ) as Record<string, unknown>
+
+    expect(result).toMatchObject({
+      status: "error",
+      errorCode: "invalid_action_params",
+      service: "posthog",
+      action: "list_projects",
+    })
+    expect(result["invalidFields"]).toEqual(
+      expect.arrayContaining(["params.project_id: required", "params.unexpected: unknown field"]),
+    )
+    expect(calls).toHaveLength(1)
+  })
+
+  test("uses and removes managed large-payload files after dispatch, errors, and skipped actions", async () => {
+    const processDir = await mkdtemp(path.join(tmpdir(), "wanta-link-payload-"))
+    let runCount = 0
+    const { calls, capability } = oomolHarness(() => {
+      runCount += 1
+      if (runCount === 2) {
+        throw Object.assign(new Error("connector failed"), {
+          stderr: "Connector action list_projects returned HTTP 403 (errorCode: POLICY_DENIED): denied",
+        })
+      }
+      return JSON.stringify({ ok: true })
+    })
+    const payload = { query: "x".repeat(9 * 1024) }
+    try {
+      await capability.callAction(
+        { processDir, sessionId: "session-1", teamName: "Analytics Team" },
+        { action: "run_query", params: payload, service: "posthog" },
+      )
+      await capability.callAction(
+        { processDir, sessionId: "session-1", teamName: "Analytics Team" },
+        { action: "list_projects", params: payload, service: "posthog" },
+      )
+      await capability.callAction(
+        { processDir, sessionId: "session-1", teamName: "Analytics Team" },
+        { action: "list_projects", params: payload, service: "posthog" },
+      )
+
+      const payloadArguments = calls.map((call) => {
+        const dataIndex = call.args.indexOf("--data")
+        return dataIndex >= 0 ? call.args[dataIndex + 1] : undefined
+      })
+      expect(payloadArguments).toHaveLength(2)
+      for (const data of payloadArguments) {
+        expect(data).toMatch(/^@\/.*link-payload-[0-9a-f-]+\.json$/u)
+        await expect(readFile(String(data).slice(1), "utf8")).rejects.toMatchObject({ code: "ENOENT" })
+      }
+      expect(await readdir(processDir)).toEqual([])
+    } finally {
+      await rm(processDir, { force: true, recursive: true })
+    }
+  })
+
+  test("emits metadata-only Link diagnostics for an external MCP action", async () => {
+    const diagnostics: LinkActionAuditRecord[] = []
+    const execute: LinkCommandExecutor = vi.fn(async () => {
+      throw Object.assign(new Error("connector failed"), {
+        stderr: "Connector action run_query returned HTTP 400 (errorCode: invalid_input): invalid query",
+      })
+    })
+    const capability = new LinkCapability({
+      execute,
+      onActionAudit: (record) => diagnostics.push(record),
+      ooBinPath: "/fake/oo",
+      runtime: () => ({ linkRuntime: { kind: "oomol", sessionToken: "secret-session-token" } }),
+      storeDir: "/private/wanta/link",
+    })
+
+    await capability.callAction(
+      { agentKind: "codex", sessionId: "session-1", teamName: "Analytics Team", transport: "host_mcp" },
+      { action: "run_query", params: { query: "invalid" }, service: "posthog" },
+    )
+
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        action: "run_query",
+        agentKind: "codex",
+        errorCode: "invalid_input",
+        httpStatus: 400,
+        outcome: "error",
+        retryCount: 0,
+        schemaValidated: false,
+        service: "posthog",
+        transport: "host_mcp",
+      }),
+    ])
+    expect(JSON.stringify(diagnostics)).not.toContain("secret-session-token")
+    expect(JSON.stringify(diagnostics)).not.toContain("invalid query")
+  })
+
+  test("does not let a diagnostic callback failure alter a successful action result", async () => {
+    const execute: LinkCommandExecutor = vi.fn(async () => ({ stderr: "", stdout: JSON.stringify({ ok: true }) }))
+    const guarded = new LinkCapability({
+      execute,
+      onActionAudit: () => {
+        throw new Error("diagnostics unavailable")
+      },
+      ooBinPath: "/fake/oo",
+      runtime: () => ({ linkRuntime: { kind: "oomol", sessionToken: "secret-session-token" } }),
+      storeDir: "/private/wanta/link",
+    })
+
+    await expect(
+      guarded.callAction(
+        { agentKind: "codex", sessionId: "session-1", teamName: "Analytics Team", transport: "host_mcp" },
+        { action: "list_projects", service: "posthog" },
+      ),
+    ).resolves.toBe(JSON.stringify({ ok: true }))
+  })
+
   test("validates an explicit connection name against the active workspace", async () => {
     const { calls, capability } = oomolHarness((args) =>
       args[1] === "apps"
@@ -112,6 +253,106 @@ describe("LinkCapability", () => {
     expect(JSON.parse(result)).toMatchObject({ status: "error", errorCode: "invalid_connection_name" })
     expect(calls).toHaveLength(1)
     expect(calls[0].args).toEqual(["connector", "apps", "posthog", "--team", "Analytics Team", "--json"])
+  })
+
+  test("preserves an explicit OOMOL Marketplace connection selector", async () => {
+    const { calls, capability } = oomolHarness((args) =>
+      args[1] === "apps"
+        ? JSON.stringify({
+            apps: [
+              {
+                authType: "marketplace",
+                connectionName: "marketplace_oomol",
+                marketplace: { id: "oomol", pricing: "metered" },
+                status: "active",
+              },
+            ],
+          })
+        : JSON.stringify({ ok: true }),
+    )
+
+    await capability.callAction(
+      { sessionId: "session-1", teamName: "Analytics Team" },
+      { action: "invoke_endpoint", connectionName: "marketplace_oomol", service: "tikhub" },
+    )
+
+    expect(calls[0]?.args).toEqual(["connector", "apps", "tikhub", "--team", "Analytics Team", "--json"])
+    expect(calls[1]?.args).toEqual([
+      "connector",
+      "run",
+      "tikhub",
+      "--action",
+      "invoke_endpoint",
+      "--data",
+      "{}",
+      "--connection-name",
+      "marketplace_oomol",
+      "--team",
+      "Analytics Team",
+      "--json",
+    ])
+  })
+
+  test("leaves no-selector calls to the Connector's saved Marketplace default", async () => {
+    const { calls, capability } = oomolHarness(() => JSON.stringify({ ok: true }))
+
+    await capability.callAction(
+      { sessionId: "session-1", teamName: "Analytics Team" },
+      { action: "invoke_endpoint", service: "tikhub" },
+    )
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.args).toEqual([
+      "connector",
+      "run",
+      "tikhub",
+      "--action",
+      "invoke_endpoint",
+      "--data",
+      "{}",
+      "--team",
+      "Analytics Team",
+      "--json",
+    ])
+  })
+
+  test("does not turn Marketplace execution failures into credential setup prompts", async () => {
+    for (const [errorCode, expectedErrorCode] of [
+      ["app_not_found", "marketplace_action_unavailable"],
+      ["insufficient_credits", "insufficient_credits"],
+      ["rate_limited", "rate_limited"],
+      ["provider_error", "provider_error"],
+      ["POLICY_DENIED", "POLICY_DENIED"],
+    ] as const) {
+      const execute: LinkCommandExecutor = vi.fn(async (_command, args) => {
+        if (args[1] === "apps") {
+          return {
+            stdout: JSON.stringify({ apps: [{ connectionName: "marketplace_oomol", status: "active" }] }),
+            stderr: "",
+          }
+        }
+        throw Object.assign(new Error("connector failed"), {
+          stderr: `Connector action invoke_endpoint returned HTTP 400 (errorCode: ${errorCode}): failed`,
+        })
+      })
+      const capability = new LinkCapability({
+        execute,
+        ooBinPath: "/fake/oo",
+        runtime: () => ({ linkRuntime: { kind: "oomol", sessionToken: "secret-session-token" } }),
+        storeDir: "/private/wanta/link",
+      })
+
+      const result = JSON.parse(
+        await capability.callAction(
+          { sessionId: "session-1", teamName: "Analytics Team" },
+          { action: "invoke_endpoint", connectionName: "marketplace_oomol", service: "tikhub" },
+        ),
+      ) as Record<string, unknown>
+
+      expect(result).toMatchObject({ status: "error", errorCode: expectedErrorCode })
+      expect(result).not.toHaveProperty("authUrl")
+      expect(result).not.toHaveProperty("status", "authorization_required")
+    }
   })
 
   test("returns a redacted, workspace-specific authorization result", async () => {
@@ -212,6 +453,37 @@ describe("LinkCapability", () => {
     expect(execute).toHaveBeenCalledTimes(1)
   })
 
+  test("blocks repeated action-level policy denials without blocking independent actions", async () => {
+    const execute: LinkCommandExecutor = vi.fn(async () => {
+      throw Object.assign(new Error("connector failed"), {
+        stderr: "Connector action run_query returned HTTP 403 (errorCode: POLICY_DENIED): access denied by policy",
+      })
+    })
+    const capability = new LinkCapability({
+      execute,
+      ooBinPath: "/fake/oo",
+      runtime: () => ({ linkRuntime: { kind: "oomol", sessionToken: "secret-session-token" } }),
+      storeDir: "/private/wanta/link",
+    })
+    const context = { sessionId: "session-1", teamName: "Analytics Team" }
+    const denied = { action: "run_query", service: "posthog" }
+
+    expect(JSON.parse(await capability.callAction(context, denied))).toMatchObject({
+      status: "error",
+      errorCode: "POLICY_DENIED",
+    })
+    expect(JSON.parse(await capability.callAction(context, denied))).toMatchObject({
+      status: "skipped",
+      reason: "action_denied_cached",
+      errorCode: "POLICY_DENIED",
+      authorizationState: "action_denied",
+    })
+    expect(execute).toHaveBeenCalledTimes(1)
+
+    await capability.callAction(context, { action: "list_projects", service: "posthog" })
+    expect(execute).toHaveBeenCalledTimes(2)
+  })
+
   test("coalesces concurrent authorization probes and blocks repeated calls to the same connection", async () => {
     let release: (() => void) | undefined
     const execute: LinkCommandExecutor = vi.fn(
@@ -271,6 +543,23 @@ describe("LinkCapability", () => {
     )
 
     expect(maxActive).toBe(2)
+
+    // A drained queue must return every handed-off slot. The previous counter
+    // implementation leaked once per waiter: the first burst completed, but a
+    // later call parked forever because no active call remained to wake it.
+    await expect(
+      Promise.race([
+        capability.callAction(context, {
+          action: "run_query",
+          params: { projectId: "after-drain" },
+          service: "posthog",
+        }),
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("post-drain action slot was never released")), 250),
+        ),
+      ]),
+    ).resolves.toBe(JSON.stringify({ data: { ok: true } }))
+    expect(execute).toHaveBeenCalledTimes(9)
   })
 })
 

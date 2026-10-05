@@ -19,12 +19,15 @@ import { reportRendererHandledError } from "@/lib/renderer-diagnostics"
 import { cn } from "@/lib/utils"
 
 interface ComposerTrailingControlsProps {
+  agentConfigurationDisabled?: boolean
   canSubmit: boolean
   composerDisabled: boolean
   contextUsage: ContextUsageInfo | null
   turnState: ChatTurnState
   modelCatalog: ModelCatalog | null
   modelRequired?: boolean
+  agentCatalogLoading?: boolean
+  agentCatalogError?: boolean
   agentCatalog?: ExternalAgentCatalog
   agentEffortId?: string
   agentEffortSelectionEnabled?: boolean
@@ -207,6 +210,7 @@ function VoiceRecorderPanel({
 }
 
 export function ComposerTrailingControls({
+  agentConfigurationDisabled = false,
   canSubmit,
   composerDisabled,
   contextUsage,
@@ -214,6 +218,8 @@ export function ComposerTrailingControls({
   modelCatalog,
   modelRequired = false,
   agentCatalog,
+  agentCatalogLoading,
+  agentCatalogError,
   agentEffortId,
   agentEffortSelectionEnabled,
   agentKind,
@@ -349,7 +355,10 @@ export function ComposerTrailingControls({
               </>
             ) : null}
             <ComposerModeControls
+              agentConfigurationDisabled={agentConfigurationDisabled}
               agentCatalog={agentCatalog}
+              agentCatalogLoading={agentCatalogLoading}
+              agentCatalogError={agentCatalogError}
               agentEffortId={agentEffortId}
               agentEffortSelectionEnabled={agentEffortSelectionEnabled}
               agentKind={agentKind}

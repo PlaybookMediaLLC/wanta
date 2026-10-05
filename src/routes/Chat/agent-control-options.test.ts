@@ -18,7 +18,7 @@ const labels = {
   notDetected: "Not detected",
 }
 
-const externalKind = EXTERNAL_AGENT_KINDS[0]!
+const externalKind = "codex" as const
 const otherExternalKind = EXTERNAL_AGENT_KINDS.find((kind) => kind !== externalKind)!
 
 function externalStatus(overrides: Partial<ExternalAgentRuntimeStatus>): ExternalAgentRuntimeStatus {
@@ -41,13 +41,13 @@ describe("composerCapabilitiesForProfile", () => {
     })
   })
 
-  it("disables model routing and modes but keeps attachments for external profiles", () => {
+  it("uses each external profile's declared model owner", () => {
     // Attachments are delivered as file references the agent resolves itself,
     // so every external agent supports them; model routing and Wanta modes
     // stay agent-owned.
     for (const kind of EXTERNAL_AGENT_KINDS) {
       expect(composerCapabilitiesForProfile(AGENT_PROFILES[kind])).toEqual({
-        agentModesEnabled: false,
+        agentModesEnabled: kind === "codex",
         attachmentsEnabled: true,
         modelRoutingEnabled: false,
       })
@@ -187,4 +187,17 @@ describe("normalizeAgentOptionValue", () => {
     expect(normalizeAgentOptionValue(undefined, "default")).toBeUndefined()
     expect(normalizeAgentOptionValue("sonnet", undefined)).toBe("sonnet")
   })
+})
+
+it("keeps a concrete default effort distinct from following the native default", () => {
+  const rows = buildAgentOptionRows(
+    [
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High" },
+    ],
+    "medium",
+    { defaultLabel: "Default", defaultDescription: "Follow agent" },
+  )
+  expect(rows.map((row) => row.id)).toEqual(["__default__", "medium", "high"])
+  expect(normalizeAgentOptionValue("medium", "medium")).toBe("medium")
 })

@@ -78,8 +78,8 @@ Connector availability is still incorrectly derived from the OOMOL runtime:
 
 The bundled oo CLI is sufficient for the first implementation:
 
-- scripts/oo-cli.ts pins oo CLI 1.7.1.
-- oo 1.7.1 supports a self-hosted connector via connector login and the
+- scripts/oo-cli.ts pins oo CLI 1.7.12.
+- oo 1.7.12 supports a self-hosted connector via connector login and the
   OO_CONNECTOR_URL / OO_CONNECTOR_TOKEN environment variables.
 - The OpenConnector runtime exposes compatible apps, action search, action
   metadata, action execution, and provider metadata endpoints.
@@ -88,7 +88,7 @@ The bundled oo CLI is sufficient for the first implementation:
   response envelopes.
 - The deterministic same-`OO_DATA_DIR` A -> B -> A probe returned the A schema,
   then the distinct B schema, then the original A schema for the same service
-  and action. oo 1.5.1 therefore namespaces this cache by connector endpoint;
+  and action. The original packaged oo 1.7.7 probe demonstrated endpoint-aware cache namespacing;
   Wanta keeps the existing isolated Agent `OO_DATA_DIR` and does not add a
   second endpoint-hash directory layer.
 
@@ -262,7 +262,7 @@ remains model_required and advertises no executable Link tools.
 - Run Wanta once and verify the current OOMOL, local custom-model, and
   Connections behavior.
 - Start the local OpenConnector repository and verify both /health and /v1/health.
-- Verify oo 1.5.1 schema-cache isolation before implementation:
+- Verify packaged oo 1.7.7 schema-cache isolation before implementation:
   - run mock connector endpoints A and B from the same temporary OO_DATA_DIR;
   - return different schemas for the same service and action from each
     endpoint;
@@ -275,7 +275,7 @@ remains model_required and advertises no executable Link tools.
 - If the schema cache is not endpoint-aware, partition the Agent OO_DATA_DIR by
   a stable hash of the backend and normalized endpoint. Prefer this over a
   broad cache clear or refresh on every runtime switch.
-- Keep oo CLI pinned at the verified 1.7.1 version; upgrades still require real OOMOL and
+- Keep oo CLI pinned at 1.7.12; upgrades still require real OOMOL and
   OpenConnector runtime smoke tests.
 
 ### Verification
@@ -292,7 +292,7 @@ npm test
 - Pre-existing failures are documented rather than attributed to this feature.
 - A real OpenConnector development runtime is reachable.
 - The current OOMOL behavior has a reproducible baseline.
-- The oo 1.5.1 schema-cache isolation result is documented, and the required
+- The packaged oo 1.7.7 schema-cache isolation result is documented, and the required
   OO_DATA_DIR strategy is decided before Agent environment implementation.
 - The deterministic A -> B -> A probe passes independently of whether hosted
   OOMOL credentials are available.
@@ -308,12 +308,18 @@ npm test
   different schemas. The observed schemas were A, B, A; endpoint switching did
   not reuse the other origin's schema. No additional `OO_DATA_DIR` partition is
   required.
+- The packaged oo 1.7.7 binary was re-verified on 2026-08-25 with the same
+  deterministic A -> B -> A sequence, one temporary `OO_DATA_DIR`, and
+  `oo connector schema demo --action act --json`. The returned
+  `inputSchema.properties.marker.const` values were A, B, A. The shared data
+  directory contained one `cache.sqlite` file (20,480 bytes); switching origins
+  did not return the other origin's cached schema.
 - The production implementation keeps one isolated Agent oo store and adds
   backend plus normalized endpoint identity to Wanta's in-memory inventory,
   authorization, probe, and circuit-breaker keys.
 - Final quality gates passed: `ts-check`, `lint`, `format`, and 1,790 tests in
   252 files.
-- The current packaged CLI is 1.7.1; its version, parser contract, and bundled Skill export passed
+- The current packaged CLI is 1.7.12; its version, command contract, and bundled Skill export passed
   the upgrade checks. The real OpenConnector call recorded below is explicitly the pre-upgrade 1.5.1
   baseline.
 - Real smoke used the sibling OpenConnector with a temporary data directory on
@@ -720,9 +726,8 @@ Every Agent runtime also receives:
 WANTA_TEAM_SCOPE_PATH
 ```
 
-The legacy environment name remains because this file also carries
-sessionKnowledgeBaseIds for query_knowledge; renaming it is outside this
-feature. Resolve OO_DATA_DIR according to the Phase 0 schema-cache probe so
+The environment file carries per-session team scope. Resolve OO_DATA_DIR
+according to the Phase 0 schema-cache probe so
 incompatible endpoint schemas never share a cache namespace.
 
 OOMOL adds:
@@ -783,8 +788,7 @@ ensureAgentWorkspace({
 })
 ```
 
-connectors controls the four Link tools; query_knowledge is written for every
-Agent runtime. It does not control bundled Skills.
+connectors controls the four Link tools. It does not control bundled Skills.
 
 For the first release, bundledOoSkills is true only when the active Link
 runtime is OOMOL. Keep the existing oo, oo-find-skills, oo-create-skill, and
@@ -811,8 +815,6 @@ runtime.
 - The runtime token exists in plaintext only in the trusted OpenConnector
   sidecar/process environment and its child oo process environment.
 - The full isolated OO\_\* environment is present for spawned oo commands.
-- query_knowledge remains available in an OpenConnector runtime and reads
-  sessionKnowledgeBaseIds from WANTA_TEAM_SCOPE_PATH.
 - With an OOMOL account signed in and OpenConnector active, Skill registry
   install, update, and delete still use the OOMOL maintenance environment.
 - No bundled oo Skill is copied into an OpenConnector workspace; an OOMOL Link
@@ -845,8 +847,6 @@ Behavior:
 - OpenConnector Link identity ignores teamName and sessionTeams.
 - OpenConnector appends neither --team nor --personal.
 - OpenConnector's cache key includes its normalized endpoint.
-- query_knowledge remains independent of Link identity and continues reading
-  sessionKnowledgeBaseIds from WANTA_TEAM_SCOPE_PATH in every Agent runtime.
 - Schema caches use the endpoint-aware OO_DATA_DIR strategy decided in Phase 0.
 
 This is mandatory: the bundled oo CLI rejects --team before sending a request
@@ -974,8 +974,7 @@ Tests with a mock runtime prove:
 - provider URLs are encoded correctly;
 - caches and circuit breakers do not cross endpoints;
 - direct /v1/apps inventory maps alias to connectionName and matches oo CLI
-  list_apps semantics;
-- query_knowledge remains usable while OpenConnector is active.
+  list_apps semantics.
 
 ## 10. Phase 5: align tools, permissions, and prompts
 
@@ -1340,7 +1339,6 @@ Agent configuration:
   and its inventory has no Gmail;
 - OOMOL Link workspaces retain all four bundled oo Skills while OpenConnector
   workspaces receive none;
-- query_knowledge in an OpenConnector Agent runtime;
 - OOMOL Skill registry maintenance while OpenConnector is active.
 
 Tool source:
@@ -1436,8 +1434,7 @@ Scenario D, OOMOL regression:
 - while OpenConnector remains active, install, update, and delete an OOMOL
   registry Skill and verify those commands still use the OOMOL account;
 - verify the OpenConnector Agent workspace has no bundled oo Skills while an
-  OOMOL Link workspace retains all four;
-- verify query_knowledge still uses the current sessionKnowledgeBaseIds.
+  OOMOL Link workspace retains all four.
 
 Scenario E, Link available but model missing:
 
@@ -1481,7 +1478,7 @@ This implementation must not:
 - add a main-process oo broker while the credential-bearing sidecar trust model
   remains acceptable;
 - bundle or supervise the sibling connect repository;
-- upgrade the pinned oo CLI without a demonstrated compatibility need;
+- upgrade the pinned oo CLI without reviewing newly documented command domains;
 - refactor unrelated auth, model, team, billing, or Skill modules.
 
 ## 15. Risks and stop conditions
@@ -1542,8 +1539,6 @@ The feature is complete only when:
 - all four Link tools work against OpenConnector;
 - OpenConnector may remain active without a model, but Agent connector
   capability stays false until the Agent can actually start;
-- query_knowledge continues using sessionKnowledgeBaseIds with OpenConnector
-  active;
 - OpenConnector calls never carry OOMOL organization identity;
 - OOMOL team-scoped connector behavior does not regress;
 - OOMOL Skill registry maintenance continues using OOMOL credentials while

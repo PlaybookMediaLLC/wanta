@@ -7,7 +7,7 @@
 ## 1. 审计结论
 
 当前仓库的开源核心、公共安装链和默认二进制准备已经可重复验证。两个 IPC 包已从公共 npm 匿名安装；
-oo CLI 1.7.1 及其内置 Skills 由 MIT 授权覆盖，不再是发布阻塞。正式公开发布的剩余工作集中在完整传递依赖
+oo CLI 1.7.12 及其内置 Skills 由 MIT 授权覆盖，不再是发布阻塞。正式公开发布的剩余工作集中在完整传递依赖
 报告、OOMOL 自有 IPC 包的 license metadata、商标/品牌政策确认、Git 历史 secret scan 和跨平台 release
 验证。
 
@@ -51,14 +51,14 @@ oo CLI 1.7.1 及其内置 Skills 由 MIT 授权覆盖，不再是发布阻塞。
   - postinstall 再通过 oo 导出 Skills 到被 gitignore 的 `resources/skills/`；
   - dev 的 `predev` 当前要求 oo 存在；
   - 默认官方和社区打包都会把 oo 与四个内置 Skills 放入应用资源；
-  - `@oomol-lab/oo-cli@1.7.1` 及对应平台包在公共 npm 声明 MIT，并指向公开
+  - `@oomol-lab/oo-cli@1.7.12` 及对应平台包在公共 npm 声明 MIT，并指向公开
     `oomol-lab/oo-cli` 仓库；内置 Skills 属于同一 MIT 分发内容。
 - 处理：`THIRD_PARTY_NOTICES.md` 记录 oo CLI、四个内置 Skills、版本、来源和 MIT 许可；它们不再列为
   发布阻塞项。
 - 工程方向：默认 `postinstall` 下载 oo，默认平台构建将其连同 Skills 打包；local runtime 不生成 oo 环境、
   不注册 Connector tools。OOMOL 或兼容自部署 OpenConnector runtime 才实际使用这条通道。
 - 验收结果：fresh clone 无需预装 oo 即可由 `pnpm install` 准备完整开发环境；`prepare:binaries` 已确认
-  默认打包包含可执行 oo 1.7.1；local runtime 不实际调用 oo；第三方声明已落盘。
+  默认打包包含可执行 oo 1.7.12；local runtime 不实际调用 oo；第三方声明已落盘。
 
 ### 2.4 OOMOL 登录门控已解除
 
@@ -74,10 +74,8 @@ oo CLI 1.7.1 及其内置 Skills 由 MIT 授权覆盖，不再是发布阻塞。
 
 | 组件                                 | 当前版本 | 包声明许可证 | 备注                                 |
 | ------------------------------------ | -------- | ------------ | ------------------------------------ |
-| `opencode-ai`                        | 1.18.10  | MIT          | Wanta Agent engine；随包分发 sidecar |
-| `@opencode-ai/sdk`                   | 1.18.10  | MIT          | 与 OpenCode 三包版本锁定策略保持一致 |
-| `wiki-graph`                         | 0.4.0    | Apache-2.0   | 仓库指向 OOMOL 的公开 GitHub 项目    |
-| `wiki-graph-core`                    | 0.4.0    | Apache-2.0   | WikiGraph SDK runtime                |
+| `opencode-ai`                        | 1.18.30  | MIT          | Wanta Agent engine；随包分发 sidecar |
+| `@opencode-ai/sdk`                   | 1.18.30  | MIT          | 与 OpenCode 三包版本锁定策略保持一致 |
 | `@univerjs/core`                     | 0.25.1   | Apache-2.0   | Univer 完整工作簿能力必须保留        |
 | `@univerjs/preset-sheets-core`       | 0.25.1   | Apache-2.0   | 需要纳入第三方 Notice                |
 | `streamdown`                         | 2.5.0    | Apache-2.0   | 聊天 Markdown 渲染依赖               |
@@ -189,7 +187,7 @@ Renderer capability 接入、local Agent runtime 和 local workspace 应用入�
 阶段 4 的 capability 装配现已完成：
 
 - local/OOMOL runtime 从同一能力判断选择 Build/Plan 系统提示和 permission；
-- local workspace 只释放 `query_knowledge`，不会释放四个 Connector 工具或 bundled oo Skills；
+- local workspace 不会释放四个 Connector 工具或 bundled oo Skills；
 - 从 OOMOL 切回 local 时会幂等清除旧 Connector 文件，runtime Skills 目录不受影响；
 - local bash 不包含 oo CLI 快速放行规则，动态授权 provider 提示也被 runtime 边界直接阻断；
 - OOMOL runtime 继续保留 Connector 工具、提示契约、授权感知和 oo permission 快速路径。
@@ -198,7 +196,7 @@ Renderer capability 接入、local Agent runtime 和 local workspace 应用入�
 
 - 未登录不再进入强制 LoginRoute，而是在初始化完成后直接进入 AppShell；
 - 无模型时显示 BYOK 配置与 OOMOL 登录 CTA，保存首个 custom model 后 local sidecar 自动进入 ready；
-- local workspace 可加载会话、项目和知识库，模型清单只展示 custom model；
+- local workspace 可加载会话和项目，模型清单只展示 custom model；
 - Connections、Teams、Billing、云 Skills、Connector 空状态和语音能力按 runtime capability 隔离；
 - 侧边栏、设置页和聊天引导均保留可选登录入口，登录失败不会卸载本地主界面；
 - local runtime 不触发默认 registry Skills 云端安装。

@@ -12,6 +12,7 @@ test("isPureOoCliCommand allows single oo CLI invocations", () => {
   assert.equal(isPureOoCliCommand('oo connector run "metaso" --action "search" --data \'{"q":"a;b"}\' --json'), true)
   assert.equal(isPureOoCliCommand('"$WANTA_OO_BIN" version --json'), true)
   assert.equal(isPureOoCliCommand("${WANTA_OO_BIN} connector schema metaso.search --json"), true)
+  assert.equal(isPureOoCliCommand('BUN_BE_BUN=1 oo file upload "/managed/input.png" --json'), true)
 })
 
 test("isPureOoCliCommand rejects shell composition around oo", () => {
@@ -21,6 +22,17 @@ test("isPureOoCliCommand rejects shell composition around oo", () => {
   assert.equal(isPureOoCliCommand("sudo oo search metaso --json"), false)
   assert.equal(isPureOoCliCommand("echo oo search metaso --json"), false)
   assert.equal(isPureOoCliCommand("PATH=/tmp oo search metaso --json"), false)
+  assert.equal(isPureOoCliCommand("BUN_BE_BUN=0 oo search metaso --json"), false)
+})
+
+test("safe OO launcher prefixes cannot bypass managed mutation denials", () => {
+  for (const command of [
+    "BUN_BE_BUN=1 oo auth login",
+    "BUN_BE_BUN=1 oo config set endpoint https://other.example.test",
+    "BUN_BE_BUN=1 oo connector logout",
+  ]) {
+    assert.equal(openConnectorCommandPolicy(command), "deny", command)
+  }
 })
 
 test("shell wrapper inspection is bounded", () => {
@@ -104,5 +116,39 @@ test("OpenConnector policy denies mutations hidden behind leading oo global flag
     "oo connector run app --action config --json",
   ]) {
     assert.equal(openConnectorCommandPolicy(command), "allow", command)
+  }
+})
+
+test("export assignments are ordinary commands while environment dumps remain denied", () => {
+  for (const command of [
+    'export PATH="/managed/bin:$PATH"',
+    'export PATH="/managed/bin:${PATH}"; cd /tmp; BUN_BE_BUN=1 oo /managed/run_image.js --mode edit',
+    "export LANG=en_US.UTF-8 OUTPUT='/tmp/output with spaces'",
+    "export LABEL='literal $(printenv)'",
+    `bash -lc 'export PATH="/managed/bin:/usr/bin"; node /tmp/run_image.js'`,
+  ]) {
+    assert.equal(openConnectorCommandPolicy(command), null, command)
+  }
+  for (const command of [
+    "export",
+    "export -p",
+    "export PATH",
+    "export PATH=/tmp -p",
+    "export -p PATH=/tmp",
+    'export PATH="$(printenv)"',
+    "export PATH=`printenv`",
+    'export PATH="/managed/bin:$PATH"; printenv',
+    'export PATH="/managed/bin:$PATH" && export -p',
+    'export PATH="/managed/bin:$PATH"; oo --debug config set endpoint https://other.test',
+    `export PATH="/managed/bin:$PATH"; bash -lc 'oo --debug auth login'`,
+    `export PATH="/managed/bin:$PATH"; bash -lc 'export -p'`,
+    "export OO_ENDPOINT=https://other.test",
+    'export OUTPUT="$OO_API_KEY"',
+    "env",
+    "set",
+    "declare -x",
+    "typeset -x",
+  ]) {
+    assert.equal(openConnectorCommandPolicy(command), "deny", command)
   }
 })

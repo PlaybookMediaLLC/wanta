@@ -5,6 +5,7 @@ import type {
   ChatPermissionRequest,
   ChatQuestionRequest,
   ChatMessage,
+  LocalArtifactPack,
   TurnOutputRecord,
 } from "../../../electron/chat/common.ts"
 import type { ChatErrorKind } from "../../../electron/chat/error.ts"
@@ -47,6 +48,7 @@ import {
   ConnectionSuggestionAction,
 } from "./ChatMessageActions.tsx"
 import { AssistantTimelineMessage, MessageBubble, PlainAssistantActivity } from "./ChatMessageBubble.tsx"
+import { KnowledgeAnswerSources } from "./KnowledgeAnswerSources.tsx"
 import { assistantResponseActionTextByMessageId } from "./message-text.ts"
 import { PermissionRequiredCard } from "./PermissionRequiredCard.tsx"
 import { QuestionPromptCard } from "./QuestionPromptCard.tsx"
@@ -176,6 +178,7 @@ const ChatTurnView = React.memo(function ChatTurnView({
     timelineHasVisibleOutcome(timelineSegments) || hasRenderableArtifacts || hasRenderableTurnOutputs
   const process = summarizeTurnProcess(turn, activity, activeAssistantMessageId, { hasVisibleOutcome })
   const hasProcessSegment = timelineSegments.some((segment) => segment.kind === "process")
+  const hasPendingResponse = timelineSegments.some((segment) => segment.kind === "pending")
   const shouldShowProcess = shouldShowTurnProcess(process, hasProcessSegment)
   const shouldShowPlainActivity = shouldShowPlainTurnActivity(process)
   const turnIsActive = Boolean(activeAssistantMessageId)
@@ -239,115 +242,99 @@ const ChatTurnView = React.memo(function ChatTurnView({
           onRetryFresh={retrySource ? handleRetryFresh : undefined}
         />
       ) : null}
-      {showTurnProcess ? (
-        <>
-          {renderSegments.map((segment, segmentIndex) => {
-            if (segment.kind === "response") {
-              const ownsTurnActions = segmentIndex === lastResponseSegmentIndex && segmentIndex === lastSegmentIndex
-              return (
-                <AssistantTimelineMessage
-                  key={segment.key}
+      <>
+        {shouldShowPlainActivity ? <PlainAssistantActivity activity={activity} /> : null}
+        {renderSegments.map((segment, segmentIndex) => {
+          if (segment.kind === "pending") {
+            return null
+          }
+          if (segment.kind === "response") {
+            const ownsTurnActions = segmentIndex === lastResponseSegmentIndex && segmentIndex === lastSegmentIndex
+            return (
+              <AssistantTimelineMessage
+                key={segment.key}
+                blocks={segment.blocks}
+                billingCacheScope={billingCacheScope}
+                smoothAssistantMessageId={smoothAssistantMessageId}
+                assistantActionsText={ownsTurnActions ? responseActionsText : null}
+                assistantCancelled={ownsTurnActions && assistantCancelled}
+                activeAssistantMessageId={activeAssistantMessageId}
+                providerByService={providerByService}
+                onAuthorize={handleAuthorize}
+                onRecover={retrySource ? handleRecover : undefined}
+                onRetryFresh={retrySource ? handleRetryFresh : undefined}
+                onViewBilling={onViewBilling}
+              />
+            )
+          }
+
+          const isLastProcess = segmentIndex === lastProcessSegmentIndex
+          const segmentTurn = {
+            ...turn,
+            assistants: assistantMessagesFromTimelineBlocks(segment.blocks),
+          }
+          const scopedSegmentProcess =
+            segment.blocks.length === 0
+              ? process
+              : summarizeTurnProcess(
+                  segmentTurn,
+                  isLastProcess ? activity : null,
+                  isLastProcess ? activeAssistantMessageId : undefined,
+                  { hasVisibleOutcome },
+                )
+          const segmentProcess =
+            isLastProcess && segment.blocks.length > 0
+              ? inheritTurnProcessTiming(scopedSegmentProcess, process)
+              : scopedSegmentProcess
+          const ownsTurnActions = isLastProcess && segmentIndex === lastSegmentIndex
+          const processLive = isLastProcess && turnIsActive
+          return (
+            <Message key={`${turn.id}:process:${segment.key}`} from="assistant">
+              <MessageContent className="w-full">
+                <TurnProcessActivity
                   blocks={segment.blocks}
+                  process={segmentProcess}
+                  live={processLive}
+                  pendingResponse={isLastProcess && hasPendingResponse}
                   billingCacheScope={billingCacheScope}
-                  smoothAssistantMessageId={smoothAssistantMessageId}
-                  assistantActionsText={ownsTurnActions ? responseActionsText : null}
-                  assistantCancelled={ownsTurnActions && assistantCancelled}
-                  activeAssistantMessageId={activeAssistantMessageId}
                   providerByService={providerByService}
                   onAuthorize={handleAuthorize}
                   onRecover={retrySource ? handleRecover : undefined}
                   onRetryFresh={retrySource ? handleRetryFresh : undefined}
                   onViewBilling={onViewBilling}
+                  onBeforeDisclosure={onBeforeDisclosure}
                 />
-              )
-            }
-
-            const isLastProcess = segmentIndex === lastProcessSegmentIndex
-            const segmentTurn = {
-              ...turn,
-              assistants: assistantMessagesFromTimelineBlocks(segment.blocks),
-            }
-            const scopedSegmentProcess =
-              segment.blocks.length === 0
-                ? process
-                : summarizeTurnProcess(
-                    segmentTurn,
-                    isLastProcess ? activity : null,
-                    isLastProcess ? activeAssistantMessageId : undefined,
-                    { hasVisibleOutcome },
-                  )
-            const segmentProcess =
-              isLastProcess && segment.blocks.length > 0
-                ? inheritTurnProcessTiming(scopedSegmentProcess, process)
-                : scopedSegmentProcess
-            const ownsTurnActions = isLastProcess && segmentIndex === lastSegmentIndex
-            const processLive = isLastProcess && turnIsActive
-            return (
-              <Message key={`${turn.id}:process`} from="assistant">
-                <MessageContent className="w-full">
-                  <TurnProcessActivity
-                    blocks={segment.blocks}
-                    process={segmentProcess}
-                    live={processLive}
-                    billingCacheScope={billingCacheScope}
-                    providerByService={providerByService}
-                    onAuthorize={handleAuthorize}
-                    onRecover={retrySource ? handleRecover : undefined}
-                    onRetryFresh={retrySource ? handleRetryFresh : undefined}
-                    onViewBilling={onViewBilling}
-                    onBeforeDisclosure={onBeforeDisclosure}
-                  />
-                </MessageContent>
-                {ownsTurnActions && (processActionsText || assistantCancelled) ? (
-                  <AssistantMessageActions text={processActionsText ?? ""} cancelled={assistantCancelled} />
-                ) : null}
-              </Message>
-            )
-          })}
-          {terminalOutcomeStatus ? <TurnOutcomeReceipt status={terminalOutcomeStatus} /> : null}
-          {!turnIsActive && (process.authorizationIssues.length > 0 || suggestedAuthorization) ? (
-            <Message from="assistant">
-              <MessageContent className="w-full">
-                {process.authorizationIssues.map((issue) => (
-                  <ConnectionAuthorizationIssueAction
-                    key={issue.key}
-                    issue={issue}
-                    provider={providerByService.get(issue.service)}
-                    onAuthorize={handleAuthorize}
-                  />
-                ))}
-                {suggestedAuthorization ? (
-                  <ConnectionSuggestionAction
-                    authorization={suggestedAuthorization}
-                    provider={providerByService.get(normalizeServiceSlug(suggestedAuthorization.service))}
-                    onAuthorize={handleAuthorize}
-                  />
-                ) : null}
               </MessageContent>
+              {ownsTurnActions && (processActionsText || assistantCancelled) ? (
+                <AssistantMessageActions text={processActionsText ?? ""} cancelled={assistantCancelled} />
+              ) : null}
             </Message>
-          ) : null}
-        </>
-      ) : (
-        <>
-          {shouldShowPlainActivity ? <PlainAssistantActivity activity={activity} /> : null}
-          {turn.assistants.map((message) => (
-            <MessageBubble
-              key={message.clientId ?? message.id}
-              message={message}
-              billingCacheScope={billingCacheScope}
-              smoothText={message.id === smoothAssistantMessageId}
-              onViewBilling={onViewBilling}
-              assistantActionsText={assistantActionTextByMessageId.get(message.id) ?? null}
-              providerByService={providerByService}
-              liveTools={message.id === activeAssistantMessageId}
-              onAuthorize={handleAuthorize}
-              onRecover={retrySource ? handleRecover : undefined}
-              onRetryFresh={retrySource ? handleRetryFresh : undefined}
-              suggestedAuthorization={message.id === lastAssistant?.id ? process.suggestedAuthorization : undefined}
-            />
-          ))}
-        </>
-      )}
+          )
+        })}
+        {showTurnProcess && terminalOutcomeStatus ? <TurnOutcomeReceipt status={terminalOutcomeStatus} /> : null}
+        {showTurnProcess && !turnIsActive && (process.authorizationIssues.length > 0 || suggestedAuthorization) ? (
+          <Message from="assistant">
+            <MessageContent className="w-full">
+              {process.authorizationIssues.map((issue) => (
+                <ConnectionAuthorizationIssueAction
+                  key={issue.key}
+                  issue={issue}
+                  provider={providerByService.get(issue.service)}
+                  onAuthorize={handleAuthorize}
+                />
+              ))}
+              {suggestedAuthorization ? (
+                <ConnectionSuggestionAction
+                  authorization={suggestedAuthorization}
+                  provider={providerByService.get(normalizeServiceSlug(suggestedAuthorization.service))}
+                  onAuthorize={handleAuthorize}
+                />
+              ) : null}
+            </MessageContent>
+          </Message>
+        ) : null}
+      </>
+      <KnowledgeAnswerSources messages={turn.assistants} />
       {hasRenderableArtifacts || hasRenderableTurnOutputs ? (
         <div className="mt-2 grid gap-2">
           {hasRenderableArtifacts ? (
@@ -386,7 +373,7 @@ interface ChatTimelineProps {
   onTurnOutputOpen: (selection: TurnOutputSelection) => void
   onTurnOutputAvailable: (selection: TurnOutputSelection) => void
   onAnswerQuestion: (requestId: string, answers: string[][]) => Promise<void>
-  onAnswerPermission: (requestId: string, reply: ChatPermissionReply) => Promise<void>
+  onAnswerPermission: (requestId: string, reply: ChatPermissionReply, optionId?: string) => Promise<void>
   onRejectQuestion: (requestId: string) => Promise<void>
   questionDrafts: QuestionDraftStore
   onViewBilling?: () => void
@@ -462,7 +449,8 @@ export const ChatTimeline = React.memo(function ChatTimeline({
     [providers],
   )
   const answerPermissionSafely = React.useCallback(
-    (requestId: string, reply: ChatPermissionReply): Promise<void> => onAnswerPermission(requestId, reply),
+    (requestId: string, reply: ChatPermissionReply, optionId?: string): Promise<void> =>
+      onAnswerPermission(requestId, reply, optionId),
     [onAnswerPermission],
   )
   const activeAssistantMessageId =
@@ -477,28 +465,52 @@ export const ChatTimeline = React.memo(function ChatTimeline({
     const ageMs = Date.now() - latestAssistant.createdAt
     return ageMs >= 0 && ageMs <= ASSISTANT_TEXT_SMOOTH_WINDOW_MS ? latestAssistant.id : undefined
   }, [activeAssistantMessageId, latestAssistant])
-  const visibleArtifactGroups = React.useMemo<ResolvedArtifactGroup[]>(
-    () =>
-      artifactBundles.map((bundle) => ({
+  const visibleArtifactGroups = React.useMemo<ResolvedArtifactGroup[]>(() => {
+    return artifactBundles.map((bundle) => {
+      const root = {
+        path: bundle.rootPath,
+        name: bundle.rootPath.split(/[\\/]/u).pop() ?? bundle.rootPath,
+        kind: "directory" as const,
+        mime: "inode/directory",
+      }
+      const pack: LocalArtifactPack | undefined =
+        bundle.version === 2 && bundle.title
+          ? {
+              root,
+              title: bundle.title,
+              kind: bundle.kind,
+              display: bundle.display,
+              ...(bundle.summary ? { summary: bundle.summary } : {}),
+              items: bundle.items
+                .filter((item) => item.role === "primary")
+                .map((item, index) => ({ ...item, role: "primary" as const, order: item.order ?? index + 1 })),
+              supporting: bundle.items
+                .filter((item) => item.role !== "primary")
+                .map((item, index) => ({
+                  ...item,
+                  role: item.role ?? ("supporting" as const),
+                  order: item.order ?? index + 1,
+                })),
+              totalItems: bundle.totalItems,
+              truncated: bundle.truncated,
+            }
+          : undefined
+      return {
         display: bundle.display,
         messageId: bundle.messageId,
         kind: bundle.kind,
         group: {
-          root: {
-            path: bundle.rootPath,
-            name: bundle.rootPath.split(/[\\/]/u).pop() ?? bundle.rootPath,
-            kind: "directory" as const,
-            mime: "inode/directory",
-          },
+          root,
           items: bundle.items,
           totalItems: bundle.totalItems,
           truncated: bundle.truncated,
         },
+        ...(pack ? { pack } : {}),
         status: bundle.status,
         ...(bundle.failure ? { failure: bundle.failure } : {}),
-      })),
-    [artifactBundles],
-  )
+      }
+    })
+  }, [artifactBundles])
   const artifactGroupsByMessageId = React.useMemo(() => {
     const byMessageId = new Map<string, ResolvedArtifactGroup[]>()
     for (const group of visibleArtifactGroups) {
@@ -612,6 +624,13 @@ export const ChatTimeline = React.memo(function ChatTimeline({
               <PermissionRequiredCard
                 request={request}
                 busy={status === "submitted"}
+                onSelectNativeOption={(requestId, option) =>
+                  answerPermissionSafely(
+                    requestId,
+                    option.kind === "allow_once" ? "once" : option.kind === "allow_always" ? "always" : "reject",
+                    option.optionId,
+                  )
+                }
                 onAllowOnce={(requestId) => answerPermissionSafely(requestId, "once")}
                 onAllowForSession={(requestId) => answerPermissionSafely(requestId, "always")}
                 onReject={(requestId) => answerPermissionSafely(requestId, "reject")}

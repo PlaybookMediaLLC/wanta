@@ -16,6 +16,8 @@ test("translate interpolates {var}", () => {
   assert.equal(translate("en", "chat.authNeeded", { name: "Slack" }), "Slack needs authorization to continue")
   assert.equal(translate("zh-CN", "chat.authNeeded", { name: "Slack" }), "需要授权 Slack 才能继续")
   assert.equal(translate("en", "connections.more", { count: 577 }), "Search to connect more (577 total)")
+  assert.equal(translate("zh-CN", "connections.marketplaceAccount"), "OOMOL 内置账号")
+  assert.equal(translate("en", "connections.authType.marketplace"), "OOMOL managed")
 })
 
 test("translate interpolates OO-style {{var}}", () => {
@@ -43,8 +45,10 @@ test("team management copy separates context switching from current-team setting
 test("full access permission mode is localized without implementation labels", () => {
   assert.equal(translate("zh-CN", "chat.permissionModeFullAccess"), "完全访问")
   assert.equal(translate("en", "chat.permissionModeFullAccess"), "Full access")
-  assert.match(translate("zh-CN", "chat.permissionModeDefaultDescription"), /智能体的默认审批策略/)
+  assert.match(translate("zh-CN", "chat.permissionModeDefaultDescription"), /自动执行日常操作/)
   assert.match(translate("en", "chat.permissionModeFullAccessDescription"), /high-risk commands/)
+  assert.match(translate("zh-CN", "chat.fullAccessDialogBody"), /内置浏览器/)
+  assert.match(translate("en", "chat.fullAccessDialogBody"), /managed-credential protections remain/)
   assert.equal(translate("zh-CN", "chat.permissionModeAuto"), "自动审批")
   assert.match(translate("en", "chat.permissionModeAutoDescription"), /auto-approves routine actions/)
   assert.doesNotMatch(translate("zh-CN", "chat.fullAccessDialogTitle"), /YOLO/)
@@ -56,7 +60,8 @@ test("full access permission mode is localized without implementation labels", (
 test("isLocale guards the supported locales", () => {
   assert.equal(isLocale("zh-CN"), true)
   assert.equal(isLocale("en"), true)
-  assert.equal(isLocale("fr"), false)
+  assert.equal(isLocale("fr"), true)
+  assert.equal(isLocale("de"), false)
   assert.equal(isLocale(null), false)
 })
 

@@ -19,6 +19,18 @@ const baseProps: ComponentProps<typeof AgentConfigurationPicker> = {
   externalAgents: [
     {
       binary: { path: "/usr/bin/claude", status: "detected", version: "2.0.0" },
+      catalog: {
+        defaultEffortId: "high",
+        defaultModelId: "claude-default",
+        efforts: [
+          { id: "high", label: "High" },
+          { id: "max", label: "Max" },
+        ],
+        models: [
+          { id: "claude-default", label: "Claude Default" },
+          { id: "claude-next", label: "Claude Next" },
+        ],
+      },
       displayName: "Claude Code",
       kind: "claude-code",
       login: { status: "logged_out" },
@@ -99,7 +111,10 @@ function buttonWithTexts(...texts: string[]): HTMLButtonElement | undefined {
 }
 
 async function hoverButton(text: string) {
-  await act(async () => buttonWithText(text)?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true })))
+  const menuItem = [...document.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]')].find((button) =>
+    button.textContent?.includes(text),
+  )
+  await act(async () => menuItem?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true })))
 }
 
 afterEach(() => {
@@ -113,6 +128,22 @@ afterEach(() => {
 })
 
 describe("AgentConfigurationPicker", () => {
+  it("keeps the selected agent visible with the model catalog owned by that agent", async () => {
+    const builtIn = await renderPicker()
+    expect(builtIn.trigger?.textContent).toBe("Built-in Agent · Auto · Default")
+    expect(builtIn.trigger?.querySelector('[title="wanta"]')).not.toBeNull()
+
+    const claude = await renderPicker({
+      agentCatalog: baseProps.externalAgents[0]?.catalog,
+      agentEffortSelectionEnabled: true,
+      agentKind: "claude-code",
+      agentModelSelectionEnabled: true,
+      modelRoutingEnabled: false,
+    })
+    expect(claude.trigger?.textContent).toBe("Claude Code · Default · Claude Default")
+    expect(claude.trigger?.querySelector('[title="claude-code"]')).not.toBeNull()
+  })
+
   it("groups agent, Wanta model, and reasoning in one portaled panel", async () => {
     const { host } = await renderPicker()
     const menu = document.querySelector<HTMLElement>('[role="menu"][aria-label="Agent configuration"]')
@@ -216,4 +247,50 @@ describe("AgentConfigurationPicker", () => {
 
     expect(host.querySelector('[aria-label="Agent configuration"]')?.textContent).toBe("Grok")
   })
+})
+
+it.each([
+  [{ agentCatalogLoading: true }, "chat.agentCatalogLoading"],
+  [{ agentCatalogError: true }, "chat.agentCatalogUnavailable"],
+  [
+    {
+      agentCatalog: { models: [], efforts: [] } as NonNullable<
+        ComponentProps<typeof AgentConfigurationPicker>["agentCatalog"]
+      >,
+    },
+    "chat.agentEffortUnavailable",
+  ],
+] as const)("explains unavailable effort choices instead of a fake default-only menu", async (state, key) => {
+  await renderPicker({ agentKind: "codex", agentEffortSelectionEnabled: true, modelRoutingEnabled: false, ...state })
+  await hoverButton("Reasoning effort")
+  expect(document.querySelector('[role="status"]')?.textContent).toBe(translate("en", key))
+})
+
+it("selects a concrete effort even when it equals the native default", async () => {
+  const onSelectAgentEffort = vi.fn()
+  await renderPicker({
+    agentKind: "codex",
+    agentCatalog: baseProps.externalAgents[1]?.catalog,
+    agentEffortSelectionEnabled: true,
+    modelRoutingEnabled: false,
+    onSelectAgentEffort,
+  })
+  await hoverButton("Reasoning effort")
+  const high = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+    (button) => button.textContent === "High",
+  )
+  expect(high).toBeDefined()
+  await act(async () => high!.click())
+  expect(onSelectAgentEffort).toHaveBeenCalledWith("high")
+})
+
+it("does not present an unresolved native default id as a display name", async () => {
+  const { trigger } = await renderPicker({
+    agentKind: "codex",
+    agentModelSelectionEnabled: true,
+    modelRoutingEnabled: false,
+    agentCatalog: { defaultModelId: "internal-stale-id", models: [{ id: "valid", label: "Valid model" }], efforts: [] },
+  })
+  expect(trigger?.textContent).toBe("Codex · Default")
+  expect(trigger?.textContent).not.toContain("internal-stale-id")
 })

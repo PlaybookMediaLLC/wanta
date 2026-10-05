@@ -1,7 +1,7 @@
 import type {
   ConnectionAppDetail,
-  ConnectionAuthType,
   ConnectionConnectInput,
+  ConnectionCredentialAuthType,
   ConnectionCredentialField,
   ConnectionOAuthClientConfigFieldDefinition,
   ConnectionProviderDetail,
@@ -12,12 +12,14 @@ import type { TranslateFn } from "@/i18n/i18n"
 
 import { Copy, KeyRound, Save } from "lucide-react"
 import * as React from "react"
+import { normalizeApiKeyInput } from "./connection-api-key-input.ts"
 import { connectionDescriptionSegments } from "./connection-description-links.ts"
 import {
   buildCredentialSummaryDisplayValues,
   buildFederatedCredentialDisplayValues,
   getConnectionAppNote,
 } from "./connection-route-model.ts"
+import { createInitialOAuthAuthorizationOptionIds } from "./oauth-authorization-options.ts"
 import {
   buildOAuthClientConfigPayload,
   buildOAuthConnectPayload,
@@ -28,6 +30,7 @@ import {
   validateOAuthFields,
   validateOAuthPersistentFields,
 } from "./oauth-client-config.ts"
+import { OAuthAuthorizationOptions } from "./OAuthAuthorizationOptions.tsx"
 import { Loader } from "@/components/ai-elements/loader"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -198,11 +201,11 @@ function getCredentialFields(
   return { fields: detail.customCredentialConfig?.fields ?? [] }
 }
 
-function isCredentialMode(authType: ConnectionAuthType): authType is CredentialMode {
+function isCredentialMode(authType: ConnectionCredentialAuthType): authType is CredentialMode {
   return authType === "api_key" || authType === "custom_credential" || authType === "federated"
 }
 
-function isDialogAuthMode(authType: ConnectionAuthType): authType is DialogAuthMode {
+function isDialogAuthMode(authType: ConnectionCredentialAuthType): authType is DialogAuthMode {
   return authType === "oauth2" || isCredentialMode(authType)
 }
 
@@ -249,6 +252,9 @@ export function ConnectDialog({
     }),
   )
   const [oauthBusy, setOAuthBusy] = React.useState<"save" | null>(null)
+  const [authorizationOptionIds, setAuthorizationOptionIds] = React.useState<string[]>(() =>
+    createInitialOAuthAuthorizationOptionIds(detail?.oauthClientConfig?.authorizationOptions, appDetail?.scopes),
+  )
   const [formError, setFormError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
@@ -286,14 +292,18 @@ export function ConnectDialog({
     setOAuthDraft(nextDraft)
     setOAuthBaselineDraft(nextDraft)
     setOAuthBusy(null)
+    setAuthorizationOptionIds(
+      createInitialOAuthAuthorizationOptionIds(detail?.oauthClientConfig?.authorizationOptions, appDetail?.scopes),
+    )
     setFormError(null)
-  }, [authType, detail?.oauthClientConfig, detail?.service, oauthClientConfig, open])
+  }, [appDetail?.scopes, authType, detail?.oauthClientConfig, detail?.service, oauthClientConfig, open])
 
   if (!detail || !authType || !isDialogAuthMode(authType)) {
     return null
   }
 
   if (authType === "oauth2") {
+    const authorizationOptions = detail.oauthClientConfig?.authorizationOptions ?? []
     const resolvedProviderOAuthConfig = resolveProviderOAuthClientConfig(
       detail.oauthClientConfig,
       savedOAuthClientConfig,
@@ -352,6 +362,7 @@ export function ConnectDialog({
       onSubmit({
         appId,
         authType: "oauth2",
+        authorizationOptionIds: authorizationOptions.length > 0 ? authorizationOptionIds : undefined,
         service: detail.service,
         extra: connectPayload.extra,
         secretExtra: connectPayload.secretExtra,
@@ -380,6 +391,14 @@ export function ConnectDialog({
         <div className="grid gap-4">
           {viewModel.blockedReason ? <Notice>{oauthBlockedReasonLabel(viewModel.blockedReason, t)}</Notice> : null}
           {viewModel.persistentDirty ? <Notice>{t("connections.saveOAuthBeforeConnect")}</Notice> : null}
+          {authorizationOptions.length > 0 ? (
+            <OAuthAuthorizationOptions
+              currentScopes={appDetail?.scopes}
+              options={authorizationOptions}
+              selectedIds={authorizationOptionIds}
+              onChange={setAuthorizationOptionIds}
+            />
+          ) : null}
           {viewModel.showPersistentSection ? (
             <section className="grid gap-3 rounded-lg border p-3">
               <h3 className="oo-text-label">{t("connections.oauthClientConfig")}</h3>
@@ -462,7 +481,15 @@ export function ConnectDialog({
   }
 
   const { primary, fields } = getCredentialFields(detail, authType)
-  const allFields = primary ? [primary, ...fields] : fields
+  const sourceFields = primary ? [primary, ...fields] : fields
+  const allFields = sourceFields.map((field) =>
+    detail.service === "lingxing" && field.key === "appId"
+      ? {
+          ...field,
+          description: [field.description, t("connections.lingxingAppIdPermissionHelp")].filter(Boolean).join("\n"),
+        }
+      : field,
+  )
   const missingRequired = allFields.some((field) => field.required && !(values[field.key] ?? "").trim())
 
   const submit = (): void => {
@@ -479,7 +506,7 @@ export function ConnectDialog({
       onSubmit({
         authType: "api_key",
         service: detail.service,
-        apiKey: values[PRIMARY_KEY]?.trim() ?? "",
+        apiKey: normalizeApiKeyInput(detail.service, values[PRIMARY_KEY]?.trim() ?? ""),
         comment,
         extra: Object.keys(extra).length > 0 ? extra : undefined,
         appId,

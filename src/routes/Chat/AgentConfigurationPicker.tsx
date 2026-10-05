@@ -3,7 +3,7 @@ import type { ExternalAgentCatalog, ExternalAgentRuntimeStatus } from "../../../
 import type { ReasoningLevel } from "../../../electron/chat/common.ts"
 import type { ModelCatalog, ModelChoice } from "../../../electron/models/common.ts"
 
-import { Brain, Check, ChevronDown, ChevronRight, Settings2, Trash2 } from "lucide-react"
+import { Brain, ChevronDown, ChevronRight, Settings2, Trash2 } from "lucide-react"
 import * as React from "react"
 import { createPortal } from "react-dom"
 import {
@@ -89,6 +89,7 @@ function SelectionRow({
       className={cn(
         "flex min-h-10 w-full min-w-0 items-stretch rounded-md hover:bg-accent hover:text-accent-foreground",
         disabled && "opacity-50 hover:bg-transparent",
+        active && "bg-secondary text-secondary-foreground hover:bg-secondary",
       )}
     >
       <button
@@ -118,11 +119,6 @@ function SelectionRow({
             ) : null}
           </span>
         )}
-        {active ? (
-          <Check className={cn("size-4 shrink-0", !inlineMeta && "mt-0.5")} />
-        ) : (
-          <span className="size-4 shrink-0" />
-        )}
       </button>
       {trailingAction ? (
         <Button
@@ -150,15 +146,21 @@ function agentOptionSelection(
   const rows = buildAgentOptionRows(options, defaultOptionId, { defaultDescription, defaultLabel })
   const normalizedValue = normalizeAgentOptionValue(value, defaultOptionId)
   const selectedId = normalizedValue ?? AGENT_OPTION_DEFAULT_ROW_ID
+  const defaultName = options.find((option) => option.id === defaultOptionId)?.label
   return {
     rows,
     selectedId,
-    selectedLabel: rows.find((row) => row.id === selectedId)?.label ?? defaultLabel,
+    selectedLabel:
+      selectedId === AGENT_OPTION_DEFAULT_ROW_ID && defaultName
+        ? `${defaultLabel} · ${defaultName}`
+        : (rows.find((row) => row.id === selectedId)?.label ?? value ?? defaultLabel),
   }
 }
 
 export function AgentConfigurationPicker({
   agentCatalog,
+  agentCatalogLoading = false,
+  agentCatalogError = false,
   agentEffortId,
   agentEffortSelectionEnabled,
   agentKind,
@@ -179,6 +181,8 @@ export function AgentConfigurationPicker({
   onSelectModel,
   onSelectReasoningLevel,
 }: {
+  agentCatalogLoading?: boolean
+  agentCatalogError?: boolean
   agentCatalog?: ExternalAgentCatalog
   agentEffortId?: string
   agentEffortSelectionEnabled: boolean
@@ -272,7 +276,7 @@ export function AgentConfigurationPicker({
       buildAgentPickerRows(externalAgents, {
         builtIn: t("chat.agentBuiltIn"),
         builtInEngine: `OpenCode ${__OPENCODE_VERSION__}`,
-        loginRequired: (hint) => t("chat.agentLoginRequired", { hint }),
+        loginRequired: () => t("chat.agentLoginRequiredShort"),
         notDetected: t("chat.agentNotDetected"),
       }),
     [externalAgents, t],
@@ -305,12 +309,13 @@ export function AgentConfigurationPicker({
   const effortLabel = modelRoutingEnabled ? wantaReasoningLabel : externalEfforts.selectedLabel
   const modelVisible = modelRoutingEnabled || agentModelSelectionEnabled
   const effortVisible = modelRoutingEnabled ? wantaReasoningLevels.length > 0 : agentEffortSelectionEnabled
-  const triggerParts = modelRoutingEnabled
-    ? [modelLabel, effortLabel]
-    : agentModelSelectionEnabled
-      ? [modelLabel, effortVisible && agentEffortId ? effortLabel : null, selectedAgentLabel]
-      : [selectedAgentLabel, effortVisible && agentEffortId ? effortLabel : null]
+  // Always lead with the selected runtime. The following model/effort labels
+  // come either from Wanta (built-in OpenCode) or that local BYOA runtime.
+  const triggerParts = agentModelSelectionEnabled
+    ? [selectedAgentLabel, modelLabel, effortVisible && agentEffortId ? effortLabel : null]
+    : [selectedAgentLabel, modelVisible ? modelLabel : null, effortVisible ? effortLabel : null]
   const triggerLabel = triggerParts.filter(Boolean).join(" · ") || selectedAgentLabel
+  const triggerIconHost = agentKind === "opencode" ? "wanta" : agentKind
 
   const onOpenRef = React.useRef(onAgentPickerOpen)
   React.useEffect(() => {
@@ -337,6 +342,23 @@ export function AgentConfigurationPicker({
   )
 
   const submenuContent = (() => {
+    if (
+      !modelRoutingEnabled &&
+      (page === "model" || page === "effort") &&
+      (agentCatalogLoading || agentCatalogError || (page === "effort" && !agentCatalog?.efforts.length))
+    ) {
+      return (
+        <div role="status" className="oo-text-caption px-3 py-3 text-muted-foreground">
+          {t(
+            agentCatalogLoading
+              ? "chat.agentCatalogLoading"
+              : agentCatalogError
+                ? "chat.agentCatalogUnavailable"
+                : "chat.agentEffortUnavailable",
+          )}
+        </div>
+      )
+    }
     if (page === "agent") {
       return (
         <>
@@ -533,11 +555,14 @@ export function AgentConfigurationPicker({
         aria-expanded={open}
         aria-haspopup="menu"
         disabled={composerDisabled}
-        className="oo-composer-model-button h-8 max-w-[15rem] min-w-0 shrink rounded-full px-2"
+        className="oo-composer-model-button h-8 max-w-[18rem] min-w-0 shrink rounded-full px-2"
         onClick={toggleMenu}
         onKeyDown={handleTriggerKeyDown}
       >
-        <Brain className="size-4 shrink-0" />
+        <AgentIcon
+          host={triggerIconHost}
+          className="size-4 shrink-0 border-0 bg-transparent [&_.oo-entity-icon-image]:size-4"
+        />
         <span className="oo-composer-model-text min-w-0 flex-1 truncate text-left">{triggerLabel}</span>
         <ChevronDown
           className={cn("oo-composer-control-chevron size-3.5 shrink-0 transition-transform", open && "rotate-180")}

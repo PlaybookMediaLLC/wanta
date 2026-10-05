@@ -119,6 +119,20 @@ Stop and ask before adding any of the following:
   reports `aria-modal="true"`, it hides only the native view so the backdrop dims that snapshot,
   then restores the live page at its measured bounds after the modal closes. Dialogs and full-screen
   viewers therefore cover the whole window without making the underlying page appear to vanish.
+- CDP screenshots temporarily change the native viewport and restore its previous size afterward.
+  Modal backdrop previews use Electron `capturePage` with `stayHidden: true` instead, so ordinary
+  modal visibility changes do not enter the Playwright screenshot/viewport lifecycle.
+  `BrowserPage` defers show/bounds requests during capture and applies only the latest request after
+  all captures finish, including native CDP commands still completing after Playwright cancellation.
+  Bounds deferral keeps an already visible view attached; detaching it mid-capture can stall frame
+  production on long reports. A resize back to the original bounds replaces any pending resize too.
+  Hide/dispose cancels a pending show immediately. Without this coordination, resizing during a
+  full-page capture can leave a 1080 x 680 native view rendering a stale 400 x 500 viewport, producing
+  blank regions and incorrect on-screen scrolling. The opt-in native regression probe is
+  `scripts/browser-screenshot-smoke.cjs`; run it with the downloaded Electron executable (on macOS,
+  `.electron-dist/Electron.app/Contents/MacOS/Electron scripts/browser-screenshot-smoke.cjs`). It uses
+  synthetic local content and an isolated temporary profile, forces resize during the actual CDP
+  capture, and verifies viewport dimensions and scrolling in both resize directions.
 - An Electron 42 probe verified that a sandboxed `WebContentsView` observes Wanta's
   `nativeTheme.themeSource` both at creation and after live light/dark changes. A second real-path
   probe against `hyrious.me` found that `playwright-core.connectOverCDP()` changes the attached page

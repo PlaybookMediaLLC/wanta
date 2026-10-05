@@ -3,19 +3,25 @@ import type { ChatPermissionRequest } from "./common.ts"
 import { openConnectorCommandPolicy } from "../agent/oo-command-permission.ts"
 import {
   isManagedPythonExecutable,
+  isManagedPythonPipExecutable,
   managedPythonEnvironmentPath,
   managedPythonExecutables,
+  managedPythonPipExecutables,
   projectPythonExecutables,
+  projectPythonPipExecutables,
 } from "../agent/python-environment.ts"
 import { commandRequiresConfirmation } from "./command-risk.ts"
 import {
   dependencyCommandRequiresConfirmation,
-  isDependencyMutationCommand,
+  dependencyCommandChangesScope,
+  protectedPipInstallOptions,
+  pipOptionName,
   isPythonDependencyMutationCommand,
 } from "./dependency-policy.ts"
 import {
-  commandWithoutSafeDescriptorDuplication,
   commandWithoutHereDocumentBodies,
+  commandWithoutInertOutputSuffixes,
+  commandWithoutSafeDescriptorDuplication,
   commandWithoutSafeOutputFilter,
   effectiveShellCommandWords,
   explicitCdDirectory,
@@ -24,6 +30,7 @@ import {
   shellWords,
   splitLeadingAnd,
   topLevelShellSegments,
+  unwrappedShellCommandWords,
 } from "./shell-syntax.ts"
 
 export type PermissionRequestKind = "command" | "edit" | "path" | "network" | "local"
@@ -38,8 +45,35 @@ export interface SessionPermissionGrant {
   processRoot?: string
 }
 
+export interface PermissionScopeContext {
+  taskProcessRoot?: string
+  commandCwd?: string
+  trustedProjectRoot?: string
+}
+
 export interface ManagedPythonDependencyInstall {
   packages: string[]
+}
+
+// Recognize only a complete, literal deletion command. Compound commands,
+// expansion, unknown options and scripts must keep the uncertain presentation.
+export function permissionDeletionTargets(command: string | undefined): string[] | undefined {
+  if (!command || hasUnsafeShellSyntax(command)) return
+  const words = shellWords(command)
+  if (!words || !["rm", "/bin/rm", "/usr/bin/rm"].includes(words[0] ?? "")) return
+  const targets: string[] = []
+  let optionsEnded = false
+  for (const word of words.slice(1)) {
+    if (!optionsEnded && word === "--") {
+      optionsEnded = true
+    } else if (!optionsEnded && word.startsWith("-")) {
+      if (!/^-[rfdiIvPR]+$/u.test(word) && !["--recursive", "--force", "--dir", "--verbose"].includes(word)) return
+    } else {
+      if (!word || word.startsWith("~") || /[$`*?[\]{}\n\r]/u.test(word)) return
+      targets.push(word)
+    }
+  }
+  return targets.length ? targets : undefined
 }
 
 export function permissionAction(request: ChatPermissionRequest): string {
@@ -87,6 +121,46 @@ export function permissionCommand(request: ChatPermissionRequest): string | unde
   return permissionPrimaryResource(request)
 }
 
+function nestedRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function cwdFromRecord(record: Record<string, unknown> | undefined): string | undefined {
+  if (!record) {
+    return undefined
+  }
+  for (const key of ["cwd", "workingDirectory", "working_directory"]) {
+    const value = record[key]
+    if (typeof value !== "string" || !value.trim()) {
+      continue
+    }
+    const cwd = value.trim()
+    if (cwd.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(cwd)) {
+      return cwd
+    }
+  }
+  return undefined
+}
+
+/**
+ * Host-proven working directory carried on the permission request. OpenCode's
+ * sidecar cwd is a private workspace and is not implied here; only an explicit
+ * metadata cwd or an ACP session cwd is trustworthy.
+ */
+export function permissionRequestWorkingDirectory(request: ChatPermissionRequest): string | undefined {
+  const metadata = request.metadata
+  if (!metadata) {
+    return undefined
+  }
+  return (
+    cwdFromRecord(metadata) ??
+    cwdFromRecord(nestedRecord(metadata.toolInput)) ??
+    cwdFromRecord(nestedRecord(metadata.rawInput))
+  )
+}
+
 /**
  * ACP agents ask before dispatching MCP tools even when the server is a
  * Wanta-owned, loopback-only capability server. The ACP adapter adds this
@@ -103,10 +177,11 @@ function commandText(request: ChatPermissionRequest): string {
   return (permissionCommand(request) ?? request.resources.join(" ")).trim()
 }
 
+const HIGH_RISK_ENV_PATH_PATTERN = /(^|[\s"'=])(?:\.\/)?\.env(?:\.[^\s"';&|<>/]*)?(?=$|[\s"';&|<>])/i
 const HIGH_RISK_COMMAND_PATH_PATTERNS: readonly RegExp[] = [
   /(^|[\s"'=])(?:~|\$HOME)\/(?:\.ssh|\.aws|\.gnupg|\.config\/gh)(?:\/|[\s"';&|<>]|$)/i,
   /(^|[\s"'=])\/Users\/[^/\s"']+\/(?:\.ssh|\.aws|\.gnupg|\.config\/gh)(?:\/|[\s"';&|<>]|$)/i,
-  /(^|[\s"'=])(?:\.\/)?\.env(?:\.[^\s"';&|<>/]*)?(?=$|[\s"';&|<>])/i,
+  HIGH_RISK_ENV_PATH_PATTERN,
   /(^|[/\s"'=])(?:\.netrc|\.npmrc|\.pypirc|credentials|id_dsa|id_ecdsa|id_ed25519|id_rsa)(?=$|[/\s"';&|<>])/i,
   /(^|[/\s"'=])(?:cookies|login data|keychain|keychains)(?=$|[/\s"';&|<>])/i,
 ]
@@ -122,14 +197,10 @@ function pathValue(value: string): string {
 function looksLikeLocalPath(value: string): boolean {
   const candidate = pathValue(value)
   return (
-    candidate === "~" ||
-    candidate === "$HOME" ||
-    candidate === "${HOME}" ||
+    hasUnresolvedShellExpansion(candidate) ||
+    isHomeReferencePath(candidate) ||
     /^[A-Za-z]:[\\/]/u.test(candidate) ||
     candidate.startsWith("/") ||
-    candidate.startsWith("~/") ||
-    candidate.startsWith("$HOME/") ||
-    candidate.startsWith("${HOME}/") ||
     candidate.startsWith("file://")
   )
 }
@@ -151,11 +222,29 @@ function commandAccessResources(command: string, depth = 0): string[] {
     if (!parsed?.length) {
       return []
     }
-    const words = effectiveShellCommandWords(parsed)
+    const words = unwrappedShellCommandWords(parsed)
     const direct = words.map(pathValue).filter(looksLikeLocalPath)
+    // Relative file operands must retain the same sensitive-path semantics as
+    // absolute paths. Limit this to file operations so quoted search patterns
+    // and script source are not misclassified as resource access.
+    if (
+      ["cat", "head", "tail", "stat", "ls", "cp", "mv", "rm", "tee", "file", "wc"].includes(
+        shellCommandName(words[0]) ?? "",
+      )
+    ) {
+      direct.push(...words.slice(1).filter((word) => !word.startsWith("-") && isSensitiveResource(word)))
+    }
     const nested = depth < 2 ? nestedShellCommand(words) : undefined
     return nested ? [...direct, ...commandAccessResources(nested, depth + 1)] : direct
   })
+}
+
+export function permissionRequestAccessResources(request: ChatPermissionRequest): string[] {
+  const values = [...request.resources, ...(request.save ?? [])].map((value) => value.trim()).filter(Boolean)
+  if (permissionRequestKind(request) !== "command") {
+    return values
+  }
+  return [...new Set([...values, ...commandAccessResources(commandText(request))])]
 }
 
 function isShallowDirectoryListing(command: string): boolean {
@@ -170,7 +259,10 @@ function isShallowDirectoryListing(command: string): boolean {
   return !words.some((word) => word === "-R" || word === "--recursive")
 }
 
-export function isHighRiskPermissionRequest(request: ChatPermissionRequest): boolean {
+export function isHighRiskPermissionRequest(
+  request: ChatPermissionRequest,
+  scope: PermissionScopeContext = {},
+): boolean {
   if (permissionRequestKind(request) !== "command") {
     return false
   }
@@ -182,7 +274,12 @@ export function isHighRiskPermissionRequest(request: ChatPermissionRequest): boo
   return (
     dependencyCommandRequiresConfirmation(shellControlText) ||
     commandRequiresConfirmation(shellControlText) ||
-    HIGH_RISK_COMMAND_PATH_PATTERNS.some((pattern) => pattern.test(shellControlText))
+    HIGH_RISK_COMMAND_PATH_PATTERNS.filter((pattern) => pattern !== HIGH_RISK_ENV_PATH_PATTERN).some((pattern) =>
+      pattern.test(shellControlText),
+    ) ||
+    ((HIGH_RISK_ENV_PATH_PATTERN.test(shellControlText) || commandHasLiteralDotEnvResource(shellControlText)) &&
+      !commandEnvAccessesAreReadOnlySelectedProject(shellControlText, scope) &&
+      !commandWritesSelectedProjectEnv(shellControlText, scope))
   )
 }
 
@@ -200,45 +297,9 @@ export function isOoCliPermissionRequest(request: ChatPermissionRequest): boolea
 
 const pythonPackageRequirementPattern =
   /^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(?:\[[A-Za-z0-9._-]+(?:,[A-Za-z0-9._-]+)*\])?(?:(?:===|==|~=|!=|<=|>=|<|>)[A-Za-z0-9*+.!_-]+(?:,(?:===|==|~=|!=|<=|>=|<|>)[A-Za-z0-9*+.!_-]+)*)?$/u
-const protectedPipInstallOptions = new Set([
-  "-c",
-  "-e",
-  "-f",
-  "-i",
-  "-r",
-  "-t",
-  "--break-system-packages",
-  "--config-file",
-  "--constraint",
-  "--default-index",
-  "--editable",
-  "--extra-index-url",
-  "--find-links",
-  "--group",
-  "--index",
-  "--index-url",
-  "--prefix",
-  "--requirement",
-  "--root",
-  "--target",
-  "--trusted-host",
-  "--user",
-])
 
 function canonicalPythonPackageName(value: string): string {
   return value.toLowerCase().replace(/[._-]+/gu, "-")
-}
-
-function pipOptionName(word: string): string {
-  if (!word.startsWith("--")) {
-    for (const shortOption of ["-c", "-e", "-f", "-i", "-r", "-t"]) {
-      if (word.startsWith(shortOption) && word !== shortOption) {
-        return shortOption
-      }
-    }
-  }
-  const separator = word.indexOf("=")
-  return separator >= 0 ? word.slice(0, separator) : word
 }
 
 function managedPythonPackageNames(words: readonly string[]): string[] | null {
@@ -307,6 +368,7 @@ function resolvedDirectory(directory: string, workingDirectory?: string): string
 function pythonInstallArguments(
   words: readonly string[],
   executableAllowed: (executable: string, workingDirectory?: string) => boolean,
+  pipExecutableAllowed: (executable: string, workingDirectory?: string) => boolean,
   workingDirectory?: string,
 ): readonly string[] | null {
   const executable = words[0] ?? ""
@@ -317,6 +379,12 @@ function pythonInstallArguments(
     words[3] === "install"
   ) {
     return words.slice(4)
+  }
+  if (
+    pipExecutableAllowed(resolvedExecutable(executable, workingDirectory), workingDirectory) &&
+    words[1] === "install"
+  ) {
+    return words.slice(2)
   }
   if (shellCommandName(executable) !== "uv") {
     return null
@@ -385,6 +453,7 @@ function boundedPythonInstallCommand(
   command: string,
   executableAllowed: (executable: string, workingDirectory?: string) => boolean,
   directoryAllowed: (directory: string) => boolean,
+  implicitWorkingDirectory?: string,
 ): { body: string; directory?: string } | undefined {
   let body = command
   let directory: string | undefined
@@ -405,20 +474,30 @@ function boundedPythonInstallCommand(
     const environment = pythonEnvironmentBootstrapTarget(possibleBootstrap.left)
     if (
       !environment ||
-      !environmentTargetMatchesAllowedExecutable(environment, executableAllowed, directory) ||
+      !environmentTargetMatchesAllowedExecutable(
+        environment,
+        executableAllowed,
+        directory ?? implicitWorkingDirectory,
+      ) ||
       !possibleBootstrap.right
     ) {
       return undefined
     }
     body = possibleBootstrap.right
   }
-  return { body, ...(directory ? { directory } : {}) }
+  const workingDirectory = directory ?? implicitWorkingDirectory
+  if (workingDirectory && !directoryAllowed(workingDirectory)) {
+    return undefined
+  }
+  return { body: commandWithoutInertOutputSuffixes(body), ...(workingDirectory ? { directory: workingDirectory } : {}) }
 }
 
 function scopedPythonDependencyInstall(
   request: ChatPermissionRequest,
   executableAllowed: (executable: string, workingDirectory?: string) => boolean,
+  pipExecutableAllowed: (executable: string, workingDirectory?: string) => boolean,
   directoryAllowed: (directory: string) => boolean = () => true,
+  implicitWorkingDirectory?: string,
 ): ManagedPythonDependencyInstall | null {
   if (permissionRequestKind(request) !== "command") {
     return null
@@ -427,19 +506,25 @@ function scopedPythonDependencyInstall(
   if (!command) {
     return null
   }
-  const boundedCommand = boundedPythonInstallCommand(command, executableAllowed, directoryAllowed)
+  const boundedCommand = boundedPythonInstallCommand(
+    command,
+    executableAllowed,
+    directoryAllowed,
+    implicitWorkingDirectory,
+  )
   if (!boundedCommand) {
     return null
   }
-  const body = commandWithoutSafeDescriptorDuplication(commandWithoutSafeOutputFilter(boundedCommand.body))
+  const body = commandWithoutInertOutputSuffixes(boundedCommand.body)
   if (hasUnsafeShellSyntax(body)) {
     return null
   }
-  const words = shellWords(body)
-  if (!words) {
+  const parsedWords = shellWords(body)
+  if (!parsedWords) {
     return null
   }
-  const installWords = pythonInstallArguments(words, executableAllowed, boundedCommand.directory)
+  const words = unwrappedShellCommandWords(parsedWords, false)
+  const installWords = pythonInstallArguments(words, executableAllowed, pipExecutableAllowed, boundedCommand.directory)
   const packages = installWords ? managedPythonPackageNames(installWords) : null
   return packages ? { packages } : null
 }
@@ -452,9 +537,13 @@ function scopedPythonDependencyInstall(
 export function managedPythonDependencyInstall(
   request: ChatPermissionRequest,
   processRoot?: string,
+  implicitWorkingDirectory?: string,
 ): ManagedPythonDependencyInstall | null {
   const allowedExecutables = processRoot
     ? new Set(managedPythonExecutables(processRoot).map(normalizedExecutable))
+    : undefined
+  const allowedPipExecutables = processRoot
+    ? new Set(managedPythonPipExecutables(processRoot).map(normalizedExecutable))
     : undefined
   return scopedPythonDependencyInstall(
     request,
@@ -462,31 +551,41 @@ export function managedPythonDependencyInstall(
       allowedExecutables
         ? allowedExecutables.has(normalizedExecutable(executable))
         : isManagedPythonExecutable(executable),
+    (executable) =>
+      allowedPipExecutables
+        ? allowedPipExecutables.has(normalizedExecutable(executable))
+        : isManagedPythonPipExecutable(executable),
     processRoot
       ? (directory) =>
           normalizedExecutable(directory) === normalizedExecutable(processRoot) ||
           normalizedExecutable(directory) === normalizedExecutable(managedPythonEnvironmentPath(processRoot))
       : undefined,
+    implicitWorkingDirectory,
   )
 }
 
 export function isTaskScopedPythonDependencyInstallRequest(
   request: ChatPermissionRequest,
   processRoot: string,
+  implicitWorkingDirectory?: string,
 ): boolean {
-  return Boolean(managedPythonDependencyInstall(request, processRoot))
+  return Boolean(managedPythonDependencyInstall(request, processRoot, implicitWorkingDirectory))
 }
 
 export function isProjectScopedPythonDependencyInstallRequest(
   request: ChatPermissionRequest,
   projectRoot: string,
+  implicitWorkingDirectory?: string,
 ): boolean {
   const allowedExecutables = new Set(projectPythonExecutables(projectRoot).map(normalizedExecutable))
+  const allowedPipExecutables = new Set(projectPythonPipExecutables(projectRoot).map(normalizedExecutable))
   return Boolean(
     scopedPythonDependencyInstall(
       request,
       (executable) => allowedExecutables.has(normalizedExecutable(executable)),
+      (executable) => allowedPipExecutables.has(normalizedExecutable(executable)),
       (directory) => normalizedExecutable(directory) === normalizedExecutable(projectRoot),
+      implicitWorkingDirectory,
     ),
   )
 }
@@ -527,11 +626,14 @@ function containsSegmentSequence(segments: readonly string[], sequence: readonly
   return segments.some((_, index) => sequence.every((segment, offset) => segments[index + offset] === segment))
 }
 
+function isDotEnvBasename(basename: string): boolean {
+  return basename === ".env" || basename.startsWith(".env.")
+}
+
 function isSensitiveResource(resource: string): boolean {
   const basename = resourceBasename(resource)
   if (
-    basename === ".env" ||
-    basename.startsWith(".env.") ||
+    isDotEnvBasename(basename) ||
     basename === ".netrc" ||
     basename === ".npmrc" ||
     basename === ".pypirc" ||
@@ -613,9 +715,293 @@ function isBroadResource(resource: string): boolean {
   return false
 }
 
-export function permissionRequestHasSensitiveResource(request: ChatPermissionRequest): boolean {
+function isAbsoluteLocalPath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:\//u.test(value)
+}
+
+function collapsePathSegments(value: string): string | undefined {
+  const windowsRoot = /^[A-Za-z]:\//u.exec(value)?.[0]
+  const root = windowsRoot ?? (value.startsWith("/") ? "/" : "")
+  if (!root) {
+    return undefined
+  }
+  const rest = windowsRoot ? value.slice(windowsRoot.length) : value.slice(1)
+  const resolved: string[] = []
+  for (const segment of rest.split("/")) {
+    if (!segment || segment === ".") {
+      continue
+    }
+    if (segment === "..") {
+      if (resolved.length === 0) {
+        return undefined
+      }
+      resolved.pop()
+      continue
+    }
+    resolved.push(segment)
+  }
+  if (windowsRoot) {
+    return resolved.length === 0 ? windowsRoot.replace(/\/$/u, "") : `${windowsRoot}${resolved.join("/")}`
+  }
+  return `/${resolved.join("/")}`
+}
+
+function isHomeReferencePath(value: string): boolean {
+  return /^(?:~|\$HOME|\$\{HOME\})(?:\/|$)/iu.test(value)
+}
+
+function hasUnresolvedShellExpansion(value: string): boolean {
+  return value.startsWith("~") || /[$`]/u.test(value)
+}
+
+function resolveScopedResourcePath(resource: string, workingDirectory?: string): string | undefined {
+  const trimmed = normalizeResourceText(resource)
+  if (!trimmed || isHomeReferencePath(trimmed) || hasUnresolvedShellExpansion(trimmed)) {
+    return undefined
+  }
+  if (isAbsoluteLocalPath(trimmed)) {
+    return collapsePathSegments(trimmed)
+  }
+  if (!workingDirectory) {
+    return undefined
+  }
+  const base = collapsePathSegments(normalizeResourceText(workingDirectory))
+  if (!base) {
+    return undefined
+  }
+  return collapsePathSegments(`${base}/${trimmed}`)
+}
+
+function scopedResourceInsideProjectRoot(target: string, projectRoot: string): boolean {
+  const normalizedRoot = collapsePathSegments(normalizeResourceText(projectRoot))
+  const normalizedTarget = collapsePathSegments(normalizeResourceText(target))
+  return Boolean(
+    normalizedRoot &&
+    normalizedTarget &&
+    (normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`)),
+  )
+}
+
+export function isSelectedProjectEnvResource(resource: string, scope: PermissionScopeContext = {}): boolean {
+  if (!isDotEnvBasename(resourceBasename(resource))) {
+    return false
+  }
+  const projectRoot = scope.trustedProjectRoot
+  if (!projectRoot) {
+    return false
+  }
+  const target = resolveScopedResourcePath(resource, scope.commandCwd)
+  return Boolean(target && scopedResourceInsideProjectRoot(target, projectRoot))
+}
+
+function commandScopeWithLeadingCd(command: string, scope: PermissionScopeContext): PermissionScopeContext {
+  const leading = splitLeadingAnd(command)
+  const directory = leading ? explicitCdDirectory(leading.left) : undefined
+  if (!directory) {
+    return scope
+  }
+  const resolved = resolveScopedResourcePath(directory, scope.commandCwd)
+  // An unexpanded `cd` target is not proof we stayed in the previous cwd.
+  return resolved ? { ...scope, commandCwd: resolved } : { ...scope, commandCwd: undefined }
+}
+
+const attachedWriteRedirectPattern = /^(?:[0-9]*)(?:>>?|>\|)(.*)$/u
+const combinedWriteRedirectPattern = /^(?:&>>?)(.*)$/u
+
+function writeRedirectDestinations(words: readonly string[]): string[] {
+  const destinations: string[] = []
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index] ?? ""
+    const match = combinedWriteRedirectPattern.exec(word) ?? attachedWriteRedirectPattern.exec(word)
+    if (!match) {
+      continue
+    }
+    const attached = (match[1] ?? "").trim()
+    if (attached.startsWith("&")) {
+      continue
+    }
+    if (attached) {
+      destinations.push(pathValue(attached))
+      continue
+    }
+    const next = words[index + 1]
+    if (next && !next.startsWith("&")) {
+      destinations.push(pathValue(next))
+      index += 1
+    }
+  }
+  return destinations
+}
+
+function inPlaceEditDestinations(words: readonly string[]): string[] {
+  const name = shellCommandName(words[0])
+  if (name !== "sed" && name !== "perl") {
+    return []
+  }
+  const inPlace = words.slice(1).some((word) => {
+    if (word === "--") {
+      return false
+    }
+    return (
+      word === "-i" ||
+      word.startsWith("-i") ||
+      word === "-pi" ||
+      word.startsWith("-pi") ||
+      word === "--in-place" ||
+      word.startsWith("--in-place=")
+    )
+  })
+  if (!inPlace) {
+    return []
+  }
+  const destinations: string[] = []
+  let optionsEnded = false
+  for (const word of words.slice(1)) {
+    if (!optionsEnded && word === "--") {
+      optionsEnded = true
+      continue
+    }
+    if (!optionsEnded && word.startsWith("-")) {
+      continue
+    }
+    destinations.push(pathValue(word))
+  }
+  return destinations
+}
+
+function commandWriteDestinations(command: string, depth = 0): string[] {
+  return topLevelShellSegments(command).flatMap(({ text }) => {
+    const parsed = shellWords(text)
+    if (!parsed?.length) {
+      return []
+    }
+    const destinations = writeRedirectDestinations(parsed)
+    const words = effectiveShellCommandWords(parsed)
+    const name = shellCommandName(words[0])
+    if (name === "tee") {
+      for (const word of words.slice(1)) {
+        if (word === "--" || word.startsWith("-")) {
+          continue
+        }
+        destinations.push(pathValue(word))
+      }
+    }
+    if (name === "cp" || name === "mv") {
+      const operands = words.slice(1).filter((word) => word !== "--" && !word.startsWith("-"))
+      const destination = operands.at(-1)
+      if (destination) {
+        destinations.push(pathValue(destination))
+      }
+    }
+    destinations.push(...inPlaceEditDestinations(words))
+    const nested = depth < 2 ? nestedShellCommand(words) : undefined
+    return nested ? [...destinations, ...commandWriteDestinations(nested, depth + 1)] : destinations
+  })
+}
+
+const selectedProjectEnvReadCommands = new Set([
+  "cat",
+  "cmp",
+  "cut",
+  "diff",
+  "egrep",
+  "fgrep",
+  "file",
+  "grep",
+  "head",
+  "rg",
+  "stat",
+  "tail",
+  "uniq",
+  "wc",
+])
+
+function commandDotEnvResources(command: string): string[] {
+  const parsed = shellWords(command)
+  if (!parsed?.length) {
+    return []
+  }
+  const words = effectiveShellCommandWords(parsed)
+  return [...new Set([...commandAccessResources(command), ...words.map(pathValue)])]
+    .map((resource) => resource.trim())
+    .filter((resource) => resource && isDotEnvBasename(resourceBasename(resource)))
+}
+
+function commandHasLiteralDotEnvResource(command: string): boolean {
+  return topLevelShellSegments(command).some(({ text }) =>
+    commandDotEnvResources(text).some((resource) => !hasUnresolvedShellExpansion(resource)),
+  )
+}
+
+function selectedProjectEnvCommandIsReadOnly(words: readonly string[]): boolean {
+  const name = shellCommandName(words[0])
+  return Boolean(name && selectedProjectEnvReadCommands.has(name))
+}
+
+function commandEnvAccessesAreReadOnlySelectedProject(command: string, scope: PermissionScopeContext): boolean {
+  if (!scope.trustedProjectRoot) {
+    return false
+  }
+  const leading = splitLeadingAnd(command)
+  if (leading && shellCommandName(shellWords(leading.left)?.[0]) === "cd" && !explicitCdDirectory(leading.left)) {
+    return false
+  }
+  const commandScope = commandScopeWithLeadingCd(command, scope)
+  let foundEnvResource = false
+  let envPipelineActive = false
+  const segments = topLevelShellSegments(commandWithoutHereDocumentBodies(command))
+  for (const { operatorAfter, text } of segments) {
+    const parsed = shellWords(text)
+    if (!parsed?.length) {
+      return false
+    }
+    const words = effectiveShellCommandWords(parsed)
+    const envResources = commandDotEnvResources(text)
+    const receivesEnvInput: boolean = envPipelineActive
+    if (envResources.length > 0) {
+      foundEnvResource = true
+      if (!envResources.every((resource) => isSelectedProjectEnvResource(resource, commandScope))) {
+        return false
+      }
+    }
+    if ((envResources.length > 0 || receivesEnvInput) && !selectedProjectEnvCommandIsReadOnly(words)) {
+      return false
+    }
+    envPipelineActive = operatorAfter === "pipe" && (envResources.length > 0 || receivesEnvInput)
+  }
+  return foundEnvResource
+}
+
+function commandWritesSelectedProjectEnv(command: string, scope: PermissionScopeContext): boolean {
+  const body = commandWithoutHereDocumentBodies(command)
+  const writeScope = commandScopeWithLeadingCd(body, scope)
+  return commandWriteDestinations(body).some((destination) => isSelectedProjectEnvResource(destination, writeScope))
+}
+
+export function permissionRequestIsSelectedProjectEnvWrite(
+  request: ChatPermissionRequest,
+  scope: PermissionScopeContext = {},
+): boolean {
+  if (!scope.trustedProjectRoot) {
+    return false
+  }
+  const kind = permissionRequestKind(request)
+  if (kind === "edit") {
+    const resources = [...request.resources, ...(request.save ?? [])].filter((value) => value.trim())
+    return resources.some((resource) => isSelectedProjectEnvResource(resource, scope))
+  }
+  if (kind === "command") {
+    return commandWritesSelectedProjectEnv(commandText(request), scope)
+  }
+  return false
+}
+
+export function permissionRequestHasSensitiveResource(
+  request: ChatPermissionRequest,
+  scope: PermissionScopeContext = {},
+): boolean {
   const values = [...request.resources, ...(request.save ?? [])].filter((value) => value.trim())
-  if (values.some(isSensitiveResource)) {
+  if (values.some((resource) => isSensitiveResource(resource) && !isSelectedProjectEnvResource(resource, scope))) {
     return true
   }
   if (permissionRequestKind(request) !== "command") {
@@ -623,8 +1009,9 @@ export function permissionRequestHasSensitiveResource(request: ChatPermissionReq
   }
   const command = commandText(request)
   return (
-    commandAccessResources(command).some(isSensitiveResource) ||
-    SENSITIVE_COMMAND_RESOURCE_PATTERN.test(commandWithoutHereDocumentBodies(command))
+    commandAccessResources(command).some(
+      (resource) => isSensitiveResource(resource) && !isSelectedProjectEnvResource(resource, scope),
+    ) || SENSITIVE_COMMAND_RESOURCE_PATTERN.test(commandWithoutHereDocumentBodies(command))
   )
 }
 
@@ -641,11 +1028,14 @@ export function permissionRequestHasBroadResource(request: ChatPermissionRequest
   )
 }
 
-export function permissionRequestNeedsDefaultPrompt(request: ChatPermissionRequest): boolean {
-  if (isHighRiskPermissionRequest(request)) {
+export function permissionRequestNeedsDefaultPrompt(
+  request: ChatPermissionRequest,
+  scope: PermissionScopeContext = {},
+): boolean {
+  if (isHighRiskPermissionRequest(request, scope)) {
     return true
   }
-  if (permissionRequestHasSensitiveResource(request)) {
+  if (permissionRequestHasSensitiveResource(request, scope)) {
     return true
   }
   const kind = permissionRequestKind(request)
@@ -654,7 +1044,7 @@ export function permissionRequestNeedsDefaultPrompt(request: ChatPermissionReque
   }
   if (kind === "command") {
     const command = commandWithoutHereDocumentBodies(commandText(request))
-    return isDependencyMutationCommand(command)
+    return dependencyCommandChangesScope(command, scope)
   }
   // Broad non-sensitive reads are consequence-free. Keep confirmation for edits whose requested
   // scope is itself a home/system root; destructive shell commands are already gated above.
@@ -705,14 +1095,21 @@ export function createSessionPermissionGrant(
       processRoot,
     }
   }
-  const basePatterns = request.save?.length
-    ? request.save
-    : request.resources.length > 0
-      ? request.resources
-      : permissionRequestKind(request) === "command"
-        ? [permissionCommand(request)].filter((item): item is string => typeof item === "string")
-        : []
-  const patterns = basePatterns.map((item) => item.trim()).filter(Boolean)
+  const basePatterns = request.save?.length ? request.save : request.resources
+  // Validation checks both the command and every resource. Retain both when
+  // granting a command, including when the agent also suggests save patterns.
+  const values =
+    permissionRequestKind(request) === "command"
+      ? [...basePatterns, ...request.resources, permissionCommand(request)]
+      : basePatterns
+  const patterns = [
+    ...new Set(
+      values
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  ]
   if (patterns.length === 0) {
     return null
   }
@@ -729,7 +1126,7 @@ export function requestMatchesSessionGrant(request: ChatPermissionRequest, grant
   const values = [permissionCommand(request), ...request.resources].filter(
     (value): value is string => typeof value === "string" && value.trim().length > 0,
   )
-  return values.some((value) => grant.patterns.some((pattern) => patternMatches(pattern, value)))
+  return values.length > 0 && values.every((value) => grant.patterns.some((pattern) => patternMatches(pattern, value)))
 }
 
 export function requestMatchesManagedPythonDependencyInstallGrant(

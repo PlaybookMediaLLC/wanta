@@ -1,4 +1,5 @@
 import type { DirectCliProvider } from "./agent/direct-cli-host-capability.ts"
+import type { HostMcpServerProvider } from "./agent/external/host-mcp.ts"
 import type { LinkCapabilityRuntime } from "./agent/link-capability.ts"
 import type { AppCommand } from "./app-command.ts"
 import type { AppLocale } from "./app-locale.ts"
@@ -51,12 +52,14 @@ import { BROWSER_CAPABILITY_ID, createBrowserHostCapability } from "./agent/brow
 import { createDirectCliHostCapability, DIRECT_CLI_CAPABILITY_ID } from "./agent/direct-cli-host-capability.ts"
 import { memoizeExternalCommandEnvironment } from "./agent/external/command-environment.ts"
 import { createExternalAgents } from "./agent/external/create.ts"
+import { ExternalOoGuardServer } from "./agent/external/oo-guard-server.ts"
+import { verifyPackagedOoRuntimeIntegrity } from "./agent/external/oo-runtime-integrity.ts"
+import { externalSessionScratchCwd, ExternalOoScopeStore } from "./agent/external/oo-scope-store.ts"
 import { externalAgentKindForSessionId } from "./agent/external/session-id.ts"
 import { HostCapabilityInvokeServer } from "./agent/host-capability-invoke-server.ts"
 import { HostCapabilityServer } from "./agent/host-capability-server.ts"
-import { HostCapabilityKernel } from "./agent/host-capability.ts"
+import { HOST_CAPABILITY_AUDIT_BINDING, HostCapabilityKernel } from "./agent/host-capability.ts"
 import { HostQuestionBroker } from "./agent/host-question-broker.ts"
-import { createKnowledgeHostCapability, KNOWLEDGE_CAPABILITY_ID } from "./agent/knowledge-host-capability.ts"
 import { LinkCapability } from "./agent/link-capability.ts"
 import { createLinkHostCapability, LINK_CAPABILITY_ID, LINK_RUNTIME_BINDING } from "./agent/link-host-capability.ts"
 import { ManagedTurnDirectories } from "./agent/managed-turn-directories.ts"
@@ -71,8 +74,17 @@ import {
   SKILL_SNAPSHOT_BINDING,
 } from "./agent/skill-host-capability.ts"
 import { SkillRegistry } from "./agent/skill-registry.ts"
+import { createSpacesHostCapability, SPACES_CAPABILITY_ID } from "./agent/spaces-host-capability.ts"
+import { SpacesService } from "./agent/spaces-service.ts"
+import { SpacesOperationStore } from "./agent/spaces-store.ts"
 import { APP_COMMAND_CHANNEL, APP_COMMANDS } from "./app-command.ts"
-import { APP_LOCALE_CHANNEL, isAppLocale, normalizeAppLocale } from "./app-locale.ts"
+import {
+  APP_LOCALE_CHANNEL,
+  APP_LOCALE_PREFERENCE_CHANNEL,
+  isAppLocale,
+  isLocalePreference,
+  normalizeAppLocale,
+} from "./app-locale.ts"
 import { ArtifactResourceLeaseStore } from "./artifact-resource/lease-store.ts"
 import {
   artifactResourceUrl,
@@ -89,6 +101,7 @@ import { BrowserControlServer } from "./browser/control-server.ts"
 import { BrowserManager, BrowserServiceImpl } from "./browser/node.ts"
 import { ArtifactBundleStore } from "./chat/artifact-bundles.ts"
 import { AuthorizationOverlayStore } from "./chat/authorization.ts"
+import { ComposerDraftStore } from "./chat/composer-drafts.ts"
 import { ChatServiceImpl } from "./chat/node.ts"
 import { removeSessionOutputDirectories } from "./chat/output-directory-cleanup.ts"
 import { SpreadsheetPreviewWorkerClient } from "./chat/spreadsheet-preview-worker-client.ts"
@@ -100,8 +113,6 @@ import { mergePathValues, resolveUserCommandPath } from "./command-path.ts"
 import { parseConnectionOAuthCallback } from "./connections/domain.ts"
 import { configureDiagnosticsLog, flushDiagnosticsLog, logDiagnostic } from "./diagnostics-log.ts"
 import { GitServiceImpl } from "./git/node.ts"
-import { KnowledgeServiceImpl } from "./knowledge/node.ts"
-import { WikiGraphQueryRunner } from "./knowledge/query-runner.ts"
 import { DingTalkCliManager } from "./link-runtime/dingtalk-cli.ts"
 import { LarkCliManager } from "./link-runtime/lark-cli.ts"
 import { LinkRuntimeManager, LinkRuntimeServiceImpl } from "./link-runtime/node.ts"
@@ -114,6 +125,7 @@ import {
 import { ModelCredentialStore } from "./models/credential-store.ts"
 import { ModelsServiceImpl } from "./models/node.ts"
 import { ModelsStore } from "./models/store.ts"
+import { nativeTranslate } from "./native-messages.ts"
 import { installOomolCorsShim } from "./net/oomol-cors.ts"
 // Teams 请求已整体搬到渲染层（src/lib/teams-client.ts），不再有对应主进程 service。
 import { listenProtocolUrls, registerProtocolClient, requestProtocolSingleInstanceLock } from "./protocol.ts"
@@ -187,10 +199,8 @@ const settingsStore = new SettingsStore(app.getPath("userData"))
 const attentionStore = new AttentionStore(app.getPath("userData"))
 const modelCredentialStore = new ModelCredentialStore(app.getPath("userData"), safeStorage)
 const modelsStore = new ModelsStore(app.getPath("userData"), modelCredentialStore)
-const wikiGraphStateDir = path.join(app.getPath("userData"), "wikigraph-state")
-const wikiGraphLibraryDir = path.join(wikiGraphStateDir, "library")
-const wikiGraphCliPath = path.join(dirname, "wanta-wg.js")
 const ooGuardCliPath = path.join(dirname, "wanta-oo-guard.js")
+const opencodeOoGuardCliPath = path.join(dirname, "wanta-opencode-oo-guard.js")
 // 二进制解析：生产从打包 Resources/bin（extraResources），dev 从 node_modules（opencode）与 .oo-bin（oo）。
 const opencodeBinPath = app.isPackaged
   ? resolveBundledBin(process.resourcesPath, opencodeBinaryName())
@@ -211,6 +221,19 @@ process.env.OO_CLI_PATH = ooBinPath
 const bundledSkillsDir = app.isPackaged
   ? resolveBundledSkillsDir(process.resourcesPath)
   : resolveDevBundledSkillsDir(appRoot)
+const externalOoRuntimeIntegrity = app.isPackaged
+  ? verifyPackagedOoRuntimeIntegrity(process.resourcesPath).then((result) => {
+      if (!result.available) {
+        logDiagnostic(
+          "external-oo-runtime",
+          "packaged integrity verification failed",
+          { reason: result.reason },
+          "error",
+        )
+      }
+      return result
+    })
+  : Promise.resolve({ available: true } as const)
 const bundledLarkSkillsDir = app.isPackaged
   ? resolveBundledLarkSkillsDir(process.resourcesPath)
   : resolveDevBundledLarkSkillsDir(appRoot)
@@ -262,6 +285,7 @@ function directRuntimes() {
   return directRuntimeCache
 }
 const linkCapability = new LinkCapability({
+  onActionAudit: (record) => logDiagnostic("link-capability", "action dispatch", { ...record }),
   ooBinPath,
   runtime: () => activeLinkCapabilityRuntime,
   storeDir: path.join(app.getPath("userData"), "agent-external", "link-oo-store"),
@@ -270,9 +294,22 @@ const hostCapabilityKernel = new HostCapabilityKernel({
   onAudit: (record) => logDiagnostic("host-capability", "tool call", { ...record }),
 })
 const hostQuestionBroker = new HostQuestionBroker()
+const spacesService = new SpacesService({
+  binary:
+    process.platform === "win32"
+      ? null
+      : app.isPackaged
+        ? path.join(process.resourcesPath, "bin", "spaces")
+        : path.join(app.getAppPath(), ".spaces-bin", "spaces"),
+  store: new SpacesOperationStore(path.join(app.getPath("userData"), "spaces", "operations")),
+  questions: hostQuestionBroker,
+  locale: activeLocale,
+  // Fail closed until an authoritative monthly-price source is configured.
+  price: async () => null,
+})
+hostCapabilityKernel.register(createSpacesHostCapability(spacesService))
 hostCapabilityKernel.register(createLinkHostCapability(linkCapability))
 hostCapabilityKernel.register(createSkillHostCapability())
-hostCapabilityKernel.register(createKnowledgeHostCapability(new WikiGraphQueryRunner(wikiGraphStateDir)))
 hostCapabilityKernel.register(createQuestionHostCapability(hostQuestionBroker))
 hostCapabilityKernel.register(
   createDirectCliHostCapability({
@@ -289,20 +326,19 @@ hostCapabilityKernel.register(
     },
   }),
 )
-const linkCapabilityServer = new HostCapabilityServer({
-  capabilityIds: [LINK_CAPABILITY_ID],
-  instructions: "Wanta host capabilities are session-scoped. Never infer or replace their account identity.",
-  kernel: hostCapabilityKernel,
-  name: "wanta_link",
-  version: "1.0.0",
-})
-const builtInHostInvokeServer = new HostCapabilityInvokeServer(hostCapabilityKernel, [LINK_CAPABILITY_ID])
+const builtInHostInvokeServer = new HostCapabilityInvokeServer(hostCapabilityKernel, [
+  LINK_CAPABILITY_ID,
+  SPACES_CAPABILITY_ID,
+])
 const sessionProjectStore = new SessionProjectStore(app.getPath("userData"))
 const artifactBundleStore = new ArtifactBundleStore(app.getPath("userData"))
 const authorizationOverlayStore = new AuthorizationOverlayStore(app.getPath("userData"))
 const stoppedGenerationStore = new StoppedGenerationStore(app.getPath("userData"))
 const turnOutputStore = new TurnOutputStore(app.getPath("userData"), artifactBundleStore)
-const userAttachmentStore = new UserAttachmentStore(app.getPath("userData"))
+const composerDraftStore = new ComposerDraftStore(app.getPath("userData"))
+const userAttachmentStore = new UserAttachmentStore(app.getPath("userData"), {
+  retentionState: () => composerDraftStore.retentionState(),
+})
 const trustedAttachmentPaths = new ExpiringTrustedPathRegistry()
 const trustedProjectPaths = new ExpiringTrustedPathRegistry()
 const artifactResourceLeaseStore = new ArtifactResourceLeaseStore()
@@ -338,13 +374,6 @@ const skillCapabilityServer = new HostCapabilityServer({
   name: "wanta_skills",
   version: "1.0.0",
 })
-const knowledgeCapabilityServer = new HostCapabilityServer({
-  capabilityIds: [KNOWLEDGE_CAPABILITY_ID],
-  instructions: "Knowledge access is read-only and restricted to Wanta's managed WikiGraph library.",
-  kernel: hostCapabilityKernel,
-  name: "wanta_knowledge",
-  version: "1.0.0",
-})
 const questionCapabilityServer = new HostCapabilityServer({
   capabilityIds: [QUESTION_CAPABILITY_ID],
   instructions: "Structured questions are session-bound and block until the user responds in Wanta.",
@@ -359,101 +388,156 @@ const directCliCapabilityServer = new HostCapabilityServer({
   name: "wanta_direct",
   version: "1.0.0",
 })
+const spacesCapabilityServer = new HostCapabilityServer({
+  capabilityIds: [SPACES_CAPABILITY_ID],
+  kernel: hostCapabilityKernel,
+  name: "wanta_spaces",
+  version: "1.0.0",
+})
+function activateSpaces(context: import("./agent/host-capability.ts").HostCapabilityContext): boolean {
+  const runtime = activeLinkCapabilityRuntime?.linkRuntime
+  if (process.platform === "win32" || runtime?.kind !== "oomol" || !context.teamName || !activeLinkCapabilityScope) {
+    spacesService.disable(context.sessionId)
+    return false
+  }
+  spacesService.activate(context, {
+    accountId: activeLinkCapabilityScope,
+    token: runtime.sessionToken,
+    teamName: context.teamName,
+  })
+  return true
+}
 const externalAgentRootDir = path.join(app.getPath("userData"), "agent-external")
+const externalOoScopeStore = new ExternalOoScopeStore()
+const externalOoGuardServer = new ExternalOoGuardServer({
+  available: async () => (await externalOoRuntimeIntegrity).available,
+  command: ooBinPath,
+  scope: () => externalOoScopeStore.snapshot(),
+})
 const externalAgentCommandEnvironment = memoizeExternalCommandEnvironment(async () => {
-  const [userPath, managedOoBinPath] = await Promise.all([
-    resolveUserCommandPath({ preferredDirectories: [path.dirname(ooBinPath)] }),
+  const [userPath, managedOoBinPath, guard] = await Promise.all([
+    resolveUserCommandPath(),
     ensureOoGuardCommandBin({
       binDir: path.join(externalAgentRootDir, "bin"),
       nodeBin: process.execPath,
       ooGuardCliPath,
     }),
+    externalOoGuardServer.descriptor(),
   ])
   return {
     ...process.env,
     PATH: mergePathValues([path.dirname(managedOoBinPath), userPath]),
     WANTA_OO_BIN: managedOoBinPath,
-    WANTA_REAL_OO_BIN: ooBinPath,
+    WANTA_OO_GUARD_TOKEN: guard.token,
+    WANTA_OO_GUARD_URL: guard.url,
+    WANTA_REAL_OO_BIN: undefined,
+    WANTA_TEAM_SCOPE_PATH: undefined,
   }
 })
-// External (BYOA) adapters are app-lifetime and independent of the OOMOL account
-// runtime: their models and auth belong to the agent CLIs themselves. Host
-// capabilities are issued per Wanta session and keep identity in main.
+// External adapters are app-lifetime and inherit their local CLI's own account,
+// provider configuration, and model catalog. Host capabilities are issued per
+// Wanta session and keep Wanta identity and credentials in Electron main.
+const externalHostMcpServers: HostMcpServerProvider = async (input) => {
+  const spacesRuntimeAtStart = activeLinkCapabilityRuntime
+  const spacesScopeAtStart = activeLinkCapabilityScope
+  const spacesScopeIsCurrent = () =>
+    activeLinkCapabilityRuntime === spacesRuntimeAtStart && activeLinkCapabilityScope === spacesScopeAtStart
+  if (input.diagnostic) {
+    spacesService.disable(input.sessionId)
+    spacesCapabilityServer.disableSession(input.sessionId)
+    skillCapabilityServer.disableSession(input.sessionId)
+    questionCapabilityServer.disableSession(input.sessionId)
+    directCliCapabilityServer.disableSession(input.sessionId)
+    browserCapabilityServer.disableSession(input.sessionId)
+    logDiagnostic(
+      "host-capability",
+      "diagnostic manifest disabled",
+      { connectorTransport: "disabled", servers: [], sessionId: input.sessionId },
+      "trace",
+    )
+    return []
+  }
+  const [larkRuntime, wecomRuntime, dingTalkRuntime] = await directRuntimes()
+  const directSkillSources = [
+    ...(larkRuntime ? [{ id: "direct-lark", kind: "connection" as const, root: larkRuntime.skillsDir }] : []),
+    ...(wecomRuntime ? [{ id: "direct-wecom", kind: "connection" as const, root: wecomRuntime.skillsDir }] : []),
+    ...(dingTalkRuntime
+      ? [{ id: "direct-dingtalk", kind: "connection" as const, root: dingTalkRuntime.skillsDir }]
+      : []),
+  ]
+  const skillSnapshot =
+    directSkillSources.length > 0
+      ? await new SkillRegistry([...baseSkillSources, ...directSkillSources]).snapshot()
+      : await skillRegistry.snapshot()
+  const context = {
+    bindings: {
+      [HOST_CAPABILITY_AUDIT_BINDING]: {
+        agentKind: externalAgentKindForSessionId(input.sessionId) ?? "external",
+        transport: "host_mcp",
+      },
+    },
+    sessionId: input.sessionId,
+    ...(input.messageId ? { turnId: input.messageId } : {}),
+    ...(input.teamName ? { teamName: input.teamName } : {}),
+    ...(input.outputProjectRoot ? { projectRoot: input.outputProjectRoot } : {}),
+    ...(input.artifactDir ? { artifactDir: input.artifactDir } : {}),
+    ...(input.processDir ? { processDir: input.processDir } : {}),
+  }
+  // External coding agents use Wanta's guarded OOCLI for Connector work.
+  // MCP stays limited to stateful Wanta-native capabilities.
+  const servers = [await questionCapabilityServer.issue(context)]
+  if (spacesScopeIsCurrent() && activateSpaces(context)) {
+    servers.push(await spacesCapabilityServer.issue(context, { isCurrent: spacesScopeIsCurrent }))
+  } else {
+    spacesService.disable(context.sessionId)
+    spacesCapabilityServer.disableSession(context.sessionId)
+  }
+  if ((await externalOoRuntimeIntegrity).available) {
+    servers.unshift(
+      await skillCapabilityServer.issue({
+        ...context,
+        bindings: { ...context.bindings, [SKILL_SNAPSHOT_BINDING]: skillSnapshot },
+      }),
+    )
+  } else {
+    skillCapabilityServer.disableSession(input.sessionId)
+  }
+  if (directSkillSources.length > 0) {
+    servers.push(
+      await directCliCapabilityServer.issue({
+        ...context,
+        bindings: { ...context.bindings, [SKILL_SNAPSHOT_BINDING]: skillSnapshot },
+      }),
+    )
+  } else {
+    directCliCapabilityServer.disableSession(input.sessionId)
+  }
+  if (settingsStore.read().browserEnabled !== false) {
+    servers.push(await browserCapabilityServer.issue(context))
+  } else {
+    browserCapabilityServer.disableSession(input.sessionId)
+  }
+  logDiagnostic(
+    "host-capability",
+    "manifest issued",
+    {
+      connectorTransport: "guarded_oo_cli",
+      linkRegistered: false,
+      servers: servers.map((server) => server.name),
+      sessionId: input.sessionId,
+      ...(input.messageId ? { turnId: input.messageId } : {}),
+    },
+    "trace",
+  )
+  return servers
+}
 const externalAgents = createExternalAgents({
   appRoot,
   isPackaged: app.isPackaged,
   resourcesPath: process.resourcesPath,
   scratchRootDir: externalAgentRootDir,
   commandEnvironment: externalAgentCommandEnvironment,
-  hostMcpServers: async (input) => {
-    const [larkRuntime, wecomRuntime, dingTalkRuntime] = await directRuntimes()
-    const directSkillSources = [
-      ...(larkRuntime ? [{ id: "direct-lark", kind: "connection" as const, root: larkRuntime.skillsDir }] : []),
-      ...(wecomRuntime ? [{ id: "direct-wecom", kind: "connection" as const, root: wecomRuntime.skillsDir }] : []),
-      ...(dingTalkRuntime
-        ? [{ id: "direct-dingtalk", kind: "connection" as const, root: dingTalkRuntime.skillsDir }]
-        : []),
-    ]
-    const skillSnapshot =
-      directSkillSources.length > 0
-        ? await new SkillRegistry([...baseSkillSources, ...directSkillSources]).snapshot()
-        : await skillRegistry.snapshot()
-    const context = {
-      bindings: {},
-      sessionId: input.sessionId,
-      ...(input.messageId ? { turnId: input.messageId } : {}),
-      ...(input.teamName ? { teamName: input.teamName } : {}),
-      ...(input.outputProjectRoot ? { projectRoot: input.outputProjectRoot } : {}),
-      ...(input.artifactDir ? { artifactDir: input.artifactDir } : {}),
-      ...(input.processDir ? { processDir: input.processDir } : {}),
-    }
-    const servers = []
-    servers.push(
-      await skillCapabilityServer.issue({
-        ...context,
-        bindings: { [SKILL_SNAPSHOT_BINDING]: skillSnapshot },
-      }),
-    )
-    servers.push(await knowledgeCapabilityServer.issue(context))
-    servers.push(await questionCapabilityServer.issue(context))
-    if (directSkillSources.length > 0) {
-      servers.push(
-        await directCliCapabilityServer.issue({
-          ...context,
-          bindings: { [SKILL_SNAPSHOT_BINDING]: skillSnapshot },
-        }),
-      )
-    } else {
-      directCliCapabilityServer.disableSession(input.sessionId)
-    }
-    if (settingsStore.read().browserEnabled !== false) {
-      servers.push(await browserCapabilityServer.issue(context))
-    } else {
-      browserCapabilityServer.disableSession(input.sessionId)
-    }
-    if (activeLinkCapabilityRuntime) {
-      servers.push(
-        await linkCapabilityServer.issue({
-          ...context,
-          bindings: { [LINK_RUNTIME_BINDING]: activeLinkCapabilityRuntime },
-        }),
-      )
-    } else {
-      linkCapabilityServer.disableSession(input.sessionId)
-    }
-    logDiagnostic(
-      "host-capability",
-      "manifest issued",
-      {
-        linkRegistered: servers.some((server) => server.name === "wanta_link"),
-        servers: servers.map((server) => server.name),
-        sessionId: input.sessionId,
-        ...(input.messageId ? { turnId: input.messageId } : {}),
-      },
-      "trace",
-    )
-    return servers
-  },
+  hostMcpServers: externalHostMcpServers,
 })
 // Connections 请求已整体搬到渲染层（src/lib/connections-client.ts）；主进程只保留 agent 团队作用域同步，
 // 经 ChatService.setAgentTeam → onSetAgentTeam 回调（渲染层切 workspace 时调用）。
@@ -462,6 +546,7 @@ const managedTurnDirectories = new ManagedTurnDirectories(agentRootDir)
 const chatService = new ChatServiceImpl(null, {
   browserAvailable: () => settingsStore.read().browserEnabled !== false,
   hostQuestions: hostQuestionBroker,
+  cancelHostOperations: (sessionId) => spacesService.disable(sessionId),
   managedTurnDirectories,
   bugReportRuntime: {
     appCommit: typeof __APP_COMMIT__ === "string" ? __APP_COMMIT__ : "unknown",
@@ -474,7 +559,7 @@ const chatService = new ChatServiceImpl(null, {
   },
   createArtifactResourceUrl: (item) => {
     const lease = artifactResourceLeaseStore.grant(item)
-    return { expiresAt: lease.expiresAt, url: artifactResourceUrl(lease.token) }
+    return { expiresAt: lease.expiresAt, retainsHandle: Boolean(item.handle), url: artifactResourceUrl(lease.token) }
   },
   createSpreadsheetPreview: (filePath, mime, size) => spreadsheetPreviewWorker.preview(filePath, mime, size),
   artifactBundleStore,
@@ -484,10 +569,25 @@ const chatService = new ChatServiceImpl(null, {
   trustedAttachmentPaths,
   turnOutputStore,
   userAttachmentStore,
+  composerDraftStore,
+  composerDraftOwner: () => authManager.activeAccount()?.id ?? "local",
   onPermissionModeChanged: (sessionId, permissionMode) =>
     sessionService.setPermissionMode({ id: sessionId, permissionMode }),
   onExternalSessionSelectionChanged: (sessionId, patch) =>
     sessionService.setAgentSelection({ id: sessionId, ...patch }),
+  onExternalTurnScopeChanged: ({ active, cwdRoots, diagnostic, sessionId, teamName }) => {
+    if (!active || diagnostic) return externalOoScopeStore.deactivate(sessionId)
+    // ACP creates a session with this stable per-session scratch directory as
+    // its default cwd when no project root is selected. It is a Wanta-owned
+    // directory, so include it in the guard scope rather than rejecting the
+    // agent's ordinary first `oo connector schema` call before it has had a
+    // reason to `cd` into the turn process directory.
+    const sessionScratchRoot = externalSessionScratchCwd(externalAgentRootDir, sessionId)
+    return externalOoScopeStore.activate(sessionId, activeLinkCapabilityRuntime?.linkRuntime.kind ?? "none", teamName, [
+      ...(cwdRoots ?? []),
+      ...(sessionScratchRoot ? [sessionScratchRoot] : []),
+    ])
+  },
   onOomolAuthRequired: () => authManager.expireSession().then(() => undefined),
   onSetAgentTeam: handleAgentTeamChanged,
   onSessionCompleted: (input) => attentionService.completeSession(input),
@@ -509,14 +609,14 @@ const sessionService = new SessionServiceImpl(null, {
       externalAgents.get(externalKind)?.forgetSession(sessionId)
     }
     await Promise.all([
-      linkCapabilityServer.revokeSession(sessionId),
       browserCapabilityServer.revokeSession(sessionId),
       skillCapabilityServer.revokeSession(sessionId),
-      knowledgeCapabilityServer.revokeSession(sessionId),
       questionCapabilityServer.revokeSession(sessionId),
       directCliCapabilityServer.revokeSession(sessionId),
+      spacesCapabilityServer.revokeSession(sessionId),
     ])
     builtInHostInvokeServer.disableSession(sessionId)
+    spacesService.disable(sessionId)
     hostQuestionBroker.cancelSession(sessionId)
     await browserManager.removeSession(sessionId)
     await chatCleanup
@@ -547,6 +647,7 @@ const modelsService = new ModelsServiceImpl({
 })
 // 凭证逻辑在未注册的 AuthManager；注册给渲染层的 AuthServiceImpl 只是薄门面（防 RPC 凭证泄露）。
 const authManager = new AuthManager({
+  getLocale: activeLocale,
   store: authStore,
   protocolScheme,
   applyAccount: applyAuthAccount,
@@ -632,13 +733,6 @@ const updateService = new UpdateServiceImpl({
 const gitService = new GitServiceImpl({
   projectStore: sessionProjectStore,
 })
-const knowledgeService = new KnowledgeServiceImpl({
-  onRemoved: async (id) => {
-    await Promise.all([sessionService.removeKnowledgeBaseReferences(id), agent?.removeKnowledgeBaseAccess(id)])
-  },
-  runtime: { managedLibraryDir: wikiGraphLibraryDir, stateDir: wikiGraphStateDir },
-  trustedImportPaths: trustedAttachmentPaths,
-})
 
 chatService.sessionActivity.on(({ sessionId, usedAt }) => {
   void sessionService.recordUseAndEmit(sessionId, usedAt).catch((error: unknown) => {
@@ -668,7 +762,6 @@ server.registerService(settingsService)
 server.registerService(authService)
 server.registerService(updateService)
 server.registerService(gitService)
-server.registerService(knowledgeService)
 server.registerService(linkRuntimeService)
 server.registerService(browserService)
 settingsService.applyStartupTheme()
@@ -825,17 +918,18 @@ function reapAgentForShutdown(): Promise<void> {
         ),
       )
     })
+    spacesService.disableAll()
     await runBoundedShutdownStep("dispose host capability servers", async () => {
       await Promise.all([
-        linkCapabilityServer.dispose(),
         browserCapabilityServer.dispose(),
         skillCapabilityServer.dispose(),
-        knowledgeCapabilityServer.dispose(),
         questionCapabilityServer.dispose(),
         directCliCapabilityServer.dispose(),
+        spacesCapabilityServer.dispose(),
       ])
     })
     await runBoundedShutdownStep("dispose built-in host invoke server", () => builtInHostInvokeServer.dispose())
+    await runBoundedShutdownStep("dispose external OO guard server", () => externalOoGuardServer.dispose())
     hostQuestionBroker.dispose()
     await runBoundedShutdownStep("dispose spreadsheet preview worker", () => spreadsheetPreviewWorker.dispose())
     await runBoundedShutdownStep("dispose browser control server", () => browserControlServer.dispose())
@@ -1001,11 +1095,13 @@ async function applyAuthAccountNow(account: AuthRuntimeAccount | null): Promise<
           .slice(0, 16)}`
     : null
   if (nextLinkCapabilityScope !== activeLinkCapabilityScope) {
-    linkCapabilityServer.disableAll()
+    spacesService.disableAll()
+    spacesCapabilityServer.disableAll()
     builtInHostInvokeServer.disableAll()
   }
   activeLinkCapabilityScope = nextLinkCapabilityScope
   activeLinkCapabilityRuntime = linkRuntime ? { accountName: account?.name, linkRuntime } : null
+  await externalOoScopeStore.setRuntime(linkRuntime?.kind ?? "none")
   chatService.setLinkRuntime(linkRuntime?.kind ?? "none")
   // 冷启动 deep-link、模型事件与 auth 广播可能重复触发；运行时身份和配置版本均未变化时短路。
   if (
@@ -1082,9 +1178,7 @@ async function applyAuthAccountNow(account: AuthRuntimeAccount | null): Promise<
       modelAccess: runtime.modelAccess,
       opencodeBinPath,
       ooBinPath,
-      ooGuardCliPath,
-      wikiGraphCliPath,
-      wikiGraphStateDir,
+      opencodeOoGuardCliPath,
       listOpenConnectorAuthorizedServices: async (signal) =>
         (await linkRuntimeManager.listOpenConnectorApps(signal))
           .filter((item) => item.status === "active")
@@ -1108,19 +1202,25 @@ async function applyAuthAccountNow(account: AuthRuntimeAccount | null): Promise<
       customModels: runtimeModels.customModels,
     }),
     async (input) => {
-      if (!activeLinkCapabilityRuntime) {
+      if (input.diagnostic || !activeLinkCapabilityRuntime) {
+        spacesService.disable(input.sessionId)
         builtInHostInvokeServer.disableSession(input.sessionId)
         return
       }
-      builtInHostInvokeServer.update({
-        bindings: { [LINK_RUNTIME_BINDING]: activeLinkCapabilityRuntime },
+      const hostContext = {
+        bindings: {
+          [HOST_CAPABILITY_AUDIT_BINDING]: { agentKind: "opencode", transport: "host_invoke" },
+          [LINK_RUNTIME_BINDING]: activeLinkCapabilityRuntime,
+        },
         sessionId: input.sessionId,
         ...(input.messageId ? { turnId: input.messageId } : {}),
         ...(input.teamName ? { teamName: input.teamName } : {}),
         ...(input.outputProjectRoot ? { projectRoot: input.outputProjectRoot } : {}),
         ...(input.artifactDir ? { artifactDir: input.artifactDir } : {}),
         ...(input.processDir ? { processDir: input.processDir } : {}),
-      })
+      }
+      activateSpaces(hostContext)
+      builtInHostInvokeServer.update(hostContext)
     },
   )
   agent = nextAgent
@@ -1165,6 +1265,10 @@ async function applyAuthAccountNow(account: AuthRuntimeAccount | null): Promise<
 async function handleAgentTeamChanged(teamName: string | undefined): Promise<void> {
   const previousTeamName = activeAgentTeamName
   const nextTeamName = teamName?.trim() ? teamName.trim() : undefined
+  if (previousTeamName !== nextTeamName) {
+    spacesService.disableAll()
+    spacesCapabilityServer.disableAll()
+  }
   activeAgentTeamName = nextTeamName
   try {
     await agent?.setTeamName(nextTeamName)
@@ -1277,7 +1381,9 @@ function installApplicationMenu(): void {
 }
 
 function activeLocale(): AppLocale {
-  return currentLocale ?? normalizeAppLocale(app.getLocale())
+  if (currentLocale) return currentLocale
+  const preference = settingsStore.read().localePreference
+  return isAppLocale(preference) ? preference : normalizeAppLocale(app.getLocale())
 }
 
 function shouldShowDevelopmentMenu(): boolean {
@@ -1285,8 +1391,17 @@ function shouldShowDevelopmentMenu(): boolean {
 }
 
 function registerAppLocaleHandler(): void {
-  ipcMain.on(APP_LOCALE_CHANNEL, (_event, locale: unknown) => {
-    if (!isAppLocale(locale) || currentLocale === locale) {
+  ipcMain.handle(APP_LOCALE_PREFERENCE_CHANNEL, () => {
+    const saved = settingsStore.read().localePreference
+    return isLocalePreference(saved) ? saved : null
+  })
+  ipcMain.on(APP_LOCALE_CHANNEL, (_event, locale: unknown, preference: unknown) => {
+    if (!isAppLocale(locale)) return
+    const persisted = settingsStore.read()
+    if (isLocalePreference(preference) && persisted.localePreference !== preference) {
+      settingsStore.write({ ...persisted, localePreference: preference })
+    }
+    if (currentLocale === locale) {
       return
     }
     currentLocale = locale
@@ -1504,12 +1619,12 @@ function handleAppUpdateStateChanged(state: AppUpdateState): void {
     return
   }
 
-  const chinese = activeLocale() === "zh-CN"
+  const locale = activeLocale()
   const notification = new Notification({
-    body: chinese ? "打开 Wanta 即可选择合适的时间重启。" : "Open Wanta to restart when you're ready.",
+    body: nativeTranslate(locale, "update.body"),
     groupId: "app-update",
     id: `app-update-${readyVersion}`,
-    title: chinese ? `Wanta ${readyVersion} 已准备好` : `Wanta ${readyVersion} is ready`,
+    title: nativeTranslate(locale, "update.title", { version: readyVersion }),
   })
   updateReadyNotification?.close()
   updateReadyNotification = notification

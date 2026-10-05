@@ -2,6 +2,7 @@ import type { PublicSkillPackage } from "../../../electron/skills/common.ts"
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 import { clearProviderSkillPackageCache, readProviderSkillPackage } from "./provider-skill-package-lookup.ts"
+import { invalidateSkillCatalogKeys, clearSkillCatalogCache } from "@/lib/skill-catalog-cache"
 import { readPublicSkillPackageByName, searchPublicSkillPackages } from "@/lib/skills-catalog-client"
 
 vi.mock("@/lib/skills-catalog-client", () => ({
@@ -127,4 +128,40 @@ describe("provider Skill package lookup", () => {
     expect(sharedSignal?.aborted).toBe(true)
     expect(searchPublicSkillPackages).not.toHaveBeenCalled()
   })
+})
+
+test("public invalidation and account cleanup invalidate provider results too", async () => {
+  clearSkillCatalogCache()
+  vi.mocked(readPublicSkillPackageByName).mockReset().mockResolvedValue(posthogPackage)
+  const candidate = { service: "posthog", providerDisplayName: "PostHog" }
+  await readProviderSkillPackage(candidate)
+  invalidateSkillCatalogKeys((key) => key.startsWith("public:"))
+  await readProviderSkillPackage(candidate)
+  clearSkillCatalogCache()
+  await readProviderSkillPackage(candidate)
+  expect(readPublicSkillPackageByName).toHaveBeenCalledTimes(3)
+  clearSkillCatalogCache()
+})
+
+test("a failed conventional lookup cannot become a cached missing package", async () => {
+  clearSkillCatalogCache()
+  vi.mocked(readPublicSkillPackageByName).mockReset().mockRejectedValueOnce(new Error("503"))
+  vi.mocked(searchPublicSkillPackages).mockReset().mockResolvedValue({ items: [], next: null, updatedAt: "now" })
+  const candidate = { service: "posthog", providerDisplayName: "PostHog" }
+  await expect(readProviderSkillPackage(candidate)).rejects.toThrow("503")
+  vi.mocked(readPublicSkillPackageByName).mockResolvedValue(posthogPackage)
+  await expect(readProviderSkillPackage(candidate)).resolves.toBe(posthogPackage)
+  clearSkillCatalogCache()
+})
+
+test("search may recover a failed conventional lookup with a matching package", async () => {
+  clearSkillCatalogCache()
+  vi.mocked(readPublicSkillPackageByName).mockReset().mockRejectedValue(new Error("503"))
+  vi.mocked(searchPublicSkillPackages)
+    .mockReset()
+    .mockResolvedValue({ items: [posthogPackage], next: null, updatedAt: "now" })
+  await expect(readProviderSkillPackage({ service: "posthog", providerDisplayName: "PostHog" })).resolves.toBe(
+    posthogPackage,
+  )
+  clearSkillCatalogCache()
 })

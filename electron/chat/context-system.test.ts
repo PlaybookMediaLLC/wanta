@@ -6,16 +6,19 @@ import {
   buildLinkRuntimeSystem,
   buildPermissionModeSystem,
   buildResponseLanguageSystem,
+  buildTeamSkillsSystem,
 } from "./context-system.ts"
 
 test("buildLinkRuntimeSystem binds raw OOMOL calls to the exact team", () => {
   const prompt = buildLinkRuntimeSystem("oomol", 'Team "Quoted"') ?? ""
 
   assert.match(prompt, /Current-turn Wanta Link workspace: team "Team \\"Quoted\\""/)
-  assert.match(prompt, /`wanta_link` MCP tools/)
-  assert.match(prompt, /managed `oo` CLI remains available/)
+  assert.match(prompt, /Wanta-managed `oo connector schema` \/ `oo connector run` CLI workflow/)
   assert.match(prompt, /--team "Team \\"Quoted\\""/)
-  assert.match(prompt, /never retry in a personal or default workspace/i)
+  assert.match(prompt, /guard also binds a missing selector/)
+  assert.match(prompt, /--data @<absolute-path>/)
+  assert.match(prompt, /hide its exit status/)
+  assert.match(prompt, /never retry in a personal, default, or different team workspace/i)
   assert.match(prompt, /does not prove that the current Wanta team is disconnected/)
 })
 
@@ -31,54 +34,22 @@ test("buildLinkRuntimeSystem keeps OpenConnector free of OOMOL selectors", () =>
   const prompt = buildLinkRuntimeSystem("openconnector", "ignored-team") ?? ""
 
   assert.match(prompt, /OpenConnector/)
-  assert.match(prompt, /`wanta_link` MCP tools/)
+  assert.match(prompt, /Wanta-managed `oo connector schema` \/ `oo connector run` CLI workflow/)
   assert.match(prompt, /must omit `--team` and `--personal`/)
+  assert.match(prompt, /--data @<absolute-path>/)
   assert.doesNotMatch(prompt, /ignored-team/)
   assert.equal(buildLinkRuntimeSystem("none", "ignored-team"), undefined)
 })
 
-test("buildContextMentionsSystem describes a pinned knowledge base without exposing a path", () => {
-  const prompt = buildContextMentionsSystem([{ id: "kb-1", kind: "knowledge", name: "西游记" }]) ?? ""
+test("selected and team Skills make the Wanta snapshot authoritative over same-id native Skills", () => {
+  const selected = buildContextMentionsSystem([{ id: "oo", kind: "skill", name: "OO" }]) ?? ""
+  const team = buildTeamSkillsSystem([{ id: "oo", name: "OO" }]) ?? ""
 
-  assert.match(prompt, /archive URI: "wikg:\/\/lib\/arc\/kb-1"/)
-  assert.match(prompt, /kb-1/)
-  assert.match(prompt, /西游记/)
-  assert.match(prompt, /load and follow the `wikigraph-knowledge` Skill/)
-  assert.match(prompt, /before answering/)
-  assert.match(prompt, /people, events, relationships, causes\/processes\/results, summaries/)
-  assert.match(prompt, /citations, sources, quotations, or fact-checking/)
-  assert.match(prompt, /do not answer those requests from general model knowledge/)
-  assert.doesNotMatch(prompt, /shell `wg` command/)
-  assert.doesNotMatch(prompt, /Wanta provides a managed `wg` on PATH/)
-  assert.doesNotMatch(prompt, /Never modify a knowledge base unless the user explicitly asks/)
-  assert.doesNotMatch(prompt, /\/Users\//)
-})
-
-test("buildContextMentionsSystem describes the global knowledge library", () => {
-  const prompt =
-    buildContextMentionsSystem([
-      { id: "wikg://lib", kind: "knowledge", name: "Knowledge library", scope: "library" },
-    ]) ?? ""
-
-  assert.match(prompt, /library URI: "wikg:\/\/lib"/)
-  assert.doesNotMatch(prompt, /wikg:\/\/lib\/arc\/wikg:\/\/lib/)
-  assert.match(prompt, /Treat `wikg:\/\/lib` as the whole local WikiGraph library/)
-  assert.match(prompt, /Use `wikg:\/\/lib` directly for a selected knowledge library/)
-})
-
-test("buildContextMentionsSystem routes the Hua Rong Trail fixture through WikiGraph context", () => {
-  const userPrompt = "关羽在华容道放走曹操，前后涉及的故事起因经过结果和相关人物结局是什么？你帮我列出来。"
-  const contextPrompt =
-    buildContextMentionsSystem([
-      { id: "wikg://lib", kind: "knowledge", name: "Knowledge library", scope: "library" },
-    ]) ?? ""
-  const agentInput = `${contextPrompt}\n\nUser request:\n${userPrompt}`
-
-  assert.match(agentInput, /load and follow the `wikigraph-knowledge` Skill/)
-  assert.match(agentInput, /people, events, relationships, causes\/processes\/results, summaries/)
-  assert.match(agentInput, /do not answer those requests from general model knowledge/)
-  assert.match(agentInput, /wikg:\/\/lib/)
-  assert.doesNotMatch(agentInput, /wikg:\/\/lib\/arc\/wikg:\/\/lib/)
+  for (const prompt of [selected, team]) {
+    assert.match(prompt, /Wanta current-turn Skill snapshot is authoritative/)
+    assert.match(prompt, /Do not substitute a same-id native, global, or home-directory Skill/)
+    assert.match(prompt, /native Skills are fallback only when the id is absent/)
+  }
 })
 
 test("buildPermissionModeSystem describes default access", () => {
@@ -90,7 +61,14 @@ test("buildPermissionModeSystem describes default access", () => {
   assert.match(prompt, /credential\/secret paths/)
   assert.match(prompt, /dependency changes/)
   assert.match(prompt, /regardless of package name, size, or runtime/)
-  assert.match(prompt, /Node\.js\/Python package runners are not confirmation boundaries/)
+  assert.match(prompt, /Node\.js\/Python package runners/)
+  assert.match(prompt, /not confirmation boundaries/)
+  assert.match(prompt, /proven permission-request cwd/)
+  assert.match(prompt, /git restore/)
+  assert.match(prompt, /named `docker rm`/)
+  assert.match(prompt, /deleting `\/tmp` or `\/var\/tmp` themselves/)
+  assert.match(prompt, /unrelated temporary directories are not automatically approved/i)
+  assert.match(prompt, /A `\.env` file inside the selected project may be read automatically/)
   assert.match(prompt, /selected-project virtual-environment interpreter/)
   assert.match(prompt, /visible integrated browser/)
   assert.match(prompt, /sensitive or consequential browser action/)
@@ -98,17 +76,16 @@ test("buildPermissionModeSystem describes default access", () => {
   assert.doesNotMatch(prompt, /user has enabled Full Access/)
 })
 
-test("buildExternalPermissionModeSystem describes shared Wanta decisions over native enforcement", () => {
+test("buildExternalPermissionModeSystem leaves local decisions and grants with the native agent", () => {
   const defaultPrompt = buildExternalPermissionModeSystem("default", true)
   const fullAccessPrompt = buildExternalPermissionModeSystem("full_access", true)
 
-  assert.match(defaultPrompt, /Default Access with Wanta's shared approval policy/)
-  assert.match(defaultPrompt, /same local permission policy to every agent/)
-  assert.match(defaultPrompt, /approved automatically/)
-  assert.doesNotMatch(defaultPrompt, /Local permission requests are auto-approved/)
-  assert.match(fullAccessPrompt, /projected onto the external agent's native permission mode when supported/)
-  assert.match(fullAccessPrompt, /external agent runtime remains the enforcement authority/)
-  assert.doesNotMatch(fullAccessPrompt, /Local permission requests are auto-approved/)
+  for (const prompt of [defaultPrompt, fullAccessPrompt]) {
+    assert.match(prompt, /approval decisions belong to the external agent runtime/)
+    assert.match(prompt, /forwards the user's selection without a local approval policy or session grants/)
+    assert.doesNotMatch(prompt, /shared approval policy|approved automatically|Ordinary dependency installation/)
+    assert.match(prompt, /business capabilities enforce their own identity/)
+  }
   assert.match(defaultPrompt, /`wanta_browser` MCP tools/)
   assert.match(defaultPrompt, /sensitive or consequential browser action/)
   assert.match(fullAccessPrompt, /visible integrated browser.*YOLO/)

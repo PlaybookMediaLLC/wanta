@@ -1,24 +1,17 @@
 import type { ConnectionProviderSummary } from "../../../electron/connections/common.ts"
 import type { ConnectionProviderSortMode } from "./connection-provider-ranking.ts"
-import type {
-  ConnectionAuthFilter,
-  ConnectionCatalogFilter,
-  ConnectionCategoryFilter,
-} from "./connection-route-model.ts"
+import type { ConnectionAuthFilter, ConnectionCatalogFilter } from "./connection-route-model.ts"
 import type { TranslateFn } from "@/i18n/i18n"
 
-import { ArrowUpDown, ChevronDown, Filter, X } from "lucide-react"
+import { ArrowUpDown, Filter, X } from "lucide-react"
 import * as React from "react"
 import {
-  categoryFilterLimit,
-  categoryFilterPrefix,
   getFilterValue,
-  getFittingCategoryFilterCount,
   getProviderCatalogLabel,
+  getProviderMarketplaceApp,
   getProviderMeta,
   getProviderStatusTone,
   parseFilterValue,
-  selectVisibleCategoryFilters,
 } from "./connection-route-model.ts"
 import {
   getProviderGridCenteredScrollTop,
@@ -29,6 +22,7 @@ import {
   providerGridGapPx,
 } from "./provider-grid-virtualization.ts"
 import { ProviderIcon } from "./ProviderIcon.tsx"
+import { ProviderPriceBadge } from "./ProviderPriceBadge.tsx"
 import { authTypeLabel as getAuthTypeLabel } from "./shared.ts"
 import { SearchField } from "@/components/SearchField"
 import { Badge } from "@/components/ui/badge"
@@ -61,10 +55,10 @@ export function ConnectionListToolbar({
   authFilter,
   attentionCount,
   availableToolsCount,
-  categoryFilters,
   connectedCount,
   directlyAvailableCount,
   loading,
+  managedConnectionCount,
   onAuthFilterChange,
   onFilterChange,
   onQueryChange,
@@ -72,18 +66,20 @@ export function ConnectionListToolbar({
   onSortModeChange,
   query,
   resultCount,
+  searchPlaceholder,
   showConnectionState,
   sortMode,
   totalCount,
+  view,
 }: {
   activeFilter: ConnectionCatalogFilter
   authFilter: ConnectionAuthFilter
   attentionCount: number
   availableToolsCount: number
-  categoryFilters: ConnectionCategoryFilter[]
   connectedCount: number
   directlyAvailableCount: number
   loading: boolean
+  managedConnectionCount: number
   onAuthFilterChange: (filter: ConnectionAuthFilter) => void
   onFilterChange: (filter: ConnectionCatalogFilter) => void
   onQueryChange: (query: string) => void
@@ -91,97 +87,16 @@ export function ConnectionListToolbar({
   onSortModeChange: (mode: ConnectionProviderSortMode) => void
   query: string
   resultCount: number
+  searchPlaceholder: string
   showConnectionState: boolean
   sortMode: ConnectionProviderSortMode
   totalCount: number
+  view: "discover" | "manage"
 }) {
   const t = useT()
-  const filterRowRef = React.useRef<HTMLDivElement | null>(null)
-  const filterMeasurementRef = React.useRef<HTMLDivElement | null>(null)
-  const [visibleCategoryCount, setVisibleCategoryCount] = React.useState(categoryFilterLimit)
-  const selectedCategory = activeFilter.kind === "category" ? activeFilter.category : null
-  const visibleCategoryFilters = selectVisibleCategoryFilters(categoryFilters, selectedCategory, visibleCategoryCount)
-  const overflowCategoryFilters = categoryFilters.filter(
-    (filter) => !visibleCategoryFilters.some((visibleFilter) => visibleFilter.label === filter.label),
-  )
   const filterValue = getFilterValue(activeFilter)
-  const hasFilters = activeFilter.kind !== "all" || authFilter !== "all" || query.trim().length > 0
-
-  React.useLayoutEffect(() => {
-    const filterRow = filterRowRef.current
-    const measurement = filterMeasurementRef.current
-    if (!filterRow || !measurement) {
-      return
-    }
-
-    const getMeasurement = (name: string): number | null => {
-      const element = measurement.querySelector<HTMLElement>(`[data-filter-measure="${name}"]`)
-      return element ? element.getBoundingClientRect().width : null
-    }
-
-    const updateVisibleCategoryCount = () => {
-      const availableWidth = (filterRow.firstElementChild as HTMLElement | null)?.clientWidth ?? filterRow.clientWidth
-      const allWidth = getMeasurement("all")
-      const availableToolsWidth = getMeasurement("available-tools")
-      const connectedWidth = getMeasurement("connected")
-      const attentionWidth = getMeasurement("attention")
-      const directlyAvailableWidth = getMeasurement("directly-available")
-      const moreWidth = getMeasurement("more")
-      const categoryWidths = categoryFilters.map((_, index) => getMeasurement(`category-${index}`))
-      if (
-        !availableWidth ||
-        allWidth === null ||
-        availableToolsWidth === null ||
-        connectedWidth === null ||
-        attentionWidth === null ||
-        directlyAvailableWidth === null ||
-        moreWidth === null ||
-        categoryWidths.some((width) => width === null)
-      ) {
-        return
-      }
-
-      const group = measurement.firstElementChild
-      const gap = group ? Number.parseFloat(window.getComputedStyle(group).gap) || 4 : 4
-      const categoryFilterWidths = new Map(
-        categoryFilters.map((filter, index) => [filter.label, categoryWidths[index] ?? 0]),
-      )
-      const nextCount = getFittingCategoryFilterCount({
-        availableWidth,
-        baseFilterWidths: [
-          allWidth,
-          ...(showConnectionState ? [availableToolsWidth, connectedWidth, attentionWidth] : []),
-          directlyAvailableWidth,
-        ],
-        categoryFilterWidths,
-        filters: categoryFilters,
-        gap,
-        moreCategoriesWidth: moreWidth,
-        selectedCategory,
-      })
-
-      setVisibleCategoryCount((current) => (current === nextCount ? current : nextCount))
-    }
-
-    updateVisibleCategoryCount()
-    if (typeof ResizeObserver === "undefined") {
-      return
-    }
-
-    const observer = new ResizeObserver(updateVisibleCategoryCount)
-    observer.observe(filterRow)
-    return () => observer.disconnect()
-  }, [
-    attentionCount,
-    availableToolsCount,
-    categoryFilters,
-    connectedCount,
-    directlyAvailableCount,
-    loading,
-    selectedCategory,
-    showConnectionState,
-    totalCount,
-  ])
+  const hasFilters =
+    activeFilter.kind !== (view === "manage" ? "managed" : "all") || authFilter !== "all" || query.trim().length > 0
 
   return (
     <div className="grid w-full min-w-0 gap-2">
@@ -190,14 +105,14 @@ export function ConnectionListToolbar({
           <SearchField
             className="min-w-48 flex-1"
             value={query}
-            placeholder={t("connections.searchProviders")}
+            placeholder={searchPlaceholder}
             onChange={(event) => onQueryChange(event.currentTarget.value)}
           />
           <ProviderSortMenu mode={sortMode} onChange={onSortModeChange} />
           <ProviderAuthFilterMenu value={authFilter} onChange={onAuthFilterChange} onReset={onReset} />
         </div>
       </div>
-      <div ref={filterRowRef} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
         <div className="oo-connection-filter-row flex min-w-0 items-center overflow-x-auto overflow-y-hidden">
           <ToggleGroup
             type="single"
@@ -214,73 +129,58 @@ export function ConnectionListToolbar({
               }
             }}
           >
-            <FilterToggleItem count={loading ? null : totalCount} label={t("connections.filterAll")} value="all" />
-            {showConnectionState ? (
+            {view === "manage" ? (
               <>
                 <FilterToggleItem
-                  count={loading ? null : availableToolsCount}
-                  label={t("connections.filterAvailableTools")}
-                  value="available-tools"
+                  count={loading ? null : managedConnectionCount}
+                  label={t("connections.filterMyConnections")}
+                  value="managed"
                 />
                 <FilterToggleItem
                   count={loading ? null : connectedCount}
                   label={t("connections.filterConnected")}
                   value="connected"
                 />
+                {showConnectionState ? (
+                  <FilterToggleItem
+                    count={loading ? null : attentionCount}
+                    label={t("connections.needsAttention")}
+                    value="attention"
+                  />
+                ) : null}
               </>
-            ) : null}
-            <FilterToggleItem
-              count={loading ? null : directlyAvailableCount}
-              label={t("connections.filterDirectlyAvailable")}
-              value="directly-available"
-            />
-            {showConnectionState ? (
-              <FilterToggleItem
-                count={loading ? null : attentionCount}
-                label={t("connections.needsAttention")}
-                value="attention"
-              />
-            ) : null}
-            {visibleCategoryFilters.map((filter) => (
-              <FilterToggleItem
-                key={filter.label}
-                count={filter.count}
-                label={filter.displayLabel}
-                value={`${categoryFilterPrefix}${filter.label}`}
-              />
-            ))}
+            ) : (
+              <>
+                <FilterToggleItem
+                  count={loading ? null : totalCount}
+                  label={t("connections.filterGeneral")}
+                  value="all"
+                />
+                <FilterToggleItem
+                  count={loading ? null : connectedCount}
+                  label={t("connections.filterConnected")}
+                  value="connected"
+                />
+                <FilterToggleItem
+                  count={loading ? null : availableToolsCount}
+                  label={t("connections.filterAvailableTools")}
+                  value="available-tools"
+                />
+                <FilterToggleItem
+                  count={loading ? null : directlyAvailableCount}
+                  label={t("connections.filterDirectlyAvailable")}
+                  value="directly-available"
+                />
+              </>
+            )}
           </ToggleGroup>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
-          {overflowCategoryFilters.length > 0 ? (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="gap-1.5 rounded-md transition-[background-color,border-color,box-shadow,transform] active:translate-y-px data-[state=open]:border-[var(--accent-ring)] data-[state=open]:bg-[var(--accent-soft)] data-[state=open]:text-foreground data-[state=open]:shadow-[inset_0_0_0_1px_var(--accent-ring)]"
-                >
-                  {t("connections.moreCategories")}
-                  <ChevronDown className="size-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" sideOffset={8} className="w-56">
-                <DropdownMenuLabel>{t("connections.category")}</DropdownMenuLabel>
-                {overflowCategoryFilters.map((filter) => (
-                  <DropdownMenuItem
-                    key={filter.label}
-                    className="grid grid-cols-[minmax(0,1fr)_auto] gap-3"
-                    onSelect={() => onFilterChange({ kind: "category", category: filter.label })}
-                  >
-                    <span className="truncate">{filter.displayLabel}</span>
-                    <span className="oo-text-muted">{filter.count}</span>
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          ) : null}
           <span className="oo-text-micro oo-text-muted whitespace-nowrap">
-            {t("connections.showingProviders", { count: resultCount, total: totalCount })}
+            {t("connections.showingProviders", {
+              count: resultCount,
+              total: view === "manage" ? managedConnectionCount : totalCount,
+            })}
           </span>
           {hasFilters ? (
             <Button
@@ -295,56 +195,6 @@ export function ConnectionListToolbar({
             </Button>
           ) : null}
         </div>
-      </div>
-      <div ref={filterMeasurementRef} aria-hidden="true" className="pointer-events-none invisible absolute -z-10">
-        <ToggleGroup type="single" variant="default" size="sm" spacing={1} className="flex w-max flex-nowrap gap-1">
-          <span data-filter-measure="all">
-            <FilterToggleItem count={loading ? null : totalCount} label={t("connections.filterAll")} value="all" />
-          </span>
-          <span data-filter-measure="available-tools">
-            <FilterToggleItem
-              count={loading ? null : availableToolsCount}
-              label={t("connections.filterAvailableTools")}
-              value="available-tools"
-            />
-          </span>
-          <span data-filter-measure="connected">
-            <FilterToggleItem
-              count={loading ? null : connectedCount}
-              label={t("connections.filterConnected")}
-              value="connected"
-            />
-          </span>
-          <span data-filter-measure="directly-available">
-            <FilterToggleItem
-              count={loading ? null : directlyAvailableCount}
-              label={t("connections.filterDirectlyAvailable")}
-              value="directly-available"
-            />
-          </span>
-          <span data-filter-measure="attention">
-            <FilterToggleItem
-              count={loading ? null : attentionCount}
-              label={t("connections.needsAttention")}
-              value="attention"
-            />
-          </span>
-          {categoryFilters.map((filter, index) => (
-            <span key={filter.label} data-filter-measure={`category-${index}`}>
-              <FilterToggleItem
-                count={filter.count}
-                label={filter.displayLabel}
-                value={`${categoryFilterPrefix}${filter.label}`}
-              />
-            </span>
-          ))}
-          <span data-filter-measure="more">
-            <Button variant="outline" size="sm" className="gap-1.5 rounded-md">
-              {t("connections.moreCategories")}
-              <ChevronDown className="size-4" />
-            </Button>
-          </span>
-        </ToggleGroup>
       </div>
     </div>
   )
@@ -468,34 +318,7 @@ export function ProviderListSkeleton() {
   )
 }
 
-export function ProviderCatalog({
-  canManageConnections,
-  providers,
-  scrollParentRef,
-  selectedService,
-  showConnectionState,
-  onSelect,
-}: {
-  canManageConnections: boolean
-  onSelect: (provider: ConnectionProviderSummary) => void
-  providers: ConnectionProviderSummary[]
-  scrollParentRef: React.RefObject<HTMLDivElement | null>
-  selectedService: string | null
-  showConnectionState: boolean
-}) {
-  return (
-    <ProviderGrid
-      canManageConnections={canManageConnections}
-      providers={providers}
-      scrollParentRef={scrollParentRef}
-      selectedService={selectedService}
-      showConnectionState={showConnectionState}
-      onSelect={onSelect}
-    />
-  )
-}
-
-function ProviderGrid({
+export const ProviderCatalog = React.memo(function ProviderCatalog({
   canManageConnections,
   providers,
   scrollParentRef,
@@ -750,19 +573,8 @@ function ProviderGrid({
               selected={provider.service === selectedService}
               showConnectionState={showConnectionState}
               tabIndex={index === focusedIndex ? 0 : -1}
-              onFocus={() => setFocusedIndex(index)}
-              onKeyDown={(event) => {
-                const targetIndex = getProviderGridKeyboardTargetIndex({
-                  columnCount,
-                  currentIndex: index,
-                  key: event.key,
-                  providerCount: itemCount,
-                })
-                if (targetIndex === null) return
-                event.preventDefault()
-                if (targetIndex === index) return
-                focusProviderIndex(targetIndex)
-              }}
+              onFocusIndex={setFocusedIndex}
+              onNavigate={focusProviderIndex}
               onSelect={onSelect}
             />
           ),
@@ -787,7 +599,7 @@ function ProviderGrid({
   return (
     <div
       ref={gridRef}
-      className="relative overflow-hidden rounded-lg border"
+      className="relative box-content overflow-hidden rounded-lg border"
       style={{ height: visibleRange.totalHeight }}
     >
       <div
@@ -804,7 +616,7 @@ function ProviderGrid({
       </div>
     </div>
   )
-}
+})
 
 const ProviderCard = React.memo(function ProviderCard({
   canManageConnections,
@@ -815,16 +627,16 @@ const ProviderCard = React.memo(function ProviderCard({
   selected,
   showConnectionState,
   tabIndex,
-  onFocus,
-  onKeyDown,
+  onFocusIndex,
+  onNavigate,
   onSelect,
 }: {
   canManageConnections: boolean
   columnCount: number
   index: number
   itemCount: number
-  onFocus: () => void
-  onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void
+  onFocusIndex: (index: number) => void
+  onNavigate: (index: number) => void
   provider: ConnectionProviderSummary
   selected: boolean
   showConnectionState: boolean
@@ -833,6 +645,7 @@ const ProviderCard = React.memo(function ProviderCard({
 }) {
   const t = useT()
   const tone = getProviderStatusTone(provider)
+  const marketplaceApp = getProviderMarketplaceApp(provider)
   const statusLabel =
     showConnectionState || tone === "directly-available"
       ? getProviderCatalogLabel(provider, canManageConnections, t)
@@ -843,10 +656,20 @@ const ProviderCard = React.memo(function ProviderCard({
       data-provider-index={index}
       tabIndex={tabIndex}
       onClick={() => onSelect(provider)}
-      onFocus={onFocus}
-      onKeyDown={onKeyDown}
+      onFocus={() => onFocusIndex(index)}
+      onKeyDown={(event) => {
+        const targetIndex = getProviderGridKeyboardTargetIndex({
+          columnCount,
+          currentIndex: index,
+          key: event.key,
+          providerCount: itemCount,
+        })
+        if (targetIndex === null) return
+        event.preventDefault()
+        if (targetIndex !== index) onNavigate(targetIndex)
+      }}
       className={cn(
-        "group/card relative grid min-w-0 cursor-pointer overflow-hidden border-r border-b bg-card px-4 py-3 text-left text-card-foreground transition-[background-color,box-shadow,transform] outline-none hover:bg-[var(--oo-row-hover)] focus-visible:z-10 focus-visible:ring-[3px] focus-visible:ring-ring/40 active:translate-y-px",
+        "group/card relative grid min-w-0 cursor-pointer items-center overflow-hidden border-r border-b bg-card px-4 py-2 text-left text-card-foreground transition-[background-color,box-shadow,transform] outline-none hover:bg-[var(--oo-row-hover)] focus-visible:z-10 focus-visible:ring-[3px] focus-visible:ring-ring/40 active:translate-y-px",
         index === 0 && "rounded-tl-[calc(var(--radius-lg)_-_1px)]",
         index < columnCount &&
           (index === itemCount - 1 || index % columnCount === columnCount - 1) &&
@@ -863,10 +686,25 @@ const ProviderCard = React.memo(function ProviderCard({
       style={{ height: providerGridCardHeightPx }}
     >
       <span className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2">
-        <ProviderIcon iconUrl={provider.iconUrl} displayName={provider.displayName} />
+        <ProviderIcon
+          iconSprite={provider.iconSprite}
+          iconSpritePosition={provider.iconSpritePosition}
+          iconUrl={provider.iconUrl}
+          displayName={provider.displayName}
+        />
         <span className="grid min-w-0 gap-0.5">
-          <span className="oo-text-control truncate font-medium">{provider.displayName}</span>
-          <span className="oo-text-micro oo-text-muted truncate">{getProviderMeta(provider, t)}</span>
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="oo-text-control truncate font-medium">{provider.displayName}</span>
+            {marketplaceApp && provider.appCount > 1 ? (
+              <Badge variant="secondary" className="shrink-0" title={t("connections.marketplaceAccount")}>
+                {t("connections.marketplaceAccount")}
+              </Badge>
+            ) : null}
+          </span>
+          <span className="flex min-w-0 items-center gap-1.5">
+            <ProviderPriceBadge provider={provider} />
+            <span className="oo-text-micro oo-text-muted truncate">{getProviderMeta(provider, t)}</span>
+          </span>
         </span>
         {statusLabel && tone === "directly-available" ? (
           <Badge

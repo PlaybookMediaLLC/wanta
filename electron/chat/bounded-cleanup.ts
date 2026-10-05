@@ -68,19 +68,22 @@ function boundedCleanupTarget(
 
 /**
  * Recognizes a deliberately narrow subset of recursive cleanup that is cheap to recover:
- * direct children of Wanta's per-turn process directory and well-known generated project roots.
- * Any composition, wildcard, variable, broad root, or ordinary project directory stays protected.
+ * descendants of Wanta's per-turn process directory and well-known generated project roots.
+ * An unrelated temporary directory is not proof of task ownership. Any composition, wildcard, variable,
+ * home path, broad root, or ordinary project directory stays protected.
  */
 export function isLowConsequenceCleanupCommand(
   command: string,
-  context: { taskProcessRoot?: string; trustedProjectRoot?: string },
+  context: { commandCwd?: string; taskProcessRoot?: string; trustedProjectRoot?: string },
 ): boolean {
   let body = command.trim()
-  let cwd: string | undefined
+  let cwd = context.commandCwd
   const leading = splitLeadingAnd(body)
   if (leading) {
-    cwd = explicitCdDirectory(leading.left)
-    if (!cwd || !leading.right) return false
+    const directory = explicitCdDirectory(leading.left)
+    if (!directory || !leading.right) return false
+    cwd = path.isAbsolute(directory) ? directory : cwd ? path.resolve(cwd, directory) : undefined
+    if (!cwd) return false
     body = leading.right
   }
   const segments = topLevelShellSegments(body)

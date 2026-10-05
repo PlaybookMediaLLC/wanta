@@ -94,6 +94,11 @@ describe("team route and scope migration", () => {
     expect(initialRoute()).toBe("teams")
   })
 
+  test("accepts the cloud knowledge route", () => {
+    vi.stubEnv("VITE_WANTA_ROUTE", "knowledge")
+    expect(initialRoute()).toBe("knowledge")
+  })
+
   test("accepts team and legacy organization scope keys", () => {
     expect(workspaceSwitchTeamId("team:team-1")).toBe("team-1")
     expect(workspaceSwitchTeamId("organization:team-1")).toBe("team-1")
@@ -130,13 +135,16 @@ describe("local workspace", () => {
 
   test("keeps community routes available while blocking account-only pages", () => {
     expect(routeAvailableForRuntime("chat", false)).toBe(true)
-    expect(routeAvailableForRuntime("knowledge", false)).toBe(true)
     expect(routeAvailableForRuntime("settings", false)).toBe(true)
     expect(routeAvailableForRuntime("connections", false)).toBe(true)
     expect(routeAvailableForRuntime("skills", false)).toBe(true)
     expect(routeAvailableForRuntime("teams", false)).toBe(false)
     expect(routeAvailableForRuntime("billing", false)).toBe(false)
     expect(routeAvailableForRuntime("billing", true)).toBe(true)
+    expect(routeAvailableForRuntime("knowledge", false)).toBe(false)
+    expect(routeAvailableForRuntime("knowledge", true)).toBe(true)
+    expect(routeAvailableForRuntime("flows", false)).toBe(false)
+    expect(routeAvailableForRuntime("flows", true)).toBe(true)
   })
 
   test("keeps project controls available without a running session", () => {

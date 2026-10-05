@@ -1,9 +1,11 @@
+import type { OoCommandDenyReason } from "../agent/oo-command-permission.ts"
 import type { ActiveLinkRuntime } from "../link-runtime/common.ts"
 import type { AgentPermissionMode, ChatPermissionRequest, LocalPermissionPromptReason } from "./common.ts"
 import type { PermissionRequestKind, SessionPermissionGrant } from "./permission-request.ts"
 
-import { openConnectorCommandPolicy } from "../agent/oo-command-permission.ts"
+import { ooCommandDenyReason } from "../agent/oo-command-permission.ts"
 import { isLowConsequenceCleanupCommand } from "./bounded-cleanup.ts"
+import { scopedCommandSequence } from "./command-sequence.ts"
 import {
   createSessionPermissionGrant,
   isHighRiskPermissionRequest,
@@ -14,8 +16,11 @@ import {
   permissionRequestHasSensitiveResource,
   permissionRequestHasBroadResource,
   permissionCommand,
+  permissionRequestIsSelectedProjectEnvWrite,
   permissionRequestNeedsDefaultPrompt,
   permissionRequestKind,
+  permissionRequestWorkingDirectory,
+  permissionRequestAccessResources,
   requestMatchesManagedPythonDependencyInstallGrant,
   requestMatchesSessionGrant,
 } from "./permission-request.ts"
@@ -24,7 +29,7 @@ import {
   isStandardRegistryNodeDependencyInstallRequest,
   requestMatchesProjectDevCommandSessionGrant,
 } from "./project-dev-command.ts"
-import { projectPermissionRequestInsideRoot } from "./project-permission.ts"
+import { projectPermissionRequestInsideRoot, projectPermissionResourceInsideRoot } from "./project-permission.ts"
 import { isProjectReadOnlyCommandRequest } from "./project-read-command.ts"
 
 export type LocalAccessAllowReason =
@@ -37,7 +42,6 @@ export type LocalAccessAllowReason =
   | "session_grant"
   | "trusted_dependency"
   | "trusted_project"
-  | "wanta_host_tool"
 
 export type LocalAccessDecision =
   | {
@@ -54,31 +58,69 @@ export type LocalAccessDecision =
   | {
       highRisk: boolean
       kind: PermissionRequestKind
+      reason: OoCommandDenyReason | "diagnostic_capability" | "diagnostic_scope"
       type: "deny"
     }
 
 export interface LocalAccessPolicyContext {
   activeGenerationId?: string
-  /**
-   * The request comes from an external (BYOA) agent session. This only affects
-   * transport-specific duplicate approvals (for example Wanta MCP dispatch).
-   * It must never change Wanta's user-visible local permission policy: the
-   * same normalized operation receives the same decision for every agent.
-   */
-  isExternalSession?: boolean
   linkRuntime?: ActiveLinkRuntime
   permissionMode: AgentPermissionMode
   sessionGrants?: readonly SessionPermissionGrant[]
   taskProcessRoot?: string
   trustedProjectRoot?: string
+  /**
+   * Host-owned `/bug-report` turn. Connector, network, and host MCP calls prompt,
+   * and local work auto-runs only inside the evidence pack / report artifact roots.
+   */
+  diagnosticRoots?: {
+    artifactRoot: string
+    processRoot: string
+  }
+  /**
+   * Proven shell cwd for this request. Prefer metadata.cwd; ChatService also
+   * supplies the ACP session working directory. OpenCode's private workspace
+   * cwd is never implied.
+   */
+  commandCwd?: string
 }
 
-export function localAccessPromptReason(request: ChatPermissionRequest): LocalPermissionPromptReason {
-  if (permissionRequestHasSensitiveResource(request)) return "sensitive_resource"
-  if (isHighRiskPermissionRequest(request)) return "high_risk_command"
+export function localAccessPromptReason(
+  request: ChatPermissionRequest,
+  context: Pick<LocalAccessPolicyContext, "commandCwd" | "trustedProjectRoot" | "taskProcessRoot"> = {},
+): LocalPermissionPromptReason {
+  const scope = permissionScope(request, context)
+  if (permissionRequestHasSensitiveResource(request, scope)) return "sensitive_resource"
+  if (isHighRiskPermissionRequest(request, scope)) return "high_risk_command"
+  if (permissionRequestIsSelectedProjectEnvWrite(request, scope)) return "project_environment_write"
   if (permissionRequestHasBroadResource(request)) return "broad_resource"
-  if (permissionRequestNeedsDefaultPrompt(request)) return "dependency_mutation"
+  if (permissionRequestNeedsDefaultPrompt(request, scope)) return "dependency_mutation"
   return "unclassified_request"
+}
+
+function permissionScope(
+  request: ChatPermissionRequest,
+  context: Pick<LocalAccessPolicyContext, "commandCwd" | "trustedProjectRoot" | "taskProcessRoot">,
+) {
+  return {
+    ...(context.taskProcessRoot ? { taskProcessRoot: context.taskProcessRoot } : {}),
+    ...(context.trustedProjectRoot ? { trustedProjectRoot: context.trustedProjectRoot } : {}),
+    ...(effectiveCommandCwd(request, context) ? { commandCwd: effectiveCommandCwd(request, context) } : {}),
+  }
+}
+
+function effectiveCommandCwd(
+  request: ChatPermissionRequest,
+  context: Pick<LocalAccessPolicyContext, "commandCwd">,
+): string | undefined {
+  return permissionRequestWorkingDirectory(request) ?? context.commandCwd
+}
+
+function cwdMatchesRoot(cwd: string | undefined, root: string | undefined): string | undefined {
+  if (!cwd || !root) {
+    return undefined
+  }
+  return projectPermissionResourceInsideRoot(cwd, root) ? cwd : undefined
 }
 
 function hasMatchingNarrowSessionGrant(
@@ -107,36 +149,94 @@ function hasMatchingGenericSessionGrant(
   request: ChatPermissionRequest,
   grants: readonly SessionPermissionGrant[] | undefined,
 ): boolean {
-  return Boolean(grants?.some((grant) => requestMatchesSessionGrant(request, grant)))
+  const matching = grants?.filter(
+    (grant) => (!grant.kind || grant.kind === "request") && grant.action === request.action.trim().toLowerCase(),
+  )
+  if (!matching?.length) return false
+  // A batch can reuse several narrow approvals without widening any of them.
+  return requestMatchesSessionGrant(request, {
+    action: matching[0]!.action,
+    kind: "request",
+    patterns: matching.flatMap((grant) => grant.patterns),
+  })
+}
+
+function diagnosticRequestInsideRoots(
+  request: ChatPermissionRequest,
+  roots: NonNullable<LocalAccessPolicyContext["diagnosticRoots"]>,
+): boolean {
+  const resources = permissionRequestAccessResources(request)
+  if (resources.length === 0) {
+    return false
+  }
+  return resources.every(
+    (resource) =>
+      projectPermissionResourceInsideRoot(resource, roots.processRoot) ||
+      projectPermissionResourceInsideRoot(resource, roots.artifactRoot),
+  )
+}
+
+function evaluateDiagnosticTurnAccess(
+  request: ChatPermissionRequest,
+  context: LocalAccessPolicyContext,
+): LocalAccessDecision | undefined {
+  const roots = context.diagnosticRoots
+  if (!roots) {
+    return undefined
+  }
+  const kind = permissionRequestKind(request)
+  const highRisk = isHighRiskPermissionRequest(request, permissionScope(request, context))
+  if (kind === "network" || isWantaHostToolPermissionRequest(request) || isOoCliPermissionRequest(request)) {
+    return { type: "deny", reason: "diagnostic_capability", kind, highRisk }
+  }
+  if (!diagnosticRequestInsideRoots(request, roots)) {
+    return { type: "deny", reason: "diagnostic_scope", kind, highRisk }
+  }
+  return undefined
 }
 
 function evaluateBaselineLocalAccessRequest(
   request: ChatPermissionRequest,
-  context: Omit<LocalAccessPolicyContext, "isExternalSession">,
+  context: LocalAccessPolicyContext,
 ): LocalAccessDecision {
   const kind = permissionRequestKind(request)
-  const highRisk = isHighRiskPermissionRequest(request)
+  const scope = permissionScope(request, context)
+  const highRisk = isHighRiskPermissionRequest(request, scope)
   const command = kind === "command" ? permissionCommand(request) : undefined
+  const commandCwd = effectiveCommandCwd(request, context)
+  const processCwd = cwdMatchesRoot(commandCwd, context.taskProcessRoot)
+  const projectCwd = cwdMatchesRoot(commandCwd, context.trustedProjectRoot)
   // The guarded OOCLI fallback is a Wanta-owned Link transport just like the
   // host MCP path. Apply the same narrow command classifier to every adapter
-  // so switching from OpenCode to Claude/Codex does not add a redundant shell
+  // so the built-in kernel does not add a redundant shell
   // approval. Unknown shell composition, sensitive resources, and high-risk
-  // commands continue through the shared Wanta permission flow.
-  const openConnectorPolicy =
-    kind === "command" ? openConnectorCommandPolicy(command ?? request.resources.join(" ")) : null
-  if (openConnectorPolicy === "deny") return { type: "deny", kind, highRisk }
+  // commands continue through the built-in permission flow.
+  const denyReason = kind === "command" ? ooCommandDenyReason(command ?? request.resources.join(" ")) : null
+  if (denyReason) return { type: "deny", reason: denyReason, kind, highRisk }
+  // OO is a first-party Wanta capability channel. Once a request is proven to
+  // be a pure managed OO invocation, do not add a shell, upload, download, or
+  // execution confirmation in the built-in kernel. The managed OO guard remains the
+  // authority for operation admission, workspace identity, paths, URLs, and
+  // runtime overrides; invalid calls fail there instead of becoming approvable.
+  if (isOoCliPermissionRequest(request)) {
+    return { type: "allow", reason: "oo_cli", kind, highRisk: false }
+  }
   if (context.permissionMode === "full_access") {
     return { type: "allow", reason: "full_access", kind, highRisk }
   }
+  if (kind === "command" && !command) {
+    return { type: "prompt", kind, highRisk }
+  }
   // A generic directory grant cannot cross credential or private application-data boundaries.
-  // Only Full Access bypasses this protection.
-  if (permissionRequestHasSensitiveResource(request)) {
+  // Only Full Access bypasses this protection. Selected-project `.env` files are not this class.
+  if (permissionRequestHasSensitiveResource(request, scope)) {
     return { type: "prompt", kind, highRisk }
   }
   if (
     highRisk &&
     command &&
     isLowConsequenceCleanupCommand(command, {
+      commandCwd,
       taskProcessRoot: context.taskProcessRoot,
       trustedProjectRoot: context.trustedProjectRoot,
     })
@@ -144,21 +244,35 @@ function evaluateBaselineLocalAccessRequest(
     return { type: "allow", reason: "bounded_cleanup", kind, highRisk }
   }
   if (highRisk) {
+    // Reuse the existing sequence parser only for proven cleanup composition.
+    // Each smaller request must independently pass all boundaries; no shell is executed here.
+    const steps = command ? scopedCommandSequence(command, commandCwd) : undefined
+    if (
+      steps?.every(
+        (step) =>
+          evaluateBaselineLocalAccessRequest(
+            { ...request, resources: [], save: undefined, metadata: { command: step.command, cwd: step.cwd } },
+            { ...context, commandCwd: step.cwd, sessionGrants: undefined },
+          ).type === "allow",
+      )
+    ) {
+      return { type: "allow", reason: "bounded_cleanup", kind, highRisk }
+    }
     return { type: "prompt", kind, highRisk }
   }
-  if (isOoCliPermissionRequest(request)) return { type: "allow", reason: "oo_cli", kind, highRisk }
   // OOMOL's bundled `oo` CLI is a first-party working channel. A parser miss
   // must not make an otherwise ordinary command stricter than the baseline
   // local-command policy merely because the command contains `oo`. Compound
   // commands continue below, where credential, sensitive-resource, high-risk,
   // dependency, and project boundaries have already been applied.
   if (
-    (context.taskProcessRoot &&
-      (isTaskScopedPythonDependencyInstallRequest(request, context.taskProcessRoot) ||
-        isStandardRegistryNodeDependencyInstallRequest(request, context.taskProcessRoot))) ||
-    (context.trustedProjectRoot &&
-      (isProjectScopedPythonDependencyInstallRequest(request, context.trustedProjectRoot) ||
-        isStandardRegistryNodeDependencyInstallRequest(request, context.trustedProjectRoot)))
+    !permissionRequestNeedsDefaultPrompt(request, scope) &&
+    ((context.taskProcessRoot &&
+      (isTaskScopedPythonDependencyInstallRequest(request, context.taskProcessRoot, processCwd) ||
+        isStandardRegistryNodeDependencyInstallRequest(request, context.taskProcessRoot, processCwd))) ||
+      (context.trustedProjectRoot &&
+        (isProjectScopedPythonDependencyInstallRequest(request, context.trustedProjectRoot, projectCwd) ||
+          isStandardRegistryNodeDependencyInstallRequest(request, context.trustedProjectRoot, projectCwd))))
   ) {
     return { type: "allow", reason: "trusted_dependency", kind, highRisk }
   }
@@ -175,7 +289,10 @@ function evaluateBaselineLocalAccessRequest(
   if (hasMatchingGenericSessionGrant(request, context.sessionGrants)) {
     return { type: "allow", reason: "session_grant", kind, highRisk }
   }
-  if (permissionRequestNeedsDefaultPrompt(request)) {
+  if (permissionRequestIsSelectedProjectEnvWrite(request, scope)) {
+    return { type: "prompt", kind, highRisk }
+  }
+  if (permissionRequestNeedsDefaultPrompt(request, scope)) {
     return { type: "prompt", kind, highRisk }
   }
   if (context.trustedProjectRoot && projectPermissionRequestInsideRoot(request, context.trustedProjectRoot)) {
@@ -197,21 +314,9 @@ export function evaluateLocalAccessRequest(
   request: ChatPermissionRequest,
   context: LocalAccessPolicyContext,
 ): LocalAccessDecision {
-  const kind = permissionRequestKind(request)
-  const highRisk = isHighRiskPermissionRequest(request)
-  // This is deliberately the only adapter-specific policy branch, and it can
-  // only make an external-agent decision more permissive. All other requests
-  // go through the baseline that powered the built-in OpenCode experience;
-  // BYOA must never add a prompt or denial for the same normalized operation.
-  // Wanta host MCP tools are transport for the same capability kernel that
-  // OpenCode invokes directly, so a second native-runtime prompt is redundant.
-  if (
-    context.isExternalSession &&
-    isWantaHostToolPermissionRequest(request) &&
-    !permissionRequestHasSensitiveResource(request) &&
-    !highRisk
-  ) {
-    return { type: "allow", reason: "wanta_host_tool", kind, highRisk }
+  const diagnostic = evaluateDiagnosticTurnAccess(request, context)
+  if (diagnostic) {
+    return diagnostic
   }
   return evaluateBaselineLocalAccessRequest(request, context)
 }
