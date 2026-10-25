@@ -18,7 +18,7 @@ Wanta는 로컬 도구, Skills, 브라우저, 지식, 관리되는 앱 연결, �
 [문서](docs/project-overview.md) · [개발 가이드](docs/development.md)
 
 [![라이선스: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-![Node.js 22.22.2+](https://img.shields.io/badge/Node.js-22.22.2%2B-339933)
+![Node.js 22.23.4+](https://img.shields.io/badge/Node.js-22.23.4%2B-339933)
 
 </div>
 
@@ -243,7 +243,7 @@ Local BYOK 핵심 기능은 OOMOL 계정이 필요하지 않습니다. 로그인
 
 ## 소스에서 실행
 
-요구 사항: Node.js 22.22.2 이상과 Corepack을 통한 pnpm. Node.js 25 이상에는 Corepack이
+요구 사항: Node.js 22.23.4 이상과 Corepack을 통한 pnpm. Node.js 25 이상에는 Corepack이
 포함되지 않으므로 `corepack`이 없다면 먼저 설치하세요.
 
 ```bash

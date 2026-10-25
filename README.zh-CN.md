@@ -18,7 +18,7 @@ Agent 工作流。
 [文档](docs/project-overview.md) · [开发指南](docs/development.md)
 
 [![许可证：Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-![Node.js 22.22.2+](https://img.shields.io/badge/Node.js-22.22.2%2B-339933)
+![Node.js 22.23.4+](https://img.shields.io/badge/Node.js-22.23.4%2B-339933)
 
 </div>
 
@@ -236,7 +236,7 @@ Local BYOK 核心功能不需要 OOMOL 账户。登录会启用托管连接器�
 
 ## 从源码运行
 
-要求：Node.js 22.22.2 或更高版本，以及通过 Corepack 使用 pnpm。Node.js 25 及更高版本不再
+要求：Node.js 22.23.4 或更高版本，以及通过 Corepack 使用 pnpm。Node.js 25 及更高版本不再
 内置 Corepack；如果系统中没有 `corepack`，请先安装：
 
 ```bash

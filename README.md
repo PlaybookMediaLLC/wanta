@@ -18,7 +18,7 @@ artifacts—so the services you already use can become part of the same Agent wo
 [Documentation](docs/project-overview.md) · [Development Guide](docs/development.md)
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-![Node.js 22.22.2+](https://img.shields.io/badge/Node.js-22.22.2%2B-339933)
+![Node.js 22.23.4+](https://img.shields.io/badge/Node.js-22.23.4%2B-339933)
 
 </div>
 
@@ -251,7 +251,7 @@ For the complete process, trust-boundary, IPC, streaming, authentication, and st
 
 ## Run from Source
 
-Requirements: Node.js 22.22.2 or newer and pnpm through Corepack. Node.js 25 and newer no longer
+Requirements: Node.js 22.23.4 or newer and pnpm through Corepack. Node.js 25 and newer no longer
 bundle Corepack, so install it first when `corepack` is unavailable:
 
 ```bash

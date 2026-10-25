@@ -18,7 +18,7 @@ Grok を持ち込むこともできます。Wanta はローカルツール、Ski
 [ドキュメント](docs/project-overview.md) · [開発ガイド](docs/development.md)
 
 [![ライセンス：Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-![Node.js 22.22.2+](https://img.shields.io/badge/Node.js-22.22.2%2B-339933)
+![Node.js 22.23.4+](https://img.shields.io/badge/Node.js-22.23.4%2B-339933)
 
 </div>
 
@@ -250,7 +250,7 @@ Local BYOK のコア機能に OOMOL アカウントは不要です。サイン�
 
 ## ソースから実行
 
-必要環境：Node.js 22.22.2 以降と、Corepack 経由の pnpm。Node.js 25 以降には Corepack が
+必要環境：Node.js 22.23.4 以降と、Corepack 経由の pnpm。Node.js 25 以降には Corepack が
 同梱されないため、`corepack` がない場合は先にインストールしてください。
 
 ```bash

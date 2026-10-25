@@ -4,7 +4,7 @@
 
 ## 1. Environment Setup
 
-- **Node >= 22.22.2** (matches the minimum of the pinned OpenCode dependency chain; PR CI pins
+- **Node >= 22.23.4** (matches the minimum of the pinned OpenCode dependency chain; PR CI pins
   Node 24, release CI pins Node 22 in all four jobs that set up Node — compute-version,
   release-mac, release-win, create-release; the fifth job, refresh-cdn-cache, installs no Node at
   all). pnpm `11.23.0` through Corepack + `pnpm-lock.yaml`.
