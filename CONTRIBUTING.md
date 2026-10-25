@@ -6,7 +6,7 @@ architecture and safety rules live in [docs/architecture.md](docs/architecture.m
 
 ## Before You Start
 
-- Use Node.js 22.22.2 or newer and npm 10.9.4.
+- Use Node.js 22.23.4 or newer and npm 10.9.4.
 - Run `npm install`; no private registry token or repository `.npmrc` is required.
 - For substantial behavior or UI changes, open an issue first so scope and product behavior can be
   agreed before implementation.

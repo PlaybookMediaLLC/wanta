@@ -32,7 +32,7 @@ describe("open-source installation contract", () => {
     })
     expect(manifest.homepage).toBe("https://wanta.ai/")
     expect(manifest.bugs?.url).toBe("https://github.com/oomol-lab/wanta/issues")
-    expect(manifest.engines?.node).toBe(">=22.22.2")
+    expect(manifest.engines?.node).toBe("^22.23.4 || ^24.22.1 || ^26.12.1")
     expect(manifest.packageManager).toBe("pnpm@11.23.0")
   })
 
