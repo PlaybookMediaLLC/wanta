@@ -73,3 +73,6 @@ resources/agent-tool-runtime
 # Local dev Electron userData
 wanta/
 .spaces-bin/
+
+# code-review-graph database (built per session)
+.code-review-graph/
